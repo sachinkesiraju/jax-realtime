@@ -1,0 +1,22 @@
+{
+  "name": "jax-realtime",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource-variable/instrument-sans": "^5.2.8",
+    "@fontsource/jetbrains-mono": "^5.2.8",
+    "@jax-js/jax": "^0.1.18",
+    "@jax-js/loaders": "^0.1.2"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.70",
+    "typescript": "~5.9.3",
+    "vite": "^8.0.16"
+  }
+}
