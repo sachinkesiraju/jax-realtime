@@ -143,14 +143,17 @@ async function runWeather(query: string): Promise<ToolResult> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}` +
     `&longitude=${place.longitude}` +
-    `&current=temperature_2m,weather_code,wind_speed_10m`;
+    `&current=temperature_2m,weather_code,wind_speed_10m` +
+    // Fahrenheit + mph by default (US-oriented). open-meteo does the unit
+    // conversion server-side, so temp/wind come back already in these units.
+    `&temperature_unit=fahrenheit&wind_speed_unit=mph`;
   const data = await fetch(url).then((r) => r.json());
   const cur = data?.current ?? {};
   const temp = Math.round(Number(cur.temperature_2m));
   const wind = Math.round(Number(cur.wind_speed_10m));
   const [condition, emoji] = wmoDescribe(Number(cur.weather_code));
-  const unit = data?.current_units?.temperature_2m ?? "°C";
-  const speech = `It's ${temp} degrees and ${condition} in ${place.name}, with winds around ${wind}.`;
+  const unit = data?.current_units?.temperature_2m ?? "°F";
+  const speech = `It's ${temp} degrees and ${condition} in ${place.name}, with winds around ${wind} miles per hour.`;
   return {
     speech,
     card: {
