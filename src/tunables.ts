@@ -70,6 +70,18 @@ export const TUNABLES = {
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
+
+  // region: tools (campaign 2 — delegation)
+  /**
+   * Tool routing breadth. "conservative" is the shipped behavior (explicit
+   * lookup phrases + weather only). "broad" adds instant deterministic tools
+   * (calculator, unit conversion, clock/date), wh-question lookup routing, and
+   * weather-query cleanup — the GPT-Live-style "delegate what the small model
+   * can't answer" posture. Small-talk protection (stoplist + validQuery) is
+   * unchanged in both modes. Shipped "broad": QA accuracy 42% → 83% on MAP,
+   * 88% on holdout, zero small-talk false triggers in both splits.
+   */
+  toolRouting: "broad" as "conservative" | "broad",
 };
 
 export type Tunables = typeof TUNABLES;
@@ -84,6 +96,8 @@ export type TurnRecord = {
   transcriptReady: number;
   /** Whether the fast bestText path was used (vs a full finalize pass). */
   usedBestText: boolean;
+  /** Which endpoint rule fired the turn (campaign-1 diagnosis). */
+  endCause?: "punct" | "silence" | "max";
   /** First LLM text delta arrived. */
   firstDelta: number;
   /** First sentence/clause handed to TTS. */

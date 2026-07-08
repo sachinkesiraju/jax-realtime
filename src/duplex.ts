@@ -31,7 +31,11 @@ const START_LEVEL = 0.05; // speech onset / barge-in threshold
 // voiced evidence — a couple of ticks above the gate and a peak comfortably
 // over it — before a turn is transcribed at all. Signal-based on purpose: no
 // phrase blocklists, so a genuine quiet "thank you" still gets through.
-const MIN_VOICED_TICKS = 2; // ≥ ~300 ms of voiced audio across the utterance
+// NOTE: the level meter decays between words, so 150 ms tick sampling catches
+// only 1-2 voiced ticks across seconds of real speech — requiring ≥2 made the
+// guard a coin flip on legitimate turns (measured: voiced=2, peak=0.114 on a
+// 2 s utterance). The peak test is the reliable discriminator; keep ticks ≥1.
+const MIN_VOICED_TICKS = 1;
 const MIN_PEAK_LEVEL = 0.07; // must rise clearly above the 0.05 onset gate
 const MAX_UTTERANCE_MS = 28_000;
 const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
@@ -162,6 +166,7 @@ export class DuplexSession {
   // Bench instrumentation: stage marks for the turn currently being answered;
   // pushed to TURN_LOG when the response ends.
   private turnMarks: Partial<TurnRecord> = {};
+  private lastEndCause: "punct" | "silence" | "max" = "punct";
 
   private timers: PendingTimer[] = [];
 
@@ -358,12 +363,23 @@ export class DuplexSession {
     const committed = this.transcriber.committed;
     const endsTerminal = TERMINAL_PUNCT.test(committed);
 
-    // 2. User turn end (adaptive endpointing).
+    // 2. User turn end (adaptive endpointing). Patience modes widen the
+    //    SILENCE window when the utterance doesn't look finished, so a
+    //    mid-thought pause isn't mistaken for the end of the turn; the punct
+    //    fast-path is never affected.
+    // NOTE (cycle-5 campaign, all candidates rejected): "patience" endpointing
+    // — extending these windows when the utterance looks unfinished — cannot
+    // work pre-fire in this cascade. At a mid-clause pause the committed text
+    // ends at the last complete sentence (terminal punct = false end-of-turn
+    // signal), and the tentative tail that knows better lags the audio by more
+    // than the punct window. The viable design is post-fire continuation-merge
+    // (abort the reply if speech resumes before first audio); see BENCHMARKS.
     const endByPunct =
       endsTerminal && trailingSilence >= TUNABLES.endpointPunctMs;
     const endBySilence = trailingSilence >= TUNABLES.endpointSilenceMs;
     const endByMax = speechMs >= MAX_UTTERANCE_MS;
     if (speechMs >= TUNABLES.minSpeechMs && (endByPunct || endBySilence || endByMax)) {
+      this.lastEndCause = endByPunct ? "punct" : endBySilence ? "silence" : "max";
       void this.endUserTurn(this.silenceStart || now);
       return;
     }
@@ -408,6 +424,7 @@ export class DuplexSession {
       endOfSpeech: endOfSpeechAt,
       fired: performance.now(),
       usedBestText: true,
+      endCause: this.lastEndCause,
     };
 
     // Latency hillclimb: the streaming loop has already transcribed this
@@ -497,7 +514,9 @@ export class DuplexSession {
     // "responding" phase), then speak the holding line while the fetch runs —
     // the user can keep talking / interrupt / be backchanneled meanwhile.
     this.startFreshListening();
-    void this.speakProactive(tool.holding);
+    // Instant tools (calc/convert/clock) have no holding line — their result
+    // arrives immediately and is spoken from the pending queue instead.
+    if (tool.holding) void this.speakProactive(tool.holding);
     this.backgroundTask = tool
       .run()
       .then((result) => {
@@ -581,6 +600,7 @@ export class DuplexSession {
         firstDelta: this.turnMarks.firstDelta ?? 0,
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
+        endCause: this.turnMarks.endCause,
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
         interrupted,
