@@ -38,7 +38,7 @@ app.innerHTML = `
           <br />
           Inspired by the
           <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">Thinking Machines interaction model</a>
-          and the <a href="https://huggingface.co/blog/cerebras-gemma4-voice-ai" target="_blank">Cerebras &times; HF demo</a>.
+          and <a href="https://openai.com/index/introducing-gpt-live/" target="_blank">GPT&#8209;Live</a>.
         </p>
       </div>
     </header>
