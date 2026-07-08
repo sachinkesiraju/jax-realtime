@@ -40,12 +40,21 @@ const START_LEVEL = 0.05; // speech onset / barge-in threshold
 const GUARD_WINDOW = 480; // 30 ms at 16 kHz
 const GUARD_RMS_FLOOR = 0.02; // absolute floor for a voiced window
 const GUARD_RMS_CEIL = 0.055; // never demand more than soft speech delivers
-const MIN_VOICED_MS = 250; // real speech easily exceeds this; blips don't
+// 150 ms, not 250: a one-syllable word ("what?") clears ~150 ms of voiced
+// audio, and the peak floor + adaptive noise floor are what actually reject
+// ambient (a swell fails the peak test regardless of length), so the duration
+// bar can be short enough to admit snappy replies.
+const MIN_VOICED_MS = 150;
 // Peak amplitude a turn must reach to be real. Raised from 0.04 after idle
 // hallucinations on long sessions: HVAC/fan swells peak ~0.03-0.06 and were
 // clearing the old bar, while real speech peaks 0.2-0.7, so 0.09 rejects
 // ambient with enormous margin on genuine speech.
 const MIN_PEAK_ABS = 0.09;
+// A peak this high is unambiguously speech (ambient/HVAC swells top out ~0.06),
+// so an utterance reaching it is real even if it's too short to clear the
+// voiced-duration bar — this is what lets one-word replies ("what?", "no")
+// through the phantom guard.
+const STRONG_PEAK_ABS = 0.2;
 
 /**
  * Voiced duration + peak of a PCM buffer (see phantom-turn guard). The voiced
@@ -498,7 +507,15 @@ export class DuplexSession {
     // proved itself to the barge detector.
     if (!this.bargeContinuation) {
       const stats = voicedStats(this.capture.samples());
-      if (stats.voicedMs < MIN_VOICED_MS || stats.peak < MIN_PEAK_ABS) {
+      // Reject only genuine noise. A too-quiet peak is always ambient. A short
+      // utterance is normally suspect (a blip), BUT a short-and-LOUD one is a
+      // real snappy word — "what?", "no", "stop", "yes" — and must get through,
+      // or the assistant ignores one-word replies. So the duration bar is
+      // waived when the peak is unambiguously speech-level.
+      const clearlyVoiced = stats.peak >= STRONG_PEAK_ABS;
+      const tooQuiet = stats.peak < MIN_PEAK_ABS;
+      const tooShort = stats.voicedMs < MIN_VOICED_MS && !clearlyVoiced;
+      if (tooQuiet || tooShort) {
         this.cb.onEvent("noise · discarded");
         this.startFreshListening();
         return;
