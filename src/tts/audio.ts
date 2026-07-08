@@ -151,8 +151,10 @@ export function createStreamingPlayer(
     stop() {
       stopped = true;
       for (const source of liveSources) {
+        // Deliberately keep source.onended attached: stop() fires the "ended"
+        // event, which resolves the per-chunk promise a concurrent close() may
+        // already be awaiting — nulling it would leave close() hanging forever.
         try {
-          source.onended = null;
           source.stop();
         } catch {
           // Already stopped or never started; ignore.

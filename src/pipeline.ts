@@ -673,10 +673,19 @@ export class SpeechSynthesizer {
       if (firstAudioMs === 0) firstAudioMs = performance.now() - startTime;
     });
 
+    // Mirror speakStream: if an abort lands outside playTTS's frame loop, cut
+    // scheduled audio immediately instead of letting it drain via close().
+    const onAbort = () => inner.stop();
+    signal?.addEventListener("abort", onAbort);
+
     try {
       await this.synthOne(voice, text, player, signal ?? null);
     } finally {
+      if (signal?.aborted) inner.stop();
+      // Keep the listener armed WHILE close() drains the scheduled tail — a
+      // barge-in during the drain must still cut the audio, not play it out.
       await player.close();
+      signal?.removeEventListener("abort", onAbort);
     }
     return {
       firstAudioMs,
@@ -702,6 +711,13 @@ export class SpeechSynthesizer {
       if (firstAudioMs === 0) firstAudioMs = performance.now() - startTime;
     });
 
+    // Barge-in can fire while we're between sentences (awaiting the next LLM
+    // sentence), where playTTS isn't running to notice the signal — without
+    // this listener the already-scheduled audio keeps draining and overlaps
+    // the next reply. Cut it the instant the abort lands.
+    const onAbort = () => inner.stop();
+    signal?.addEventListener("abort", onAbort);
+
     try {
       for await (const sentence of sentences) {
         if (signal?.aborted) break;
@@ -710,7 +726,12 @@ export class SpeechSynthesizer {
         await this.synthOne(voice, line, player, signal ?? null);
       }
     } finally {
+      if (signal?.aborted) inner.stop();
+      // Keep the listener armed WHILE close() drains: the loop exits as soon
+      // as the LLM finishes, but seconds of scheduled audio may still be
+      // playing — a barge-in during that drain must cut it, not talk over it.
       await player.close();
+      signal?.removeEventListener("abort", onAbort);
     }
     return {
       firstAudioMs,
