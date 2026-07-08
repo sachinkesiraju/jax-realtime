@@ -135,11 +135,15 @@ export class VisionSession {
     for (const d of detections) {
       let [x, y, w, h] = d.box;
       if (d.label === "person") {
-        // Torso ≈ clothing: middle horizontally, upper-mid vertically.
+        // Clothing band: LOWER-middle of the box. A seated webcam framing gives
+        // a head-and-shoulders box where 40-70% height is still face/neck —
+        // sampling there described skin ("orange person", "dark red shirt" on a
+        // navy polo). 58-90% height hits the chest/shirt in that framing, and
+        // still lands on clothing (pants) for a full-body box.
         x += w * 0.3;
         w *= 0.4;
-        y += h * 0.42;
-        h *= 0.28;
+        y += h * 0.58;
+        h *= 0.32;
       } else {
         x += w * 0.25;
         y += h * 0.25;

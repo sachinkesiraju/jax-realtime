@@ -500,6 +500,13 @@ export class DuplexSession {
       this.startFreshListening();
       return;
     }
+    if (isDegenerateTranscript(text)) {
+      // Whisper repetition loop ("All in all. All in all. …") — a decoder
+      // artifact, not something the user said. Never answer it.
+      this.cb.onEvent("asr · garbled, discarded");
+      this.startFreshListening();
+      return;
+    }
 
     this.cb.onMetric({ asrLagMs });
     this.cb.onUserTurn(text);
@@ -702,8 +709,16 @@ export class DuplexSession {
       // Fastest first audio: flush the first clause as soon as a comma/colon/
       // semicolon appears (once there's enough to sound natural), so speech
       // starts after "The weather in Tokyo," instead of the whole sentence.
+      // If no punctuation shows up, flush at a WORD BOUNDARY once ~2× the
+      // clause minimum has accumulated — otherwise the reply text is fully
+      // written on screen while the voice still waits for the first sentence
+      // to complete before it can even start synthesizing.
       if (!firstEmitted) {
-        const clauseIdx = findClauseEnd(buffer);
+        let clauseIdx = findClauseEnd(buffer);
+        if (clauseIdx === -1 && buffer.length >= TUNABLES.firstClauseMinChars * 2) {
+          const lastSpace = buffer.lastIndexOf(" ");
+          if (lastSpace >= TUNABLES.firstClauseMinChars) clauseIdx = lastSpace + 1;
+        }
         if (clauseIdx !== -1) {
           const clause = buffer.slice(0, clauseIdx).trim();
           buffer = buffer.slice(clauseIdx);
@@ -967,6 +982,23 @@ export class DuplexSession {
 function displayWordCount(text: string): number {
   const trimmed = text.trim();
   return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
+/**
+ * Whisper's repetition-loop failure mode: on ambiguous audio the decoder can
+ * emit one phrase over and over ("All in all. All in all. All in all…"). That
+ * is a decode artifact, not speech — a real utterance of ≥6 words has far more
+ * lexical variety. Signal-based (a repetition statistic), no phrase lists.
+ */
+function isDegenerateTranscript(text: string): boolean {
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens.length < 6) return false;
+  const unique = new Set(tokens).size;
+  return unique / tokens.length < 0.4;
 }
 
 function findSentenceEnd(buffer: string): number {
