@@ -36,8 +36,8 @@ app.innerHTML = `
           It listens while it talks, you can interrupt it mid&#8209;sentence,
           and it backchannels while you speak.
           <br />
-          Inspired by the Thinking Machines
-          <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">interaction model</a>
+          Inspired by the
+          <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">Thinking Machines interaction model</a>
           and the <a href="https://huggingface.co/blog/cerebras-gemma4-voice-ai" target="_blank">Cerebras &times; HF demo</a>.
         </p>
       </div>
