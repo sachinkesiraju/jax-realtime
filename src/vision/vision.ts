@@ -10,6 +10,9 @@ import type { Detection, ObjectDetector } from "./detector";
 // ASR/LLM/TTS — so it detects infrequently and yields the GPU to the audio
 // pipeline (see `pauseWhile`).
 const FRAME_INTERVAL_MS = 2200;
+// Retry cadence after a tick was skipped for priority reasons — cheap (no GPU
+// work happened) and keeps the Eye from starving while audio stays busy.
+const SKIP_RETRY_MS = 250;
 const POSTURE_BASELINE = 6; // rolling frames used for the slouch baseline
 // A label must appear in ≥2 of the last STABILITY_FRAMES detector frames to be
 // reported — this filters flickering false positives (a "cat" that D-FINE only
@@ -321,28 +324,35 @@ export class VisionSession {
   // --- Detection loop -----------------------------------------------------
 
   private loop(): void {
-    // Single recursive scheduler: run a frame, then wait FRAME_INTERVAL_MS
-    // after it finishes before the next (self-throttling; the mic never pauses).
-    void this.tick().finally(() => {
+    // Single recursive scheduler: a COMPLETED frame waits the full low-priority
+    // interval, but a SKIPPED tick (detector busy / yielding to ASR-TTS, which
+    // is most tick moments while a session runs) retries quickly — otherwise
+    // every skip burned a whole 2.2 s and the first detection could take 5-10 s
+    // to appear after enabling the Eye.
+    void this.tick().then((ran) => {
       if (!this.running) return;
-      this.timer = setTimeout(() => this.loop(), FRAME_INTERVAL_MS);
+      const delay = ran ? FRAME_INTERVAL_MS : SKIP_RETRY_MS;
+      this.timer = setTimeout(() => this.loop(), delay);
     });
   }
 
-  private async tick(): Promise<void> {
-    if (!this.running || this.detector.isBusy) return;
+  /** Returns true when a detector frame actually ran (vs a priority skip). */
+  private async tick(): Promise<boolean> {
+    if (!this.running || this.detector.isBusy) return false;
     // Yield to the higher-priority audio pipeline: skip this frame while ASR is
-    // transcribing or the assistant is speaking. The next frame retries later.
-    if (this.pauseWhile?.()) return;
+    // transcribing or the assistant is speaking. The scheduler retries soon.
+    if (this.pauseWhile?.()) return false;
     try {
       const detections = await this.detector.detect(this.video);
-      if (!this.running) return;
+      if (!this.running) return true;
       this.sampleColors(detections);
       this.latest = detections;
       this.updateStability(detections);
       this.updatePosture(detections);
+      return true;
     } catch {
       // Transient; the next frame retries.
+      return true;
     }
   }
 
