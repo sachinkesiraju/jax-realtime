@@ -158,7 +158,7 @@ budget that isn't GPU-bound — the endpoint wait (B). New instrumentation:
 filler→reply gap; a synthetic mid-pause clip (0.5 s inserted silence) for the
 false-cut cost guard.
 
-### Campaign A — onset fillers (SHIPPED)
+### Campaign A — onset fillers (SHIPPED, then REVERTED)
 Pre-render short lead-ins ("So,"/"Right,"/"Okay,") to PCM at load (zero runtime
 GPU, like the backchannels) and play one instantly at endpoint while the real
 reply generates behind it.
@@ -172,18 +172,25 @@ sound − endOfSpeech:**
 | onset "ack" | **~0.46 s** | ~1.3–1.8 s | reply unchanged |
 | onset "think" | ~0.45 s | ~1.7–2.5 s | same first-sound; phrase is a quality choice, not latency |
 
-**HOLDOUT (`dialogue.wav[2.6:5.2s]`, unseen):** first-sound ~0.45–0.75 s — the
-win holds. **Result: ~1.3 s / ~70 % cut in perceived latency**, real reply
-untouched. Shipped default `onsetFiller: "ack"`.
+**HOLDOUT (`dialogue.wav[2.6:5.2s]`, unseen):** first-sound ~0.45–0.75 s on the
+*metric* — the timing win held. **But the metric lied about the experience.**
 
-Two defects the data caught and fixed before shipping:
-1. *Overlap* — onset ran into the reply (negative gap → double-speak). Fixed
-   with an `onFirstAudio` hand-off that cuts the onset the instant real audio
-   starts.
-2. *Bloated clip* — the TTS pads short prompts, so a raw onset was ~2.5 s of
-   near-silence around a tiny word (first-sound looked fast but the audible word
-   was delayed). Fixed by trimming silence + a 0.6 s hard cap → onset is a
-   punchy ~0.2 s clip that's heard immediately.
+**Reverted after listening.** The bench measured time-to-first-sound and the
+filler→reply gap, and both looked good — but neither captures the actual defect:
+the onset (a separate short-lived AudioContext) and the real reply (the TTS
+player) are two independent audio streams with no shared clock, so the reply
+begins *over/into* the tail of the onset and the hand-off `stop()` clips the
+filler mid-word. It sounds broken — a stutter, not a smooth "So, … answer." The
+two "fixes" (hand-off cut, silence-trim + 0.6 s cap) reduced the numeric overlap
+but not the audible collision. Removed entirely.
+
+**Lesson (recorded as a law):** perceived-audio quality is not capturable by the
+deterministic timing proxies we had. A first-sound metric rewards *any* sound,
+including one that steps on the real reply. Masking the gap needs the filler and
+the reply to be **one gapless stream on one clock** (append the onset as the
+first TTS sentence, or gate the reply until the filler's buffer drains) — not two
+overlapping contexts. Until that's built, no onset ships. Do not re-attempt with
+a two-context design.
 
 ### Campaign B — earlier endpointing (REJECTED)
 Two candidate modes vs the committed-text baseline: `tentativePunct` (fire on
@@ -207,10 +214,12 @@ negative result is recorded here so the family isn't retried.
 
 **FUSE:** A and B touch disjoint regions, but B has no winner — fusion is just A.
 
-**Net cycle 3: first shippable win of the whole latency effort** — perceived
-turn latency ~1.8 s → ~0.46 s via onset masking, holdout-validated, real reply
-unchanged. The actual GPU floor is untouched (as the diagnosis said it must be);
-what changed is that the user now hears the assistant ~1.3 s sooner.
+**Net cycle 3: no shippable win.** Onset masking looked like a ~1.3 s perceived
+win on the timing proxy but sounded broken on ears (two un-synced audio streams
+colliding) and was reverted; the endpoint modes bought nothing. The lasting
+output is the law above — perceived-audio quality needs an ears-in-the-loop gate,
+and gap-masking must be a single-stream design — plus confirmation (again) that
+the GPU floor is the real ceiling.
 
 ## Hill-climb levers (ordered by expected payoff)
 
@@ -223,11 +232,12 @@ Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
    first-token isn't pre-paid and the endpoint is pushed later. Removed. The
    takeaway reorders this list: on one GPU you cannot buy latency by overlapping
    stages — only by cutting total GPU work (items 3–4).
-2. **Perceived first-audio** — *shipped in cycle 3.* Real first-audio is
-   GPU-floored, so instead we mask it: an instant pre-rendered onset filler at
-   endpoint drops time-to-first-sound ~1.8 s → ~0.46 s. Real TTS first-audio
-   itself (`framesAfterEos`/`lsdDecodeSteps=1`) is already minimal; the first
-   clause already flushes on a comma.
+2. **Perceived first-audio** — *tried in cycle 3 (onset filler), reverted.* The
+   two-AudioContext design collided with the real reply and sounded broken. A
+   redo must make the filler + reply one gapless stream on one clock (prepend the
+   onset as the first TTS sentence). Real TTS first-audio itself
+   (`framesAfterEos`/`lsdDecodeSteps=1`) is already minimal; the first clause
+   already flushes on a comma.
 3. **Shorter replies** — cap first-sentence tokens; the SYSTEM_HINT already asks
    for 1–3 short sentences. A tighter "lead with one short sentence" nudge lowers
    time-to-first-audio variance.

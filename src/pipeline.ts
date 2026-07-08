@@ -570,29 +570,15 @@ export type SpeakStats = {
 export type SpeakOptions = {
   signal?: AbortSignal;
   onAnalyser?: (analyser: AnalyserNode) => void;
-  /** Fires once, when the first real audio chunk is scheduled (for handing off
-   *  from an onset filler so the two never overlap). */
-  onFirstAudio?: () => void;
 };
 
 const TTS_SAMPLE_RATE = 24_000; // Mimi codec output rate.
 const BACKCHANNEL_PHRASES = ["Mm-hmm.", "Right.", "Got it."] as const;
 
-// Onset fillers (campaign A): short, universally-safe lead-ins pre-rendered to
-// PCM once, played instantly at endpoint to mask the first-token+first-frame gap
-// while the real reply generates. Two candidate sets for the map-reduce bench.
-export type OnsetSet = "ack" | "think";
-const ONSET_PHRASES: Record<OnsetSet, readonly string[]> = {
-  ack: ["So,", "Right,", "Okay,"],
-  think: ["Hmm,", "Let's see,", "One sec,"],
-};
-
 export class SpeechSynthesizer {
   private voiceEmbeds = new Map<TTSVoice, np.Array>();
   private backchannels: Float32Array[] = [];
   private backchannelVoice: TTSVoice | null = null;
-  private onsets = new Map<OnsetSet, Float32Array[]>();
-  private onsetVoice: TTSVoice | null = null;
 
   private constructor(
     private model: PocketTTS,
@@ -706,17 +692,14 @@ export class SpeechSynthesizer {
   async speakStream(
     voice: TTSVoice,
     sentences: AsyncIterable<string>,
-    { signal, onAnalyser, onFirstAudio }: SpeakOptions = {},
+    { signal, onAnalyser }: SpeakOptions = {},
   ): Promise<SpeakStats> {
     const startTime = performance.now();
     let firstAudioMs = 0;
     const inner = createStreamingPlayer();
     onAnalyser?.(inner.analyser);
     const player = withFirstAudio(inner, () => {
-      if (firstAudioMs === 0) {
-        firstAudioMs = performance.now() - startTime;
-        onFirstAudio?.();
-      }
+      if (firstAudioMs === 0) firstAudioMs = performance.now() - startTime;
     });
 
     try {
@@ -756,73 +739,6 @@ export class SpeechSynthesizer {
     this.backchannelVoice = voice;
   }
 
-  /**
-   * Pre-synthesize the onset fillers (both candidate sets) for a voice and cache
-   * their PCM, so `playOnset()` never touches the GPU mid-conversation.
-   */
-  async prepareOnsets(voice: TTSVoice): Promise<void> {
-    if (this.onsets.size && this.onsetVoice === voice) return;
-    this.onsets.clear();
-    for (const set of Object.keys(ONSET_PHRASES) as OnsetSet[]) {
-      const clips: Float32Array[] = [];
-      for (const phrase of ONSET_PHRASES[set]) {
-        const collector = createStreamingPlayer({ collectPcm: true });
-        try {
-          await this.synthOne(voice, phrase, collector, null);
-          // The TTS pads short prompts with leading spaces + trailing frames, so
-          // the raw clip is a tiny word wrapped in ~seconds of silence. Trim it
-          // so the onset is heard the instant it plays, then hard-cap the length
-          // so a mis-rendered phrase can never drone on before the real reply.
-          let clip = trimSilence(collector.pcm());
-          const maxLen = Math.floor(0.6 * TTS_SAMPLE_RATE);
-          if (clip.length > maxLen) clip = clip.slice(0, maxLen);
-          clips.push(clip);
-        } finally {
-          await collector.close();
-        }
-      }
-      this.onsets.set(set, clips);
-    }
-    this.onsetVoice = voice;
-  }
-
-  /**
-   * Play a random cached onset from `set` instantly through a short-lived
-   * context. Returns a stop handle + duration so the caller can cut it on
-   * barge-in and measure the filler→reply gap; null if not prepared.
-   */
-  playOnset(set: OnsetSet): { stop: () => void; durationMs: number } | null {
-    const clips = this.onsets.get(set);
-    if (!clips || !clips.length) return null;
-    const pcm = clips[Math.floor(Math.random() * clips.length)];
-    if (!pcm.length) return null;
-    const ctx = new AudioContext({ sampleRate: TTS_SAMPLE_RATE });
-    const buffer = ctx.createBuffer(1, pcm.length, TTS_SAMPLE_RATE);
-    buffer.getChannelData(0).set(pcm);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    let closed = false;
-    const close = () => {
-      if (closed) return;
-      closed = true;
-      void ctx.close().catch(() => {});
-    };
-    source.onended = close;
-    source.start();
-    return {
-      stop: () => {
-        try {
-          source.stop();
-        } catch {
-          // already stopped
-        }
-        close();
-      },
-      durationMs: (pcm.length / TTS_SAMPLE_RATE) * 1000,
-    };
-  }
-
   /** Play a random cached backchannel instantly through a short-lived context. */
   playBackchannel(): void {
     if (!this.backchannels.length) return;
@@ -838,23 +754,6 @@ export class SpeechSynthesizer {
     source.onended = () => void ctx.close().catch(() => {});
     source.start();
   }
-}
-
-/**
- * Trim leading/trailing near-silence from a PCM clip (± a small margin) so a
- * pre-rendered onset filler is punchy and short. Returns the original if the
- * clip is all silence.
- */
-function trimSilence(pcm: Float32Array, threshold = 0.015): Float32Array {
-  let start = 0;
-  let end = pcm.length - 1;
-  while (start < pcm.length && Math.abs(pcm[start]) < threshold) start++;
-  while (end > start && Math.abs(pcm[end]) < threshold) end--;
-  if (start >= end) return pcm;
-  const margin = Math.floor(0.02 * TTS_SAMPLE_RATE); // 20 ms breathing room
-  start = Math.max(0, start - margin);
-  end = Math.min(pcm.length - 1, end + margin);
-  return pcm.slice(start, end + 1);
 }
 
 /** Wrap a player so the first played chunk fires `onFirst()` (for timing). */
