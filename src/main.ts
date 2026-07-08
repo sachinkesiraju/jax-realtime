@@ -7,11 +7,10 @@ import { DuplexSession } from "./duplex";
 import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
-import type { ToolKind, UiCard } from "./tools/tools";
+import { detectTool, type ToolKind, type UiCard } from "./tools/tools";
 import { ObjectDetector } from "./vision/detector";
 import { VisionSession } from "./vision/vision";
 import {
-  CerebrasChatModel,
   type ChatModel,
   type DownloadProgress,
   loadPipeline,
@@ -111,16 +110,6 @@ app.innerHTML = `
             <span>Voice</span>
             <select id="voice-select"></select>
           </label>
-          <details class="field cerebras">
-            <summary>LLM backend</summary>
-            <div class="cerebras-body">
-              <p>Default is Gemma running locally in your browser. Paste a
-              Cerebras API key to route the LLM stage through Cerebras inference
-              instead, as in the blog post.</p>
-              <input id="cerebras-key" type="password" placeholder="Cerebras API key (optional)" />
-              <input id="cerebras-model" type="text" value="gemma-4-31b" placeholder="Model name" />
-            </div>
-          </details>
         </div>
       </div>
 
@@ -150,8 +139,6 @@ const el = {
   transcript: document.querySelector<HTMLDivElement>("#transcript")!,
   downloads: document.querySelector<HTMLDivElement>("#downloads")!,
   voiceSelect: document.querySelector<HTMLSelectElement>("#voice-select")!,
-  cerebrasKey: document.querySelector<HTMLInputElement>("#cerebras-key")!,
-  cerebrasModel: document.querySelector<HTMLInputElement>("#cerebras-model")!,
   llmLabel: document.querySelector<HTMLSpanElement>("#llm-label")!,
   backendChip: document.querySelector<HTMLSpanElement>("#backend-chip")!,
   laneAsr: document.querySelector<HTMLSpanElement>("#lane-asr")!,
@@ -181,6 +168,22 @@ const el = {
   },
 };
 
+// The per-card lanes already say "webgpu"; make the footer chip earn its place
+// by naming the actual GPU. Set at page init (not load time) so it's always
+// accurate; Chrome populates adapter-level info, not GPUDevice.adapterInfo.
+void (async () => {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    const info = adapter?.info;
+    const gpu =
+      info?.description ||
+      [info?.vendor, info?.architecture].filter(Boolean).join(" ");
+    if (gpu) el.backendChip.textContent = `WebGPU · ${gpu}`;
+  } catch {
+    // Leave the static "WebGPU" label.
+  }
+})();
+
 for (const voice of TTS_VOICES) {
   const option = document.createElement("option");
   option.value = voice;
@@ -200,6 +203,7 @@ let toolChip: HTMLDivElement | null = null;
 
 // Vision "Eye" stage (D-FINE). Loaded lazily when the dock toggle is enabled.
 let detector: ObjectDetector | null = null;
+let detectorPromise: Promise<ObjectDetector> | null = null;
 let vision: VisionSession | null = null;
 let visionRaf: number | null = null;
 let visionBusy = false;
@@ -213,6 +217,7 @@ if (import.meta.env.DEV) {
   dev.__tunables = TUNABLES;
   dev.__turnLog = TURN_LOG;
   dev.__pipeline = () => pipeline;
+  dev.__detectTool = detectTool;
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {
@@ -299,12 +304,7 @@ function renderCard(card: UiCard) {
 }
 
 function currentModel(): ChatModel {
-  const key = el.cerebrasKey.value.trim();
-  if (key && pipeline) {
-    el.llmLabel.textContent = `Cerebras · ${el.cerebrasModel.value.trim()}`;
-    return new CerebrasChatModel(key, el.cerebrasModel.value.trim());
-  }
-  el.llmLabel.textContent = "Gemma 3 270M";
+  // Everything runs locally on jax-js; the Brain is always the local Gemma.
   return pipeline!.llm;
 }
 
@@ -344,21 +344,17 @@ async function handleLoad() {
   el.loadBtn.disabled = true;
   setStatus("downloading models", "busy");
   try {
+    // Preload + warm the Eye detector in parallel with the voice pipeline so
+    // enabling the Eye at "ready" doesn't stall on the D-FINE download/compile
+    // — that stall was the visible delay before "1 person" appeared.
+    detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
+      async (d) => {
+        await d.warmup();
+        return d;
+      },
+    );
     pipeline = await loadPipeline(onDownloadProgress);
     el.laneAsr.textContent = pipeline.asrDevice;
-    // The per-card lanes already say "webgpu"; make this chip earn its place by
-    // naming the actual GPU everything is running on. Chrome populates the
-    // adapter-level info (vendor/architecture), not GPUDevice.adapterInfo.
-    try {
-      const adapter = await navigator.gpu.requestAdapter();
-      const info = adapter?.info;
-      const gpu =
-        info?.description ||
-        [info?.vendor, info?.architecture].filter(Boolean).join(" ");
-      el.backendChip.textContent = gpu ? `WebGPU · ${gpu}` : "WebGPU";
-    } catch {
-      el.backendChip.textContent = "WebGPU";
-    }
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
     el.loadBtn.hidden = true;
@@ -453,9 +449,15 @@ async function enableVision(): Promise<void> {
   if (!pipeline) return;
   setStatus("loading D-FINE detector", "busy");
   if (!detector) {
-    detector = await ObjectDetector.load(onDownloadProgress);
-    setStatus("warming up D-FINE", "busy");
-    await detector.warmup();
+    // Usually already resolved: handleLoad preloads + warms it in parallel
+    // with the voice pipeline.
+    detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
+      async (d) => {
+        await d.warmup();
+        return d;
+      },
+    );
+    detector = await detectorPromise;
     setTimeout(() => (el.downloads.hidden = true), 1500);
   }
   vision = new VisionSession(detector);
