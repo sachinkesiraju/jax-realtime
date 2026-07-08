@@ -45,7 +45,7 @@ app.innerHTML = `
 
     <section class="rail" aria-label="Pipeline stages">
       <div class="stage" id="stage-asr">
-        <span class="stage-role"><span class="stage-dot" id="dot-asr"></span>Ear <span class="stage-lane" id="lane-asr"></span></span>
+        <span class="stage-role"><span class="stage-dot" id="dot-asr"></span>Ear <span class="stage-lane" id="lane-asr">webgpu</span></span>
         <span class="stage-model">Whisper tiny.en</span>
         <span class="stage-metric" id="metric-asr">&ndash;</span>
       </div>
