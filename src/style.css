@@ -692,7 +692,7 @@ summary:focus-visible {
 .colophon {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   gap: 1rem;
   flex-wrap: wrap;
   color: var(--ink-soft);
@@ -716,11 +716,11 @@ summary:focus-visible {
   font-family: var(--mono);
   font-size: 0.72rem;
   letter-spacing: 0.01em;
-  border: 1px solid oklch(82% 0.06 118);
+  border: 1px solid oklch(38% 0.04 118);
   border-radius: 999px;
   padding: 0.28rem 0.75rem;
-  background: oklch(97% 0.03 118);
-  color: oklch(38% 0.06 118);
+  background: oklch(24% 0.02 118);
+  color: oklch(84% 0.05 118);
   white-space: nowrap;
 }
 
