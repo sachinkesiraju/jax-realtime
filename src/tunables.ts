@@ -84,6 +84,33 @@ export const TUNABLES = {
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
 
+  // region: tts-generation
+  /**
+   * Fuse the per-frame Pocket TTS decode into as few jitted dispatches as
+   * possible, mirroring the Gemma `llmFusedStep` lever. When on:
+   *   - the flow-LM decode step (input proj → 6 streaming-transformer layers →
+   *     out-norm → EOS head → LSD/flow decode) collapses from ~8 jit dispatches
+   *     plus ~10 eager ops into ONE jitted dispatch (`runFlowLMStepFused`), and
+   *   - the Mimi decode (quantizer conv → upsample → 2 decoder-transformer
+   *     layers → SEANet decoder) collapses from ~3 jit dispatches plus ~12 eager
+   *     ops into ONE jitted dispatch (`runMimiDecodeFused`).
+   * The per-frame command-buffer submit count drops from ~35 to ~2 (plus the
+   * two readbacks playTTS already does). Trace caches key on avals, so per-frame
+   * dynamics (position/offset/kv-length, noise) are passed as np.Array inputs
+   * and the trace is reused across frames (it only re-traces on the stepwise
+   * KV-cache capacity growth, exactly as the unfused path does).
+   *
+   * Numerically the fused path runs the identical math in the identical order
+   * (the inline helpers are verbatim copies of the jitted originals with the
+   * inner jit calls inlined to avoid nested-jit boundaries); the flow-LM prefill
+   * (step 0) still uses the unfused path, matching Gemma's fuse-decode-only
+   * split. A/B with `window.__pipeline().tts.benchSynth(sentence, {fused})`.
+   * Shipped on: bench (fixed seed) showed 1291→1010 ms gen (~22%), realtime
+   * factor 0.40→0.31, with identical frame count both paths (same EOS decision,
+   * same audio duration) — equivalent output, fewer dispatches.
+   */
+  ttsFusedStep: true,
+
   // region: tools (campaign 2 — delegation)
   /**
    * Tool routing breadth. "conservative" is the shipped behavior (explicit

@@ -391,6 +391,18 @@ CLOCK_RE misses some phrasings (expanding risks small-talk false positives);
 KV-reuse mid-loop-throw leaves inconsistent cache state (feature is off by
 default — must be fixed before ever enabling it).
 
+## TTS decode fusion (shipped)
+
+Pocket TTS generation was the pipeline bottleneck (~1.1x realtime under GPU
+contention -> longer replies stuttered). Same lever as the Gemma fusion: the
+per-frame decode dispatched ~11 separate jits (+ ~25 eager ops); an Opus pass
+fused it to 2 (flow-LM step -> 1, Mimi decode -> 1) via verbatim inline copies
+(no nested-jit boundaries), per-frame dynamics as np.Array trace inputs. Bench
+(fixed seed): gen 1291->1010 ms (~22%), realtime factor 0.40->0.31, IDENTICAL
+frame count both paths (same EOS decision, same 3200 ms audio) = equivalent
+output. E2E verified (62 audio chunks, coherent reply). Shipped on
+(ttsFusedStep). Prefill step 0 stays unfused (fuse-decode-only, like Gemma).
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

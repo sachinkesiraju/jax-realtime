@@ -1298,6 +1298,96 @@ export class SpeechSynthesizer {
   }
 
   /**
+   * DEV A/B bench hook: synthesize `sentence` once (off the audio graph) and
+   * measure pure generation cost, so the harness can compare the fused
+   * per-frame decode (TUNABLES.ttsFusedStep) against the shipped path on an
+   * identical sentence. A fixed seed makes fused-vs-unfused frame counts (and
+   * thus audio duration) comparable. Because the player collects PCM without
+   * touching the speakers, `genMs` is the wall-clock of generation alone (GPU
+   * dispatch + per-frame EOS readback), not real-time playback.
+   *
+   * `realtimeFactor = genMs / audioDurationMs`; < 1 means we generate faster
+   * than real time (the goal). A `warmup` run (default on) is done first so the
+   * timed run does not eat the one-time JIT compile of the fused/unfused traces.
+   *
+   * Usage: `await window.__pipeline().tts.benchSynth("some sentence.", { fused: true })`
+   */
+  async benchSynth(
+    sentence: string,
+    {
+      fused = false,
+      voice = TTS_VOICES[0],
+      seed = 1234,
+      warmup = true,
+    }: {
+      fused?: boolean;
+      voice?: TTSVoice;
+      seed?: number;
+      warmup?: boolean;
+    } = {},
+  ): Promise<{
+    genMs: number;
+    firstAudioMs: number;
+    audioDurationMs: number;
+    realtimeFactor: number;
+  }> {
+    const [prepared, framesAfterEos] = this.prepareTextPrompt(sentence);
+    const tokens = this.tokenizer.encode(prepared);
+    const voiceEmbed = await this.getVoiceEmbed(voice);
+
+    const runOnce = async (): Promise<{
+      genMs: number;
+      firstAudioMs: number;
+      audioDurationMs: number;
+    }> => {
+      const tokensAr = np.array(tokens, { dtype: np.uint32 });
+      let embeds = this.model.flowLM.conditionerEmbed.ref.slice(tokensAr);
+      embeds = np.concatenate([voiceEmbed.ref, embeds]);
+
+      const inner = createStreamingPlayer({ collectPcm: true });
+      let firstAudioMs = 0;
+      const start = performance.now();
+      const player = withFirstAudio(inner, () => {
+        if (firstAudioMs === 0) firstAudioMs = performance.now() - start;
+      });
+      try {
+        await playTTS(player, tree.ref(this.model), embeds, {
+          framesAfterEos,
+          seed,
+          temperature: 0.7,
+          lsdDecodeSteps: 1,
+          signal: null,
+        });
+      } finally {
+        // playTTS consumed the embeds ref; drain any pending PCM copy.
+      }
+      const genMs = performance.now() - start;
+      const samples = inner.pcm().length;
+      await inner.close();
+      return {
+        genMs,
+        firstAudioMs,
+        audioDurationMs: (samples / TTS_SAMPLE_RATE) * 1000,
+      };
+    };
+
+    const prev = TUNABLES.ttsFusedStep;
+    TUNABLES.ttsFusedStep = fused;
+    try {
+      if (warmup) await runOnce();
+      const { genMs, firstAudioMs, audioDurationMs } = await runOnce();
+      return {
+        genMs,
+        firstAudioMs,
+        audioDurationMs,
+        realtimeFactor: audioDurationMs > 0 ? genMs / audioDurationMs : NaN,
+      };
+    } finally {
+      TUNABLES.ttsFusedStep = prev;
+    }
+  }
+
+  /**
    * Pre-synthesize the backchannel phrases once (off the audio graph) and cache
    * their PCM, so `playBackchannel()` never touches the GPU mid-conversation.
    */
