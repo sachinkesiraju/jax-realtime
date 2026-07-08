@@ -88,8 +88,15 @@ const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
 // the assistant's reply is the user talking over it (not our own playback), so
 // interrupt on energy alone — the ASR path often misses it because the mic
 // picks up a mix of user + assistant and the self-echo filter drops it.
-const BARGE_ENERGY_LEVEL = 0.08;
-const BARGE_ENERGY_TICKS = 3; // ~450 ms sustained → interrupt
+// Adaptive energy barge-in. The threshold is the per-reply echo floor (the
+// loudest the mic hears during the calibration window, when only our own
+// playback is audible) times a ratio, with an absolute minimum so a silent
+// echo floor doesn't make a whisper trigger. Fewer sustained ticks than before
+// so short interjections ("wait", "stop") interrupt.
+const BARGE_FLOOR_CALIB_TICKS = 3; // ~450 ms to estimate the echo floor
+const BARGE_ENERGY_RATIO = 1.8; // user must clear the echo floor by this much
+const BARGE_ENERGY_MIN = 0.05; // absolute floor (level units, min·4 RMS)
+const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
 const BACKCHANNEL_PAUSE_MIN = 450;
 const BACKCHANNEL_PAUSE_MAX = 800;
@@ -191,6 +198,9 @@ export class DuplexSession {
   private silenceStart = 0;
   private aboveTicks = 0;
   private aboveBargeTicks = 0; // consecutive ticks above the energy-barge level
+  // Adaptive barge-in echo-floor calibration (reset each reply).
+  private bargeFloor = 0;
+  private bargeFloorTicks = 0;
   private backchannelUsed = false;
   // A barge-in continuation skips the phantom-turn guard (its sustained energy
   // already proved itself to the barge detector).
@@ -342,21 +352,33 @@ export class DuplexSession {
 
     if (level > START_LEVEL) this.aboveTicks++;
     else this.aboveTicks = 0;
-    if (level > BARGE_ENERGY_LEVEL) this.aboveBargeTicks++;
-    else this.aboveBargeTicks = 0;
 
-    // 1. Barge-in: stop the assistant the moment the user talks over it. Two
-    //    independent triggers — sustained mic energy (robust: the ASR path
-    //    frequently misses talk-over because the self-echo filter discards the
-    //    user's words mixed with our playback), or a freshly-committed word.
+    // 1. Barge-in: stop the assistant the moment the user talks over it.
+    //    Energy-based, and ADAPTIVE — a fixed threshold failed in the wild: on
+    //    real hardware the assistant's own playback leaks into the mic (echo
+    //    cancellation is imperfect) and, worse, the mic's AGC ducks the user
+    //    during double-talk, so the absolute level of a genuine interruption
+    //    varies wildly by device. Instead we calibrate the echo/ambient floor
+    //    over the reply's first few ticks (before the user could react) and
+    //    fire when the level clears that floor by a ratio. The ASR path can't
+    //    help here — it's paused during assistant speech to free the GPU.
     if (this.phase === "responding" && this.assistant) {
-      const energyBarge = this.aboveBargeTicks >= BARGE_ENERGY_TICKS;
-      const asrBarge =
-        this.aboveTicks >= BARGE_TICKS &&
-        this.transcriber.committedWordCount >= BARGE_MIN_WORDS;
-      if (energyBarge || asrBarge) {
-        this.handleBargeIn(now);
-        return;
+      if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
+        // Calibration window: the loudest thing the mic hears now is our own
+        // echo, so take the max as the floor to beat.
+        this.bargeFloor = Math.max(this.bargeFloor, level);
+        this.bargeFloorTicks++;
+      } else {
+        const threshold = Math.max(
+          BARGE_ENERGY_MIN,
+          this.bargeFloor * BARGE_ENERGY_RATIO,
+        );
+        if (level > threshold) this.aboveBargeTicks++;
+        else this.aboveBargeTicks = 0;
+        if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
+          this.handleBargeIn(now);
+          return;
+        }
       }
     }
 
@@ -597,6 +619,10 @@ export class DuplexSession {
     };
     this.assistant = state;
     this.currentTtsText = "";
+    // Recalibrate the adaptive barge-in echo floor for this reply.
+    this.bargeFloor = 0;
+    this.bargeFloorTicks = 0;
+    this.aboveBargeTicks = 0;
     this.cb.onAssistantStart();
     this.cb.onStageActivity("llm", true);
 
