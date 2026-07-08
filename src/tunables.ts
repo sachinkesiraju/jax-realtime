@@ -76,9 +76,12 @@ export const TUNABLES = {
   llmKvReuse: false,
   /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
-   * (whole user/assistant pairs). 0 = unlimited (shipped behavior).
+   * (whole user/assistant pairs). 0 = unlimited. Shipped at 16 (8 exchanges):
+   * unbounded history let Gemma's prefill grow every turn until a long session
+   * crawled (and risked a capacity throw that wedged the response path); a
+   * rolling window keeps recent context while bounding per-turn cost.
    */
-  llmMaxHistoryTurns: 0,
+  llmMaxHistoryTurns: 16,
 
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */

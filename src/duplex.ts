@@ -83,6 +83,11 @@ function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } 
   return { voicedMs: voiced * 30, peak };
 }
 const MAX_UTTERANCE_MS = 28_000;
+// Hard cap on how long the engine may stay in "responding". A real reply
+// (generate + speak, even a long one with a background tool) finishes well
+// inside this; exceeding it means the response path wedged, and the watchdog
+// force-recovers to listening so the session can't die silently.
+const RESPONDING_MAX_MS = 30_000;
 // Cap on the rolling per-turn bench log so a long live session can't grow it
 // (and its retained strings) without bound.
 const TURN_LOG_MAX = 500;
@@ -195,6 +200,7 @@ export class DuplexSession {
   readonly history: ChatMessage[] = [];
 
   private phase: Phase = "listening";
+  private respondingSince = 0; // perf.now() when the current reply began (watchdog)
   private sessionStart = 0;
 
   // User-speech tracking (listening phase).
@@ -387,6 +393,18 @@ export class DuplexSession {
     }
 
     if (this.phase === "responding") {
+      // Watchdog: a reply should never take this long. If we're still
+      // "responding" past the cap, something wedged (an unhandled error in the
+      // response path, a stalled generation) and the session would otherwise be
+      // dead forever — every tick early-returns here. Force-recover to
+      // listening so the user isn't stuck talking to a frozen assistant.
+      if (this.respondingSince && now - this.respondingSince > RESPONDING_MAX_MS) {
+        this.cb.onEvent("recovered · response stalled");
+        this.assistant?.controller.abort();
+        this.assistant = null;
+        this.proactiveSpeaking = false;
+        this.startFreshListening();
+      }
       // Nothing else to do while responding (barge-in handled above).
       return;
     }
@@ -490,6 +508,7 @@ export class DuplexSession {
 
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
+    this.respondingSince = performance.now(); // watchdog clock
 
     // Bench instrumentation: per-turn stage marks (see tunables.ts).
     this.turnMarks = {
@@ -996,6 +1015,7 @@ export class DuplexSession {
   /** Fresh listening window: drop buffered audio and reset ASR commit state. */
   private startFreshListening(): void {
     this.phase = "listening";
+    this.respondingSince = 0;
     this.capture.clear();
     this.transcriber?.reset();
     this.resetUtterance();

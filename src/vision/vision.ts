@@ -10,9 +10,22 @@ import type { Detection, ObjectDetector } from "./detector";
 // ASR/LLM/TTS — so it detects infrequently and yields the GPU to the audio
 // pipeline (see `pauseWhile`).
 const FRAME_INTERVAL_MS = 2200;
+// While the scene isn't yet established (no stable person), poll faster so a
+// person who just sat down registers within ~1 s instead of up to one full
+// low-priority interval. Once a person is stable we relax to FRAME_INTERVAL_MS.
+const SEARCH_INTERVAL_MS = 700;
 // Retry cadence after a tick was skipped for priority reasons — cheap (no GPU
 // work happened) and keeps the Eye from starving while audio stays busy.
 const SKIP_RETRY_MS = 250;
+// Confidence floor for a detection to be reported in the scene description /
+// answers (the overlay still draws everything above the detector threshold).
+// D-FINE-S (COCO) confidently confuses similar furniture (bed/couch/chair) in
+// the 0.55-0.7 band on a webcam; 0.62 trims the worst of it. Genuine confusions
+// above this are a small-detector accuracy limit, not something the app can fix.
+const SCENE_MIN_SCORE = 0.62;
+// Cap the scene description to its most confident objects — a long tail of
+// low-ish detections reads as noise even when each clears the floor.
+const SCENE_MAX_OBJECTS = 4;
 const POSTURE_BASELINE = 6; // rolling frames used for the slouch baseline
 // A label must appear in ≥2 of the last STABILITY_FRAMES detector frames to be
 // reported — this filters flickering false positives (a "cat" that D-FINE only
@@ -105,7 +118,13 @@ export class VisionSession {
 
   /** Detections in the latest frame limited to temporally-stable labels. */
   private stableDetections(): Detection[] {
-    return this.latest.filter((d) => this.stableSet.has(d.label));
+    // Confidence floor on top of stability: D-FINE confidently flickers
+    // background furniture (a "couch"/"bed" at ~0.5) in a webcam scene, and
+    // reporting those as fact reads as hallucination. Real, salient objects
+    // (the person, a held phone) sit well above this.
+    return this.latest.filter(
+      (d) => d.score >= SCENE_MIN_SCORE && this.stableSet.has(d.label),
+    );
   }
 
   /**
@@ -199,14 +218,15 @@ export class VisionSession {
     if (byLabel.size === 0) return "";
     const parts = [...byLabel.entries()]
       .sort((a, b) => b[1].length - a[1].length)
-      .slice(0, 6)
+      .slice(0, SCENE_MAX_OBJECTS)
       .map(([label, dets]) => {
         const n = dets.length;
-        if (n === 1) {
-          const color = dets[0].color;
-          const desc = color ? `${color} ${label}` : label;
-          return `${/^[aeiou]/.test(color ?? label) ? "an" : "a"} ${desc}`;
-        }
+        // Colours are deliberately NOT volunteered here: the cheap box-average
+        // sampler is unreliable under webcam lighting (it has called a navy
+        // polo "dark red" and a person "orange"), so stating a colour unasked
+        // reads as hallucination. A direct "what colour is X" still answers
+        // from the measurement in answer(), where it's explicitly requested.
+        if (n === 1) return `${/^[aeiou]/.test(label) ? "an" : "a"} ${label}`;
         return `${numWord(n)} ${pluralize(label)}`;
       });
     return joinList(parts);
@@ -356,7 +376,13 @@ export class VisionSession {
     // to appear after enabling the Eye.
     void this.tick().then((ran) => {
       if (!this.running) return;
-      const delay = ran ? FRAME_INTERVAL_MS : SKIP_RETRY_MS;
+      // Completed frame: fast search cadence until a person is established,
+      // then relax to the low-priority interval. Skipped frame: retry soon.
+      const delay = ran
+        ? this.personCount > 0
+          ? FRAME_INTERVAL_MS
+          : SEARCH_INTERVAL_MS
+        : SKIP_RETRY_MS;
       this.timer = setTimeout(() => this.loop(), delay);
     });
   }
