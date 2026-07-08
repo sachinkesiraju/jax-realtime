@@ -3,8 +3,6 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/600.css";
 import "./style.css";
 
-import { getWebGPUDevice } from "@jax-js/jax";
-
 import { DuplexSession } from "./duplex";
 import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
@@ -349,9 +347,11 @@ async function handleLoad() {
     pipeline = await loadPipeline(onDownloadProgress);
     el.laneAsr.textContent = pipeline.asrDevice;
     // The per-card lanes already say "webgpu"; make this chip earn its place by
-    // naming the actual GPU everything is running on.
+    // naming the actual GPU everything is running on. Chrome populates the
+    // adapter-level info (vendor/architecture), not GPUDevice.adapterInfo.
     try {
-      const info = getWebGPUDevice().adapterInfo;
+      const adapter = await navigator.gpu.requestAdapter();
+      const info = adapter?.info;
       const gpu =
         info?.description ||
         [info?.vendor, info?.architecture].filter(Boolean).join(" ");
