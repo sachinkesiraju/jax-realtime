@@ -12,7 +12,9 @@
     "@fontsource-variable/instrument-sans": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@jax-js/jax": "^0.1.18",
-    "@jax-js/loaders": "^0.1.2"
+    "@jax-js/loaders": "^0.1.2",
+    "@jax-js/onnx": "^0.1.2",
+    "onnx-buf": "^1.20.0-1"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.70",

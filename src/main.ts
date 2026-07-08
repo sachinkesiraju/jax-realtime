@@ -1,10 +1,17 @@
+import "@fontsource-variable/instrument-sans";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/600.css";
 import "./style.css";
 
+import { DuplexSession } from "./duplex";
 import { VoiceCapture } from "./mic";
-import { analyserLevel, Orb } from "./orb";
+import { Orb } from "./orb";
+import type { ToolKind, UiCard } from "./tools/tools";
+import { ObjectDetector } from "./vision/detector";
+import { VisionSession } from "./vision/vision";
 import {
   CerebrasChatModel,
-  type ChatMessage,
+  type ChatModel,
   type DownloadProgress,
   loadPipeline,
   TTS_VOICES,
@@ -14,16 +21,6 @@ import {
 
 type Stage = "asr" | "llm" | "tts";
 
-// Voice-activity detection tuning (levels are VoiceCapture.level() units).
-const VAD = {
-  startLevel: 0.07,
-  stopLevel: 0.04,
-  silenceMs: 900,
-  minSpeechMs: 500,
-  maxUtteranceMs: 28_000,
-  partialIntervalMs: 1_500,
-};
-
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
 app.innerHTML = `
@@ -32,31 +29,39 @@ app.innerHTML = `
       <div>
         <h1>jax&#8209;realtime</h1>
         <p class="tagline">
-          A speech&#8209;to&#8209;speech voice assistant running entirely in your browser
-          with <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a> on WebGPU
-          &mdash; the same ASR&nbsp;&rarr;&nbsp;LLM&nbsp;&rarr;&nbsp;TTS pipeline as the
-          <a href="https://huggingface.co/blog/cerebras-gemma4-voice-ai" target="_blank">HF &times; Cerebras voice AI demo</a>.
+          A full&#8209;duplex voice assistant running entirely in your browser with
+          <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a>
+          &mdash; no turn buttons: it listens while it talks, you can interrupt it
+          mid&#8209;sentence, and it backchannels while you speak, in the spirit of
+          <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">interaction models</a>
+          and the <a href="https://huggingface.co/blog/cerebras-gemma4-voice-ai" target="_blank">HF &times; Cerebras demo</a>.
         </p>
       </div>
     </header>
 
     <section class="rail" aria-label="Pipeline stages">
       <div class="stage" id="stage-asr">
-        <span class="stage-role">Ear</span>
+        <span class="stage-role"><span class="stage-dot" id="dot-asr"></span>Ear <span class="stage-lane" id="lane-asr"></span></span>
         <span class="stage-model">Whisper tiny.en</span>
         <span class="stage-metric" id="metric-asr">&ndash;</span>
       </div>
       <span class="rail-arrow">&rarr;</span>
       <div class="stage" id="stage-llm">
-        <span class="stage-role">Brain</span>
+        <span class="stage-role"><span class="stage-dot" id="dot-llm"></span>Brain <span class="stage-lane">webgpu</span></span>
         <span class="stage-model" id="llm-label">Gemma 3 270M</span>
         <span class="stage-metric" id="metric-llm">&ndash;</span>
       </div>
       <span class="rail-arrow">&rarr;</span>
       <div class="stage" id="stage-tts">
-        <span class="stage-role">Voice</span>
+        <span class="stage-role"><span class="stage-dot" id="dot-tts"></span>Voice <span class="stage-lane">webgpu</span></span>
         <span class="stage-model">Kyutai Pocket TTS</span>
         <span class="stage-metric" id="metric-tts">&ndash;</span>
+      </div>
+      <span class="rail-arrow rail-arrow-eye">&rarr;</span>
+      <div class="stage stage-eye" id="stage-eye">
+        <span class="stage-role"><span class="stage-dot" id="dot-eye"></span>Eye <span class="stage-lane">webgpu</span></span>
+        <span class="stage-model">D&#8209;FINE</span>
+        <span class="stage-metric" id="metric-eye">off</span>
       </div>
     </section>
 
@@ -64,24 +69,40 @@ app.innerHTML = `
       <div class="console-status">
         <span class="status-dot" id="status-dot"></span>
         <span id="status-text">standing by</span>
+        <span class="bg-pill" id="bg-pill" hidden>background</span>
+      </div>
+
+      <div class="pip" id="pip" hidden>
+        <canvas id="pip-overlay"></canvas>
+        <span class="pip-label">eye · D-FINE</span>
       </div>
 
       <div class="orb-area">
         <button id="orb-btn" class="orb-btn" aria-label="Start conversation" disabled>
           <canvas id="orb-canvas"></canvas>
         </button>
+        <p class="captions" id="captions" hidden>
+          <span id="cap-committed"></span><span id="cap-tentative" class="cap-tentative"></span>
+        </p>
         <p class="orb-hint" id="orb-hint">
-          Load the models, then press the orb and just talk &mdash; turns are
-          detected automatically.<br />
+          Load the models, then press the orb once and just talk &mdash; no
+          buttons between turns. Talk over it to interrupt.<br />
           The first load downloads ~750&nbsp;MB of weights; cached afterwards.
         </p>
+        <p class="ticker" id="ticker"></p>
       </div>
 
       <div class="transcript" id="transcript"></div>
 
+      <div class="canvas-panel" id="canvas-panel" hidden></div>
+
       <div class="dock">
         <button id="load-btn" class="load-btn">Load models</button>
         <div class="dock-side">
+          <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
+            <input type="checkbox" id="eye-toggle" disabled />
+            <span>Eye &middot; webcam</span>
+          </label>
           <label class="field">
             <span>Voice</span>
             <select id="voice-select"></select>
@@ -116,6 +137,10 @@ const el = {
   orbBtn: document.querySelector<HTMLButtonElement>("#orb-btn")!,
   orbCanvas: document.querySelector<HTMLCanvasElement>("#orb-canvas")!,
   orbHint: document.querySelector<HTMLParagraphElement>("#orb-hint")!,
+  captions: document.querySelector<HTMLParagraphElement>("#captions")!,
+  capCommitted: document.querySelector<HTMLSpanElement>("#cap-committed")!,
+  capTentative: document.querySelector<HTMLSpanElement>("#cap-tentative")!,
+  ticker: document.querySelector<HTMLParagraphElement>("#ticker")!,
   statusDot: document.querySelector<HTMLSpanElement>("#status-dot")!,
   statusText: document.querySelector<HTMLSpanElement>("#status-text")!,
   transcript: document.querySelector<HTMLDivElement>("#transcript")!,
@@ -124,15 +149,25 @@ const el = {
   cerebrasKey: document.querySelector<HTMLInputElement>("#cerebras-key")!,
   cerebrasModel: document.querySelector<HTMLInputElement>("#cerebras-model")!,
   llmLabel: document.querySelector<HTMLSpanElement>("#llm-label")!,
+  backendChip: document.querySelector<HTMLSpanElement>("#backend-chip")!,
+  laneAsr: document.querySelector<HTMLSpanElement>("#lane-asr")!,
+  eyeToggle: document.querySelector<HTMLInputElement>("#eye-toggle")!,
+  stageEye: document.querySelector<HTMLDivElement>("#stage-eye")!,
+  metricEye: document.querySelector<HTMLSpanElement>("#metric-eye")!,
+  dotEye: document.querySelector<HTMLSpanElement>("#dot-eye")!,
+  pip: document.querySelector<HTMLDivElement>("#pip")!,
+  pipOverlay: document.querySelector<HTMLCanvasElement>("#pip-overlay")!,
+  bgPill: document.querySelector<HTMLSpanElement>("#bg-pill")!,
+  canvasPanel: document.querySelector<HTMLDivElement>("#canvas-panel")!,
   metrics: {
     asr: document.querySelector<HTMLSpanElement>("#metric-asr")!,
     llm: document.querySelector<HTMLSpanElement>("#metric-llm")!,
     tts: document.querySelector<HTMLSpanElement>("#metric-tts")!,
   },
-  stages: {
-    asr: document.querySelector<HTMLDivElement>("#stage-asr")!,
-    llm: document.querySelector<HTMLDivElement>("#stage-llm")!,
-    tts: document.querySelector<HTMLDivElement>("#stage-tts")!,
+  dots: {
+    asr: document.querySelector<HTMLSpanElement>("#dot-asr")!,
+    llm: document.querySelector<HTMLSpanElement>("#dot-llm")!,
+    tts: document.querySelector<HTMLSpanElement>("#dot-tts")!,
   },
 };
 
@@ -146,16 +181,25 @@ el.voiceSelect.value = "azelma";
 
 const orb = new Orb(el.orbCanvas);
 const capture = new VoiceCapture();
-if (import.meta.env.DEV) {
-  (window as unknown as Record<string, unknown>).__capture = capture;
-}
 let pipeline: VoicePipeline | null = null;
-let session = false;
-let sessionEnding = false;
-const history: ChatMessage[] = [];
+let duplex: DuplexSession | null = null;
+let sessionActive = false;
+let toggling = false;
+let assistantBubble: HTMLDivElement | null = null;
+let toolChip: HTMLDivElement | null = null;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Vision "Eye" stage (D-FINE). Loaded lazily when the dock toggle is enabled.
+let detector: ObjectDetector | null = null;
+let vision: VisionSession | null = null;
+let visionRaf: number | null = null;
+let visionBusy = false;
+
+if (import.meta.env.DEV) {
+  const dev = window as unknown as Record<string, unknown>;
+  dev.__capture = capture;
+  dev.__getDuplex = () => duplex;
+  dev.__vision = () => vision;
+  dev.__detector = () => detector;
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {
@@ -165,12 +209,6 @@ function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idl
 
 function setHint(text: string) {
   el.orbHint.innerHTML = text;
-}
-
-function setActiveStage(stage: Stage | null) {
-  for (const [name, node] of Object.entries(el.stages)) {
-    node.classList.toggle("is-active", name === stage);
-  }
 }
 
 function formatMs(ms: number): string {
@@ -183,6 +221,78 @@ function addBubble(role: "user" | "assistant"): HTMLDivElement {
   el.transcript.appendChild(bubble);
   el.transcript.scrollTop = el.transcript.scrollHeight;
   return bubble;
+}
+
+function tick(text: string) {
+  el.ticker.textContent = text;
+}
+
+// A monospace chip in the transcript stream, shown while a background tool task
+// runs and resolved to "done" when the result lands (like the TML web_search chip).
+function addToolChip(kind: ToolKind, query: string): HTMLDivElement {
+  const chip = document.createElement("div");
+  chip.className = "tool-chip";
+  const verb = kind === "weather" ? "weather" : "web_search";
+  const dot = document.createElement("span");
+  dot.className = "chip-dot";
+  const label = document.createElement("span");
+  label.textContent = `${verb} · ${query}`;
+  chip.append(dot, label);
+  el.transcript.appendChild(chip);
+  el.transcript.scrollTop = el.transcript.scrollHeight;
+  return chip;
+}
+
+// Generative UI: render the latest tool result as a data card in the canvas panel.
+function renderCard(card: UiCard) {
+  const panel = el.canvasPanel;
+  panel.hidden = false;
+  panel.replaceChildren();
+
+  const make = (cls: string, text?: string): HTMLDivElement => {
+    const d = document.createElement("div");
+    d.className = cls;
+    if (text !== undefined) d.textContent = text;
+    return d;
+  };
+
+  if (card.kind === "weather") {
+    panel.classList.add("is-weather");
+    const head = make("card-head", card.location);
+    const big = make("card-temp");
+    big.textContent = `${card.emoji} ${card.temperature}°`;
+    const cond = make("card-sub", card.condition);
+    const wind = make("card-meta", `wind ${card.wind}`);
+    panel.append(head, big, cond, wind);
+  } else if (card.kind === "factcard") {
+    panel.classList.remove("is-weather");
+    const head = make("card-head", card.title);
+    const body = make("card-body", card.extract);
+    const src = make("card-meta", `via ${card.source}`);
+    panel.append(head, body, src);
+  } else {
+    panel.classList.remove("is-weather");
+    const head = make("card-head", card.title);
+    panel.append(head);
+    const ul = document.createElement("ul");
+    ul.className = "card-list";
+    for (const item of card.items) {
+      const li = document.createElement("li");
+      li.textContent = item;
+      ul.appendChild(li);
+    }
+    panel.append(ul);
+  }
+}
+
+function currentModel(): ChatModel {
+  const key = el.cerebrasKey.value.trim();
+  if (key && pipeline) {
+    el.llmLabel.textContent = `Cerebras · ${el.cerebrasModel.value.trim()}`;
+    return new CerebrasChatModel(key, el.cerebrasModel.value.trim());
+  }
+  el.llmLabel.textContent = "Gemma 3 270M";
+  return pipeline!.llm;
 }
 
 const downloadRows = new Map<string, HTMLDivElement>();
@@ -222,14 +332,27 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
+    el.laneAsr.textContent = pipeline.asrDevice;
+    el.backendChip.textContent = pipeline.dualLane ? "WebGPU + Wasm" : "WebGPU";
+    setStatus("preparing backchannels", "busy");
+    await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
+    el.eyeToggle.disabled = false;
     orb.setState("idle");
     setStatus("ready", "idle");
-    setHint("Press the orb and just talk &mdash; turns are detected automatically.");
+    setHint(
+      "Press the orb once and just talk &mdash; interrupt it, pause, ask it to " +
+        "time things. Press again to end.",
+    );
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
+    // Eye ("webcam") is on by default — enable it after load. toggleVision
+    // fails gracefully (unchecks itself) if there's no camera or permission is
+    // denied, so this never blocks the rest of the app.
+    el.eyeToggle.checked = true;
+    void toggleVision(true);
   } catch (error) {
     console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");
@@ -237,204 +360,255 @@ async function handleLoad() {
   }
 }
 
-type Utterance = {
-  samples: Float32Array;
-  duration: number;
-  liveBubble: HTMLDivElement | null;
-};
+el.voiceSelect.addEventListener("change", () => {
+  // Re-synthesize backchannel clips in the new voice (background, best-effort).
+  void pipeline?.tts
+    .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+    .catch(() => {});
+});
 
-/**
- * Wait for one utterance: speech onset, then trailing silence. While the user
- * is talking, run incremental Whisper passes to stream a live transcript.
- */
-async function listenForUtterance(): Promise<Utterance | null> {
-  capture.clear();
-  await capture.resume();
-  orb.setState("listening", () => capture.level());
-  setStatus("listening — just talk", "live");
-
-  let speechStart = 0;
-  let silenceStart = 0;
-  let lastPartial = 0;
-  let partialBusy = false;
-  let partialChain: Promise<void> = Promise.resolve();
-  const live: { bubble: HTMLDivElement | null } = { bubble: null };
-
-  while (session) {
-    await sleep(100);
-    const level = capture.level();
-    const now = performance.now();
-
-    if (!speechStart) {
-      if (level > VAD.startLevel) speechStart = now;
-      continue;
-    }
-
-    if (level < VAD.stopLevel) {
-      if (!silenceStart) silenceStart = now;
-    } else {
-      silenceStart = 0;
-    }
-
-    const speechMs = now - speechStart;
-    const trailingSilence = silenceStart ? now - silenceStart : 0;
-    if (
-      (trailingSilence > VAD.silenceMs && speechMs > VAD.minSpeechMs) ||
-      speechMs > VAD.maxUtteranceMs
-    ) {
-      break;
-    }
-
-    // Live transcript: incremental Whisper pass on the buffer so far.
-    if (
-      pipeline &&
-      !partialBusy &&
-      now - lastPartial > VAD.partialIntervalMs &&
-      speechMs > 600
-    ) {
-      partialBusy = true;
-      lastPartial = now;
-      const snapshot = capture.samples();
-      partialChain = pipeline.asr
-        .transcribe(snapshot, snapshot.length / 16_000)
-        .then((text) => {
-          if (text && session) {
-            live.bubble ??= addBubble("user");
-            live.bubble.classList.add("is-live");
-            live.bubble.textContent = text;
-            el.transcript.scrollTop = el.transcript.scrollHeight;
-          }
-        })
-        .catch((error) => console.warn("partial ASR failed", error))
-        .finally(() => {
-          partialBusy = false;
-        });
-    }
-  }
-
-  await partialChain;
-  if (!session) {
-    live.bubble?.remove();
-    return null;
-  }
-  await capture.pause();
-  return {
-    samples: capture.samples(),
-    duration: capture.durationSeconds(),
-    liveBubble: live.bubble,
-  };
+function stageActivity(stage: Stage, active: boolean) {
+  el.dots[stage].classList.toggle("is-on", active);
 }
 
-async function processTurn(utterance: Utterance): Promise<void> {
+// --- Vision "Eye" stage -------------------------------------------------
+
+function drawPreview() {
+  visionRaf = requestAnimationFrame(drawPreview);
+  if (!vision) return;
+  const video = vision.video;
+  const overlay = el.pipOverlay;
+  const cssSize = overlay.clientWidth;
+  if (!cssSize || !video.videoWidth) return;
+  const ratio = window.devicePixelRatio || 1;
+  const px = Math.floor(cssSize * ratio);
+  if (overlay.width !== px || overlay.height !== px) {
+    overlay.width = px;
+    overlay.height = px;
+  }
+  const ctx = overlay.getContext("2d")!;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, cssSize, cssSize);
+
+  // The pip shows the center square (object-fit: cover on a square box), which
+  // is exactly the region the detector center-crops, so detection boxes (in
+  // source pixels) map linearly onto it.
+  const crop = Math.min(video.videoWidth, video.videoHeight);
+  const sx = (video.videoWidth - crop) / 2;
+  const sy = (video.videoHeight - crop) / 2;
+  const scale = cssSize / crop;
+
+  ctx.lineWidth = 2;
+  ctx.font = "600 10px " + getComputedStyle(document.body).fontFamily;
+  for (const det of vision.latest) {
+    const x = (det.box[0] - sx) * scale;
+    const y = (det.box[1] - sy) * scale;
+    const w = det.box[2] * scale;
+    const h = det.box[3] * scale;
+    ctx.strokeStyle = "oklch(90% 0.19 118)";
+    ctx.strokeRect(x, y, w, h);
+    const label = `${det.label} ${(det.score * 100).toFixed(0)}%`;
+    ctx.fillStyle = "oklch(90% 0.19 118 / 0.85)";
+    const tw = ctx.measureText(label).width + 6;
+    ctx.fillRect(x, Math.max(0, y - 13), tw, 13);
+    ctx.fillStyle = "oklch(20% 0.05 118)";
+    ctx.fillText(label, x + 3, Math.max(10, y - 3));
+  }
+  // Highlight the number of people (the meaningful signal), not raw object
+  // count — a room full of chairs shouldn't read as "6 obj".
+  const people = vision.personCount;
+  el.metricEye.textContent =
+    people === 0 ? "no people" : `${people} ${people === 1 ? "person" : "people"}`;
+  el.dotEye.classList.toggle("is-on", vision.active);
+}
+
+async function enableVision(): Promise<void> {
   if (!pipeline) return;
-  orb.setState("thinking");
-
-  // 1. ASR (final pass over the full utterance)
-  setActiveStage("asr");
-  setStatus("transcribing", "busy");
-  const asrStart = performance.now();
-  const text = await pipeline.asr.transcribe(
-    utterance.samples,
-    utterance.duration,
-  );
-  el.metrics.asr.textContent = formatMs(performance.now() - asrStart);
-
-  if (!text) {
-    utterance.liveBubble?.remove();
-    setActiveStage(null);
-    return;
+  setStatus("loading D-FINE detector", "busy");
+  if (!detector) {
+    detector = await ObjectDetector.load(onDownloadProgress);
+    setStatus("warming up D-FINE", "busy");
+    await detector.warmup();
+    setTimeout(() => (el.downloads.hidden = true), 1500);
   }
-  const userBubble = utterance.liveBubble ?? addBubble("user");
-  userBubble.classList.remove("is-live");
-  userBubble.textContent = text;
-  history.push({ role: "user", content: text });
-
-  // 2. LLM
-  setActiveStage("llm");
-  setStatus("thinking", "busy");
-  setHint("Thinking&hellip;");
-  const bubble = addBubble("assistant");
-  const cerebrasKey = el.cerebrasKey.value.trim();
-  const llm = cerebrasKey
-    ? new CerebrasChatModel(cerebrasKey, el.cerebrasModel.value.trim())
-    : pipeline.llm;
-  el.llmLabel.textContent = cerebrasKey
-    ? `Cerebras · ${el.cerebrasModel.value.trim()}`
-    : "Gemma 3 270M";
-  const { text: reply, stats } = await llm.generate(history, (partial) => {
-    bubble.textContent = partial;
-    el.transcript.scrollTop = el.transcript.scrollHeight;
-  });
-  el.metrics.llm.textContent = `${formatMs(stats.totalMs)} · ${stats.newTokens} tok`;
-
-  if (!reply) {
-    bubble.textContent = "(no reply)";
-    setActiveStage(null);
-    return;
-  }
-  bubble.textContent = reply;
-  history.push({ role: "assistant", content: reply });
-
-  // 3. TTS (mic is paused, so the assistant doesn't hear itself)
-  setActiveStage("tts");
-  setStatus("speaking", "live");
-  setHint("Speaking&hellip; the orb keeps listening after.");
-  const speakable = reply.replace(/[*_`#>|]/g, "").replace(/\s+/g, " ");
-  const ttsStats = await pipeline.tts.speak(
-    el.voiceSelect.value as TTSVoice,
-    speakable,
-    (analyser) => {
-      const buffer = new Float32Array(analyser.fftSize);
-      orb.setState("speaking", () => analyserLevel(analyser, buffer));
-    },
-  );
-  el.metrics.tts.textContent = `${formatMs(ttsStats.firstAudioMs)} to audio`;
-  setActiveStage(null);
-  setHint("Just talk. Press the orb again to end the conversation.");
+  vision = new VisionSession(detector);
+  // Vision is the lowest-priority stage: skip a detection frame whenever the
+  // audio pipeline is using the GPU (an ASR pass or the assistant speaking).
+  vision.pauseWhile = () =>
+    duplex ? duplex.audioActive() : (pipeline?.asr.isBusy ?? false);
+  // Mount the session's video element into the pip (behind the overlay).
+  vision.video.className = "pip-video";
+  el.pip.insertBefore(vision.video, el.pipOverlay);
+  await vision.start();
+  el.pip.hidden = false;
+  el.stageEye.classList.add("is-active");
+  if (visionRaf === null) drawPreview();
+  duplex?.setVision(vision);
+  tick("eye · webcam on (D-FINE on webgpu)");
+  setStatus(sessionActive ? "listening — just talk" : "ready", sessionActive ? "live" : "idle");
 }
 
-async function conversationLoop() {
+function disableVision(): void {
+  duplex?.setVision(null);
+  vision?.stop();
+  if (vision?.video.parentElement) vision.video.remove();
+  vision = null;
+  if (visionRaf !== null) {
+    cancelAnimationFrame(visionRaf);
+    visionRaf = null;
+  }
+  el.pip.hidden = true;
+  el.stageEye.classList.remove("is-active");
+  el.dotEye.classList.remove("is-on");
+  el.metricEye.textContent = "off";
+}
+
+async function toggleVision(enabled: boolean): Promise<void> {
+  if (visionBusy) return;
+  visionBusy = true;
+  el.eyeToggle.disabled = true;
   try {
-    await capture.start();
+    if (enabled) await enableVision();
+    else disableVision();
+  } catch (error) {
+    console.error(error);
+    tick(error instanceof Error ? error.message : String(error));
+    el.eyeToggle.checked = false;
+    disableVision();
+  } finally {
+    el.eyeToggle.disabled = false;
+    visionBusy = false;
+  }
+}
+
+function buildSession(pipe: VoicePipeline): DuplexSession {
+  return new DuplexSession({
+    pipeline: pipe,
+    capture,
+    getVoice: () => el.voiceSelect.value as TTSVoice,
+    getModel: currentModel,
+    vision,
+    callbacks: {
+      onCaptions(committed, tentative) {
+        const any = committed || tentative;
+        el.captions.hidden = !any;
+        el.capCommitted.textContent = committed ? committed + " " : "";
+        el.capTentative.textContent = tentative;
+      },
+      onUserTurn(text) {
+        el.captions.hidden = true;
+        addBubble("user").textContent = text;
+      },
+      onAssistantStart() {
+        assistantBubble = addBubble("assistant");
+        setStatus("responding", "busy");
+      },
+      onAssistantPartial(text) {
+        if (assistantBubble) {
+          assistantBubble.textContent = text;
+          el.transcript.scrollTop = el.transcript.scrollHeight;
+        }
+      },
+      onAssistantEnd(text, interrupted) {
+        if (assistantBubble) {
+          const shown = text.trim();
+          if (!shown) assistantBubble.remove();
+          else assistantBubble.textContent = shown + (interrupted ? " —" : "");
+        }
+        assistantBubble = null;
+        if (interrupted) tick("barge-in · assistant yielded");
+        if (sessionActive) setStatus("listening — just talk", "live");
+      },
+      onEvent(text) {
+        tick(text);
+      },
+      onMetric(metric) {
+        if (metric.asrLagMs !== undefined) {
+          el.metrics.asr.textContent = `lag ${formatMs(metric.asrLagMs)}`;
+        }
+        if (metric.turnLatencyMs !== undefined) {
+          el.metrics.llm.textContent = `turn ${formatMs(metric.turnLatencyMs)}`;
+          tick(`turn latency ${formatMs(metric.turnLatencyMs)}`);
+        }
+        if (metric.interruptStopMs !== undefined) {
+          el.metrics.tts.textContent = `stop ${formatMs(metric.interruptStopMs)}`;
+          tick(`barge-in · stopped in ${formatMs(metric.interruptStopMs)}`);
+        }
+      },
+      onStageActivity: stageActivity,
+      onToolCall(kind, query) {
+        toolChip = addToolChip(kind, query);
+        tick(`${kind} · looking up "${query}"`);
+      },
+      onToolResult(card) {
+        if (toolChip) {
+          toolChip.classList.add("is-done");
+          toolChip = null;
+        }
+        renderCard(card);
+      },
+      onBackground(active) {
+        el.bgPill.hidden = !active;
+      },
+      onError(error) {
+        console.error(error);
+        tick(error instanceof Error ? error.message : String(error));
+      },
+    },
+  });
+}
+
+async function handleOrb() {
+  if (!pipeline || toggling) return;
+  toggling = true;
+  try {
+    if (sessionActive && duplex) {
+      setStatus("ending conversation", "busy");
+      el.orbBtn.disabled = true;
+      await duplex.stop();
+      duplex = null;
+      sessionActive = false;
+      el.orbBtn.disabled = false;
+      el.orbBtn.classList.remove("is-recording");
+      el.orbBtn.setAttribute("aria-label", "Start conversation");
+      orb.setState("idle");
+      el.captions.hidden = true;
+      for (const stage of ["asr", "llm", "tts"] as Stage[]) {
+        stageActivity(stage, false);
+      }
+      setStatus("ready", "idle");
+      setHint(
+        "Press the orb once and just talk &mdash; interrupt it, pause, ask it " +
+          "to time things. Press again to end.",
+      );
+      return;
+    }
+
+    duplex = buildSession(pipeline);
+    await duplex.start();
+    sessionActive = true;
+    const session = duplex;
+    orb.setDuplex(
+      () => session.micLevel(),
+      () => session.ttsLevel(),
+    );
     el.orbBtn.classList.add("is-recording");
     el.orbBtn.setAttribute("aria-label", "End conversation");
-    setHint("Just talk. Press the orb again to end the conversation.");
-
-    while (session) {
-      const utterance = await listenForUtterance();
-      if (!utterance || !session) break;
-      await processTurn(utterance);
-    }
+    setStatus("listening — just talk", "live");
+    setHint("Live. Talk naturally; talk over it to interrupt. Press the orb to end.");
+    tick("duplex · live");
   } catch (error) {
     console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");
+    sessionActive = false;
+    duplex = null;
   } finally {
-    session = false;
-    sessionEnding = false;
-    await capture.close();
-    el.orbBtn.classList.remove("is-recording");
-    el.orbBtn.setAttribute("aria-label", "Start conversation");
-    el.orbBtn.disabled = false;
-    setActiveStage(null);
-    orb.setState("idle");
-    if (el.statusDot.dataset.mode !== "error") setStatus("ready", "idle");
-    setHint("Press the orb and just talk &mdash; turns are detected automatically.");
+    toggling = false;
   }
-}
-
-function handleOrb() {
-  if (!pipeline || sessionEnding) return;
-  if (session) {
-    // End the conversation; the loop notices and cleans up.
-    session = false;
-    sessionEnding = true;
-    el.orbBtn.disabled = true;
-    setStatus("ending conversation", "busy");
-    return;
-  }
-  session = true;
-  void conversationLoop();
 }
 
 el.loadBtn.addEventListener("click", () => void handleLoad());
-el.orbBtn.addEventListener("click", handleOrb);
+el.orbBtn.addEventListener("click", () => void handleOrb());
+el.eyeToggle.addEventListener("change", () =>
+  void toggleVision(el.eyeToggle.checked),
+);

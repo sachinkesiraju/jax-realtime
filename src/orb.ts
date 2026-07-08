@@ -273,17 +273,30 @@ export class Orb {
     ctx.fillStyle = body;
     ctx.fill();
 
-    // Red outer ring driven by the user's microphone level.
-    const listening = PALETTES.listening;
-    const ringR = baseR * (1.2 + this.smoothUser * 0.5);
-    const ringWidth = size * (0.012 + this.smoothUser * 0.05);
-    ctx.beginPath();
-    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
-    ctx.strokeStyle = listening.mid;
-    ctx.globalAlpha = 0.35 + Math.min(0.6, this.smoothUser * 1.4);
-    ctx.lineWidth = ringWidth;
-    ctx.stroke();
-    ctx.globalAlpha = 1;
+    // The user's mic level shows as a soft, on-palette halo that expands with
+    // your voice — cohesive with the lime orb rather than a hard red ring.
+    const userR = baseR * (1.15 + this.smoothUser * 0.55);
+    const intensity = Math.min(1, this.smoothUser * 1.3);
+    if (intensity > 0.02) {
+      const halo = ctx.createRadialGradient(
+        cx,
+        cy,
+        userR * 0.72,
+        cx,
+        cy,
+        userR * 1.15,
+      );
+      halo.addColorStop(0, "transparent");
+      halo.addColorStop(
+        0.6,
+        `oklch(86% 0.15 118 / ${(0.14 + intensity * 0.34).toFixed(3)})`,
+      );
+      halo.addColorStop(1, "transparent");
+      ctx.fillStyle = halo;
+      ctx.beginPath();
+      ctx.arc(cx, cy, userR * 1.15, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 }
 

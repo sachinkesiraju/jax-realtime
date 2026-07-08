@@ -101,8 +101,31 @@ body {
 }
 
 .stage-role {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
   font-size: 0.78rem;
   color: var(--ink-soft);
+}
+
+.stage-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: oklch(85% 0.02 105);
+  transition: background 150ms;
+}
+
+.stage-dot.is-on {
+  background: var(--signal-deep);
+  box-shadow: 0 0 6px oklch(88% 0.19 118 / 0.9);
+}
+
+.stage-lane {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: oklch(60% 0.03 105);
 }
 
 .stage-model {
@@ -121,6 +144,7 @@ body {
 
 /* Console */
 .console {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -130,6 +154,73 @@ body {
   background: var(--panel);
   color: var(--panel-text);
   overflow: hidden;
+}
+
+/* Eye stage: muted until enabled. */
+.stage-eye {
+  opacity: 0.75;
+}
+
+.stage-eye.is-active {
+  opacity: 1;
+  border-color: var(--signal-deep);
+}
+
+/* Webcam preview PiP (corner, like the TML demos). */
+.pip {
+  position: absolute;
+  top: 3.4rem;
+  right: 1rem;
+  z-index: 4;
+  width: clamp(8rem, 18vw, 11rem);
+  aspect-ratio: 1;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--panel-edge);
+  box-shadow: 0 8px 24px oklch(10% 0.01 220 / 0.5);
+  background: oklch(15% 0.01 220);
+}
+
+.pip-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1); /* mirror the front camera like a webcam view */
+}
+
+.pip-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: scaleX(-1); /* match the mirrored video */
+}
+
+.pip-label {
+  position: absolute;
+  left: 0.4rem;
+  bottom: 0.35rem;
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  color: var(--signal);
+  text-shadow: 0 1px 2px oklch(10% 0.01 220 / 0.8);
+}
+
+.eye-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+
+.eye-toggle input {
+  accent-color: var(--signal-deep);
+  cursor: pointer;
+}
+
+.eye-toggle input:disabled {
+  cursor: default;
 }
 
 .console-status {
@@ -223,6 +314,29 @@ body {
   color: oklch(68% 0.02 110);
 }
 
+/* Live captions: committed text solid, tentative tail dimmed italic. */
+.captions {
+  margin: 0;
+  min-height: 1.4em;
+  max-width: 56ch;
+  text-align: center;
+  font-size: 1.02rem;
+  color: var(--panel-text);
+}
+
+.cap-tentative {
+  color: oklch(62% 0.02 110);
+  font-style: italic;
+}
+
+.ticker {
+  margin: 0;
+  min-height: 1.2em;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: oklch(62% 0.06 118);
+}
+
 .transcript {
   flex: 1;
   min-height: 4rem;
@@ -277,6 +391,132 @@ body {
   align-self: flex-start;
   background: oklch(29% 0.02 220);
   border-bottom-left-radius: 4px;
+}
+
+/* Two-tier tool use: chip + background pill + generative-UI card. */
+.bg-pill {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--signal);
+  border: 1px solid var(--signal-deep);
+  border-radius: 999px;
+  padding: 0.05rem 0.55rem;
+  animation: pulse 1.2s cubic-bezier(0.25, 1, 0.5, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bg-pill {
+    animation: none;
+  }
+}
+
+.tool-chip {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: oklch(78% 0.06 118);
+  background: oklch(26% 0.02 220);
+  border: 1px solid var(--panel-edge);
+  border-radius: 999px;
+  padding: 0.3rem 0.7rem;
+}
+
+.chip-dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 999px;
+  background: var(--signal);
+  animation: pulse 1s cubic-bezier(0.25, 1, 0.5, 1) infinite;
+}
+
+.tool-chip.is-done {
+  color: oklch(60% 0.02 110);
+}
+
+.tool-chip.is-done .chip-dot {
+  background: var(--signal-deep);
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chip-dot {
+    animation: none;
+  }
+}
+
+.canvas-panel {
+  margin: 0 1.2rem 1.1rem;
+  display: grid;
+  gap: 0.35rem;
+  border: 1px solid var(--panel-edge);
+  border-radius: 12px;
+  background: oklch(24% 0.02 220);
+  padding: 0.9rem 1.1rem;
+  animation: card-in 240ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .canvas-panel {
+    animation: none;
+  }
+}
+
+.card-head {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: oklch(68% 0.06 118);
+}
+
+.card-temp {
+  font-size: 2.6rem;
+  font-weight: 650;
+  line-height: 1.05;
+  color: var(--panel-text);
+}
+
+.card-sub {
+  font-size: 0.98rem;
+  color: var(--panel-text);
+}
+
+.card-meta {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: oklch(62% 0.02 110);
+}
+
+.card-body {
+  font-size: 0.92rem;
+  color: var(--panel-text);
+  display: -webkit-box;
+  -webkit-line-clamp: 6;
+  line-clamp: 6;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.card-list {
+  margin: 0.1rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.92rem;
+  color: var(--panel-text);
 }
 
 /* Dock */

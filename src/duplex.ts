@@ -13,16 +13,28 @@ import type {
   TTSVoice,
   VoicePipeline,
 } from "./pipeline";
+import {
+  detectTool,
+  type ToolCall,
+  type ToolKind,
+  type UiCard,
+} from "./tools/tools";
+import type { VisionSession } from "./vision/vision";
 
 const TICK_MS = 150;
-const START_LEVEL = 0.07; // speech onset / barge-in threshold
-const STOP_LEVEL = 0.04; // below this counts as silence
+const START_LEVEL = 0.05; // speech onset / barge-in threshold
 const MIN_SPEECH_MS = 350; // ignore sub-blip "utterances"
-const ENDPOINT_PUNCT_MS = 450; // silence to end a turn that ends in . ! ?
-const ENDPOINT_SILENCE_MS = 800; // silence to end a turn otherwise
+const ENDPOINT_PUNCT_MS = 380; // silence to end a turn that ends in . ! ?
+const ENDPOINT_SILENCE_MS = 620; // silence to end a turn otherwise
 const MAX_UTTERANCE_MS = 28_000;
-const BARGE_TICKS = 2; // sustained loud ticks required for barge-in
-const BARGE_MIN_WORDS = 2; // committed (echo-filtered) words required
+const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
+const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
+// Energy barge-in: with echoCancellation on, sustained loud mic input during
+// the assistant's reply is the user talking over it (not our own playback), so
+// interrupt on energy alone — the ASR path often misses it because the mic
+// picks up a mix of user + assistant and the self-echo filter drops it.
+const BARGE_ENERGY_LEVEL = 0.08;
+const BARGE_ENERGY_TICKS = 3; // ~450 ms sustained → interrupt
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
 const BACKCHANNEL_PAUSE_MIN = 450;
 const BACKCHANNEL_PAUSE_MAX = 800;
@@ -30,6 +42,20 @@ const BACKCHANNEL_PAUSE_MAX = 800;
 const TERMINAL_PUNCT = /[.!?…]\s*$/;
 const TIMER_UNIT = /(\d+)\s*(seconds?|secs?|minutes?|mins?)/i;
 const TIMER_VERB = /(timer|remind|tell me|let me know|when|after|in)\b/i;
+
+// Vision "Eye" proactive interjections. Persistence is time-based (~1.2 s per
+// detector frame); a single 8 s cooldown gates all of them so they never
+// dogpile. Lines kept as a small rule table per the spec.
+const VISION_COOLDOWN_MS = 8_000;
+const VISION_PERSON_PRESENT_MS = 3_600; // person established (≥3 frames)
+const VISION_PERSON_GONE_MS = 3_600; // then absent (≥3 frames)
+const VISION_PHONE_MS = 3_600; // phone persists (≥3 frames)
+const VISION_SLOUCH_MS = 4_800; // slouch persists (≥4 frames)
+const VISION_LINES = {
+  stepAway: "Did you step away? I'll be here when you're back.",
+  phone: "Phone again? I can wait.",
+  slouch: "Hey — sit up straight.",
+} as const;
 
 export type DuplexMetrics = {
   turnLatencyMs?: number;
@@ -54,6 +80,12 @@ export interface DuplexCallbacks {
   onMetric(metric: DuplexMetrics): void;
   /** A stage started/stopped actually computing (activity dots). */
   onStageActivity(stage: "asr" | "llm" | "tts", active: boolean): void;
+  /** A background tool task was kicked off (render an in-progress chip). */
+  onToolCall(kind: ToolKind, query: string): void;
+  /** A background tool task resolved with a card to render. */
+  onToolResult(card: UiCard): void;
+  /** Background-activity indicator: pulses while a tool task runs. */
+  onBackground(active: boolean): void;
   onError(error: unknown): void;
 }
 
@@ -63,6 +95,8 @@ export interface DuplexConfig {
   getVoice: () => TTSVoice;
   getModel: () => ChatModel;
   callbacks: DuplexCallbacks;
+  /** Optional webcam "Eye" stage for scene grounding + proactive lines. */
+  vision?: VisionSession | null;
 }
 
 type Phase = "listening" | "responding";
@@ -86,6 +120,7 @@ export class DuplexSession {
   private readonly getVoice: () => TTSVoice;
   private readonly getModel: () => ChatModel;
   private readonly cb: DuplexCallbacks;
+  private vision: VisionSession | null;
 
   private transcriber: StreamingTranscriber | null = null;
   private tick: ReturnType<typeof setInterval> | null = null;
@@ -100,6 +135,7 @@ export class DuplexSession {
   private speechStartAt = 0;
   private silenceStart = 0;
   private aboveTicks = 0;
+  private aboveBargeTicks = 0; // consecutive ticks above the energy-barge level
   private backchannelUsed = false;
 
   // Assistant / response tracking.
@@ -115,13 +151,45 @@ export class DuplexSession {
 
   private timers: PendingTimer[] = [];
 
+  // Two-tier tool use: one background fetch at a time; resolved speech is queued
+  // and delivered on the next silence so it never talks over the user.
+  private backgroundTask: Promise<void> | null = null;
+  private pendingToolSpeech: string[] = [];
+
+  // Vision proactive-interjection tracking (time-based persistence).
+  private visionCooldownUntil = 0;
+  private personSeen = false; // a person has been established this session
+  private personPresentSince = 0;
+  private personAbsentSince = 0;
+  private stepAwayAnnounced = false;
+  private phonePresentSince = 0;
+  private phoneAnnounced = false;
+  private slouchSince = 0;
+  private slouchAnnounced = false;
+
   constructor(config: DuplexConfig) {
     this.pipeline = config.pipeline;
     this.capture = config.capture;
     this.getVoice = config.getVoice;
     this.getModel = config.getModel;
     this.cb = config.callbacks;
+    this.vision = config.vision ?? null;
   }
+
+  /** Attach or detach the webcam "Eye" stage on a running session. */
+  setVision(vision: VisionSession | null): void {
+    this.vision = vision;
+    // Reset proactive tracking so a freshly-attached camera starts clean.
+    this.personSeen = false;
+    this.personPresentSince = 0;
+    this.personAbsentSince = 0;
+    this.stepAwayAnnounced = false;
+    this.phonePresentSince = 0;
+    this.phoneAnnounced = false;
+    this.slouchSince = 0;
+    this.slouchAnnounced = false;
+  }
+
 
   // --- Orb level sources -------------------------------------------------
 
@@ -147,7 +215,13 @@ export class DuplexSession {
       () => this.capture.samples(),
       (update) => this.onTranscript(update),
       () => (this.isAssistantAudible() ? this.currentTtsText : null),
-      { minPassIntervalMs: 400, maxWindowSec: 28 },
+      {
+        // WebGPU passes are ~250 ms, so refresh captions ~4×/s. Pause while the
+        // assistant is speaking so ASR doesn't steal the GPU from TTS.
+        minPassIntervalMs: 150,
+        maxWindowSec: 28,
+        pauseWhile: () => this.isAssistantAudible(),
+      },
     );
     this.transcriber.start();
 
@@ -181,6 +255,10 @@ export class DuplexSession {
     this.currentTtsText = null;
     this.assistant = null;
     this.proactiveSpeaking = false;
+    // Drop any queued tool speech; the background fetch (if any) resolves into
+    // a no-op since the queue is cleared and the session is no longer running.
+    this.pendingToolSpeech = [];
+    this.backgroundTask = null;
   }
 
   // --- ASR callback ------------------------------------------------------
@@ -196,18 +274,25 @@ export class DuplexSession {
 
   private onTick(): void {
     if (!this.running || !this.transcriber) return;
+
     const now = performance.now();
     const level = this.capture.level();
 
     if (level > START_LEVEL) this.aboveTicks++;
     else this.aboveTicks = 0;
+    if (level > BARGE_ENERGY_LEVEL) this.aboveBargeTicks++;
+    else this.aboveBargeTicks = 0;
 
-    // 1. Barge-in.
-    if (this.phase === "responding" && this.isAssistantAudible()) {
-      if (
+    // 1. Barge-in: stop the assistant the moment the user talks over it. Two
+    //    independent triggers — sustained mic energy (robust: the ASR path
+    //    frequently misses talk-over because the self-echo filter discards the
+    //    user's words mixed with our playback), or a freshly-committed word.
+    if (this.phase === "responding" && this.assistant) {
+      const energyBarge = this.aboveBargeTicks >= BARGE_ENERGY_TICKS;
+      const asrBarge =
         this.aboveTicks >= BARGE_TICKS &&
-        this.transcriber.committedWordCount >= BARGE_MIN_WORDS
-      ) {
+        this.transcriber.committedWordCount >= BARGE_MIN_WORDS;
+      if (energyBarge || asrBarge) {
         this.handleBargeIn(now);
         return;
       }
@@ -218,16 +303,39 @@ export class DuplexSession {
       return;
     }
 
-    // Listening phase: track speech onset and silence.
+    // Don't endpoint a user turn while a proactive line is still playing;
+    // starting a second TTS stream would overlap audio on the same GPU lane.
+    if (this.proactiveSpeaking) return;
+
+    // Listening phase: track speech onset and silence. Anything below the
+    // speech threshold counts toward silence — using a lower "stop" gate here
+    // created a dead-band where a quiet-but-nonzero signal latched neither
+    // state and the turn never endpointed. Brief within-word dips are absorbed
+    // by the endpoint silence windows (450–800 ms), not this per-tick gate.
     if (level > START_LEVEL) {
       if (!this.speechStartAt) this.speechStartAt = now;
       this.silenceStart = 0;
-    } else if (level < STOP_LEVEL) {
-      if (this.speechStartAt && !this.silenceStart) this.silenceStart = now;
+    } else if (this.speechStartAt && !this.silenceStart) {
+      this.silenceStart = now;
     }
 
     // 4. Time awareness (independent of speech state).
     this.checkTimers(now);
+
+    // 4b. Vision "Eye" proactive interjections — only while idle (user not
+    // speaking; assistant/responding already gated above).
+    if (this.vision?.active && !this.speechStartAt) this.evaluateVision(now);
+
+    // 4c. Two-tier tool result: deliver a queued background result on silence.
+    if (
+      this.pendingToolSpeech.length &&
+      !this.speechStartAt &&
+      !this.responding() &&
+      !this.proactiveSpeaking
+    ) {
+      const line = this.pendingToolSpeech.shift()!;
+      void this.speakProactive(line);
+    }
 
     if (!this.speechStartAt) return; // idle
 
@@ -267,15 +375,21 @@ export class DuplexSession {
     if (!transcriber) return;
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
-    this.cb.onStageActivity("asr", true);
 
-    let text = "";
-    try {
-      text = await transcriber.finalize();
-    } catch (error) {
-      this.cb.onError(error);
-    } finally {
-      this.cb.onStageActivity("asr", false);
+    // Latency hillclimb: the streaming loop has already transcribed this
+    // utterance incrementally, so prefer its result and skip the extra
+    // multi-second Whisper finalize pass that used to dominate turn latency.
+    // Only fall back to finalize() when streaming hasn't caught up (short/empty).
+    let text = transcriber.bestText();
+    if (displayWordCount(text) < 3) {
+      this.cb.onStageActivity("asr", true);
+      try {
+        text = await transcriber.finalize();
+      } catch (error) {
+        this.cb.onError(error);
+      } finally {
+        this.cb.onStageActivity("asr", false);
+      }
     }
     const asrLagMs = performance.now() - endOfSpeechAt;
 
@@ -289,10 +403,78 @@ export class DuplexSession {
 
     this.cb.onMetric({ asrLagMs });
     this.cb.onUserTurn(text);
-    this.history.push({ role: "user", content: text, t: this.elapsed() });
+
+    // Vision: the detector only *measures* (objects + colours). Precise factual
+    // questions (count, colour, "what do you see") are answered directly from
+    // those measurements — the 270M model deflects on them. Broader /
+    // interpretive visual questions ("what am I doing", "does my room look
+    // tidy") are handed to the LLM with the measured scene as grounding, so the
+    // model reasons rather than us templating a reply.
+    if (this.vision?.active && this.vision.matchesQuestion(text)) {
+      const reply = this.vision.answer(text);
+      this.cb.onEvent("eye · answering from the camera");
+      this.history.push({ role: "user", content: text, t: this.elapsed() });
+      this.capture.clear();
+      transcriber.reset();
+      this.resetUtterance();
+      this.startFreshListening();
+      void this.speakProactive(reply);
+      return;
+    }
+
+    let content = text;
+    if (this.vision?.active && this.vision.referencesVision(text)) {
+      const facts = this.vision.sceneFacts();
+      content = facts
+        ? `(Right now through the camera you can see ${facts}. You can't tell colours of clothing or fine detail beyond that.) ${text}`
+        : text;
+      this.cb.onEvent("eye · grounding from the camera");
+    }
+    this.history.push({ role: "user", content, t: this.elapsed() });
     this.maybeScheduleTimer(text);
 
+    // Fresh audio window for the response phase: barge-in detection must see
+    // only NEW committed words (spoken over the reply), not this turn's.
+    this.capture.clear();
+    transcriber.reset();
+    this.resetUtterance();
+
+    // Two-tier path: a tool intent runs as a background task while the fast
+    // model stays present. Only one background task at a time; if one is
+    // already running, fall through to a normal reply.
+    const tool = this.backgroundTask ? null : detectTool(text);
+    if (tool) {
+      this.startToolTask(tool);
+      return;
+    }
+
     this.respondPromise = this.respond(endOfSpeechAt);
+  }
+
+  // --- Two-tier tool use -------------------------------------------------
+
+  private startToolTask(tool: ToolCall): void {
+    this.cb.onToolCall(tool.kind, tool.query);
+    this.cb.onBackground(true);
+    // Return to listening first (so speakProactive doesn't bail on the
+    // "responding" phase), then speak the holding line while the fetch runs —
+    // the user can keep talking / interrupt / be backchanneled meanwhile.
+    this.startFreshListening();
+    void this.speakProactive(tool.holding);
+    this.backgroundTask = tool
+      .run()
+      .then((result) => {
+        // Render the card now; queue the spoken line for the next silence.
+        this.cb.onToolResult(result.card);
+        this.pendingToolSpeech.push(result.speech);
+      })
+      .catch((error) => {
+        this.cb.onError(error);
+      })
+      .finally(() => {
+        this.backgroundTask = null;
+        this.cb.onBackground(false);
+      });
   }
 
   // --- Assistant response ------------------------------------------------
@@ -365,7 +547,10 @@ export class DuplexSession {
       this.startFreshListening();
     }
 
-    this.assistant = null;
+    // Only clear if this is still the active response: after a barge-in the
+    // user may already have started the next turn (a new respond() with its own
+    // state), and nulling it here would break that turn's barge-in + teardown.
+    if (this.assistant === state) this.assistant = null;
   }
 
   /**
@@ -377,6 +562,7 @@ export class DuplexSession {
     state: AssistantState,
   ): AsyncGenerator<string, void, void> {
     let buffer = "";
+    let firstEmitted = false;
     let result = await stream.next();
     while (!result.done) {
       if (state.controller.signal.aborted) {
@@ -388,11 +574,29 @@ export class DuplexSession {
       state.fullText += delta;
       this.cb.onAssistantPartial(state.fullText);
 
+      // Fastest first audio: flush the first clause as soon as a comma/colon/
+      // semicolon appears (once there's enough to sound natural), so speech
+      // starts after "The weather in Tokyo," instead of the whole sentence.
+      if (!firstEmitted) {
+        const clauseIdx = findClauseEnd(buffer);
+        if (clauseIdx !== -1) {
+          const clause = buffer.slice(0, clauseIdx).trim();
+          buffer = buffer.slice(clauseIdx);
+          if (clause) {
+            firstEmitted = true;
+            yield this.trackSpoken(state, clause);
+          }
+        }
+      }
+
       let idx: number;
       while ((idx = findSentenceEnd(buffer)) !== -1) {
         const sentence = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx);
-        if (sentence) yield this.trackSpoken(state, sentence);
+        if (sentence) {
+          firstEmitted = true;
+          yield this.trackSpoken(state, sentence);
+        }
       }
       if (buffer.length >= 120) {
         const sentence = buffer.trim();
@@ -421,13 +625,15 @@ export class DuplexSession {
     this.bargeAt = now;
     this.assistant?.controller.abort();
     this.cb.onEvent("barge-in · stopping");
-    // The interrupting speech is already being captured & transcribed; treat it
-    // as the start of a fresh user utterance.
+    // The interrupting speech is already being captured & transcribed (echo
+    // cancellation keeps our own playback out of the buffer), so treat it as a
+    // fresh user utterance already in progress — don't clear it.
     this.phase = "listening";
-    this.speechStartAt = now - BARGE_TICKS * TICK_MS;
+    this.speechStartAt = now - BARGE_ENERGY_TICKS * TICK_MS;
     this.silenceStart = 0;
     this.backchannelUsed = false;
     this.aboveTicks = 0;
+    this.aboveBargeTicks = 0;
   }
 
   // --- Time awareness ----------------------------------------------------
@@ -463,6 +669,87 @@ export class DuplexSession {
       void this.speakProactive(line);
     }
     this.timers = this.timers.filter((t) => !t.fired);
+  }
+
+  // --- Vision proactive interjections ------------------------------------
+
+  private evaluateVision(now: number): void {
+    const vision = this.vision;
+    if (!vision) return;
+    if (this.responding() || this.proactiveSpeaking) return;
+
+    const { personPresent, phonePresent, slouching } = vision.state;
+
+    // Track person presence/absence streaks.
+    if (personPresent) {
+      if (!this.personPresentSince) this.personPresentSince = now;
+      this.personAbsentSince = 0;
+      if (now - this.personPresentSince >= VISION_PERSON_PRESENT_MS) {
+        this.personSeen = true;
+        this.stepAwayAnnounced = false;
+      }
+    } else {
+      if (!this.personAbsentSince) this.personAbsentSince = now;
+      this.personPresentSince = 0;
+    }
+
+    // Track phone streak.
+    if (phonePresent) {
+      if (!this.phonePresentSince) this.phonePresentSince = now;
+    } else {
+      this.phonePresentSince = 0;
+      this.phoneAnnounced = false;
+    }
+
+    // Track slouch streak.
+    if (slouching) {
+      if (!this.slouchSince) this.slouchSince = now;
+    } else {
+      this.slouchSince = 0;
+      this.slouchAnnounced = false;
+    }
+
+    if (now < this.visionCooldownUntil) return;
+
+    // Rule 1: person was established, now gone for ≥3 frames.
+    if (
+      this.personSeen &&
+      !this.stepAwayAnnounced &&
+      this.personAbsentSince &&
+      now - this.personAbsentSince >= VISION_PERSON_GONE_MS
+    ) {
+      this.stepAwayAnnounced = true;
+      this.personSeen = false;
+      this.fireVision(now, "eye · stepped away", VISION_LINES.stepAway);
+      return;
+    }
+
+    // Rule 2: phone newly appears and persists ≥3 frames.
+    if (
+      !this.phoneAnnounced &&
+      this.phonePresentSince &&
+      now - this.phonePresentSince >= VISION_PHONE_MS
+    ) {
+      this.phoneAnnounced = true;
+      this.fireVision(now, "eye · phone spotted", VISION_LINES.phone);
+      return;
+    }
+
+    // Rule 3: slouch persists ≥4 frames.
+    if (
+      !this.slouchAnnounced &&
+      this.slouchSince &&
+      now - this.slouchSince >= VISION_SLOUCH_MS
+    ) {
+      this.slouchAnnounced = true;
+      this.fireVision(now, "eye · slouching", VISION_LINES.slouch);
+    }
+  }
+
+  private fireVision(now: number, event: string, line: string): void {
+    this.visionCooldownUntil = now + VISION_COOLDOWN_MS;
+    this.cb.onEvent(event);
+    void this.speakProactive(line);
   }
 
   private async speakProactive(text: string): Promise<void> {
@@ -504,6 +791,12 @@ export class DuplexSession {
     return this.assistant !== null || this.proactiveSpeaking;
   }
 
+  /** True when the audio pipeline is using the GPU (an ASR pass is in flight or
+   *  the assistant is speaking) — the vision stage checks this to yield. */
+  audioActive(): boolean {
+    return this.isAssistantAudible() || this.pipeline.asr.isBusy;
+  }
+
   private elapsed(): number {
     return (performance.now() - this.sessionStart) / 1000;
   }
@@ -512,6 +805,7 @@ export class DuplexSession {
     this.speechStartAt = 0;
     this.silenceStart = 0;
     this.aboveTicks = 0;
+    this.aboveBargeTicks = 0;
     this.backchannelUsed = false;
   }
 
@@ -530,10 +824,35 @@ export class DuplexSession {
  * whitespace, or -1. Requiring a trailing whitespace avoids flushing on
  * decimals like "3.14" mid-stream; the end-of-stream tail is flushed separately.
  */
+/** Count whitespace-separated word tokens in a transcript string. */
+function displayWordCount(text: string): number {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
 function findSentenceEnd(buffer: string): number {
   for (let i = 0; i < buffer.length - 1; i++) {
     const c = buffer[i];
     if ((c === "." || c === "!" || c === "?" || c === "…") && /\s/.test(buffer[i + 1])) {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Index just after the first clause break (comma/colon/semicolon or sentence
+ * end) followed by whitespace, but only once ≥18 chars have accumulated so the
+ * first spoken fragment isn't a choppy one-word stub. Used only for the very
+ * first chunk, to minimize time-to-first-audio on longer opening sentences.
+ */
+function findClauseEnd(buffer: string): number {
+  const MIN = 18;
+  for (let i = 0; i < buffer.length - 1; i++) {
+    const c = buffer[i];
+    const isBreak =
+      c === "," || c === ";" || c === ":" || c === "." || c === "!" || c === "?" || c === "…";
+    if (isBreak && i + 1 >= MIN && /\s/.test(buffer[i + 1])) {
       return i + 1;
     }
   }

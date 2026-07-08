@@ -88,15 +88,14 @@ export const TTS_VOICES = [
 export type TTSVoice = (typeof TTS_VOICES)[number];
 
 // Gemma 3 270M has no system role; fold instructions into the first user turn.
+// Keep this SHORT and POSITIVE: a 270M model can't follow long instructions
+// or negation (naming a phrase to avoid just primes it to say that phrase).
 const SYSTEM_HINT =
-  "You are a friendly, quick voice assistant in a live full-duplex " +
-  "conversation. Answer in one to three short, plain spoken-English " +
-  "sentences. No markdown, no lists, no emoji. Timestamps like [t+12s] mark " +
-  "when each turn was spoken — use them for time awareness but never read " +
-  "them aloud. If a previous assistant turn is marked [interrupted], the user " +
-  "cut you off: acknowledge briefly and address what they just said.";
+  "You are a warm, helpful voice assistant. Answer the user's question or " +
+  "message directly in one or two short spoken sentences. A [scene: …] tag " +
+  "tells you what the camera sees. Do not read any bracketed tag aloud.";
 
-async function fetchWithProgress(
+export async function fetchWithProgress(
   name: string,
   url: string,
   onProgress: ProgressFn,
@@ -158,6 +157,21 @@ export class SpeechRecognizer {
   /** True while a transcribe pass is in flight (one at a time per instance). */
   get isBusy(): boolean {
     return this.busy;
+  }
+
+  /**
+   * Run one throwaway pass to trigger backend kernel compilation (JIT). On the
+   * wasm lane the first Whisper pass compiles kernels and can take tens of
+   * seconds; doing it here moves that cost into the loading screen instead of
+   * the user's first turn.
+   */
+  async warmup(): Promise<void> {
+    try {
+      await this.transcribe(new Float32Array(16_000), 1);
+    } catch {
+      // Warmup is best-effort; a failure here just means the first real pass
+      // pays the compilation cost.
+    }
   }
 
   /** Transcribe 16 kHz mono PCM samples to text. */
@@ -345,20 +359,35 @@ export class LocalChatModel implements ChatModel {
     return new LocalChatModel(model, tokenizer);
   }
 
+  /**
+   * Generate a couple of throwaway tokens so the Gemma prefill + decode kernels
+   * JIT-compile at load time instead of on the user's first turn (that cold
+   * pass added ~1.7 s to turn 1).
+   */
+  async warmup(): Promise<void> {
+    try {
+      const stream = this.generateStream([{ role: "user", content: "Hi" }], 2);
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      for await (const _ of stream) {
+        // drain
+      }
+    } catch {
+      // Best-effort; a failure just means the first real turn pays the cost.
+    }
+  }
+
   private formatPrompt(history: ChatMessage[]): string {
+    // Gemma 3 270M follows the plain chat template far better than an
+    // instruction preamble — folding a system prompt or per-turn [t+Ns] tag in
+    // here made the tiny model echo the instructions instead of answering. So
+    // the local prompt is just the raw conversation (the SYSTEM_HINT is used
+    // only by the larger Cerebras model). A [scene: …] tag, when present, is
+    // already baked into the message content by the duplex layer.
     let text = "";
-    let firstUser = true;
     for (const message of history) {
-      let content = message.content.trim();
+      const content = message.content.trim();
       if (content === "") continue;
       const role = message.role === "assistant" ? "model" : "user";
-      if (message.role === "user" && message.t !== undefined) {
-        content = `[t+${Math.round(message.t)}s] ${content}`;
-      }
-      if (message.role === "user" && firstUser) {
-        content = `${SYSTEM_HINT}\n\n${content}`;
-        firstUser = false;
-      }
       text += `<start_of_turn>${role}\n${content}<end_of_turn>\n`;
     }
     text += "<start_of_turn>model\n";
@@ -372,7 +401,10 @@ export class LocalChatModel implements ChatModel {
    */
   async *generateStream(
     history: ChatMessage[],
-    maxNewTokens = 160,
+    // Kept short so spoken replies stay to a couple of sentences — without a
+    // length instruction (which the 270M model echoes) this cap is what keeps
+    // it from monologuing.
+    maxNewTokens = 96,
   ): AsyncGenerator<string, GenerateStats, void> {
     const promptTokens = [
       this.tokenizer.bosToken,
@@ -395,7 +427,9 @@ export class LocalChatModel implements ChatModel {
         logits = null;
         const data = (await sampledLogits.data()) as Float32Array;
         const nextToken = sampleLogits(data, {
-          temperature: 0.8,
+          // The plain chat template (no instruction preamble) responds best at
+          // a natural sampling temperature, matching the jax-js chat demo.
+          temperature: 0.7,
           topK: 64,
           topP: 0.95,
         });
@@ -757,10 +791,11 @@ export type DeviceSetup = {
 };
 
 /**
- * Initialize backends. WebGPU is required (TTS/LLM lane). wasm is preferred for
- * the ASR lane so Whisper passes run concurrently without stalling WebGPU; if
- * wasm can't initialize (e.g. not cross-origin isolated), ASR degrades onto
- * WebGPU and shares it as before.
+ * Initialize backends. WebGPU is required (all stages). ASR runs on WebGPU too
+ * (fp16): a Whisper pass there is ~250 ms vs ~1.6 s on the wasm CPU lane, so
+ * live captions actually keep up. The streaming ASR loop is paused while the
+ * assistant speaks (barge-in is energy-based, not ASR-based), so it never
+ * contends with TTS generation on the GPU.
  */
 export async function initDevice(): Promise<DeviceSetup> {
   let devices: Device[];
@@ -771,21 +806,11 @@ export async function initDevice(): Promise<DeviceSetup> {
   }
   if (!devices.includes("webgpu")) {
     throw new Error(
-      "WebGPU is not available in this browser; it is required for the TTS stage.",
+      "WebGPU is not available in this browser; it is required to run the models.",
     );
   }
   defaultDevice("webgpu");
-  const wasmReady = devices.includes("wasm");
-  if (!wasmReady) {
-    console.warn(
-      "wasm backend unavailable (cross-origin isolation?); ASR will share WebGPU.",
-    );
-  }
-  return {
-    devices,
-    asrDevice: wasmReady ? "wasm" : "webgpu",
-    asrDtype: wasmReady ? np.float32 : np.float16,
-  };
+  return { devices, asrDevice: "webgpu", asrDtype: np.float16 };
 }
 
 export async function loadPipeline(
@@ -798,6 +823,13 @@ export async function loadPipeline(
   });
   const llm = await LocalChatModel.load(onProgress);
   const tts = await SpeechSynthesizer.load(onProgress);
+  // Compile the ASR + LLM kernels now (esp. slow to JIT on wasm) so the first
+  // real turn isn't hit with a multi-second cold start. (TTS is warmed via
+  // prepareBackchannels, which the UI calls right after load.)
+  onProgress({ name: "Warming up models", loadedBytes: 0, done: false });
+  await asr.warmup();
+  await llm.warmup();
+  onProgress({ name: "Warming up models", loadedBytes: 1, done: true });
   return {
     asr,
     llm,

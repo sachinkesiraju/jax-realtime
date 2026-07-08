@@ -21,6 +21,9 @@ export type StreamingOptions = {
   maxWindowSec?: number;
   /** Below this much audio (seconds) a pass is skipped. */
   minWindowSec?: number;
+  /** When this returns true, skip passes (e.g. while the assistant speaks, to
+   *  keep ASR off the GPU so TTS generation stays smooth). */
+  pauseWhile?: () => boolean;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -61,6 +64,9 @@ export class StreamingTranscriber {
   private committedWords: string[] = [];
   private tentativeText = "";
   private lastChangeAt = 0;
+  // Bumped by reset(); passes started under an older generation are discarded
+  // so a stale hypothesis can't repopulate freshly-cleared commit state.
+  private generation = 0;
 
   constructor(
     private asr: SpeechRecognizer,
@@ -85,6 +91,16 @@ export class StreamingTranscriber {
 
   get tentative(): string {
     return this.tentativeText;
+  }
+
+  /**
+   * The best available transcript right now — committed words plus the live
+   * tentative tail — WITHOUT running another Whisper pass. The streaming loop
+   * has already transcribed the utterance incrementally, so this is what the
+   * turn-end path uses to skip a redundant multi-second finalize.
+   */
+  bestText(): string {
+    return `${this.committed} ${this.tentativeText}`.trim();
   }
 
   get lastChange(): number {
@@ -112,6 +128,7 @@ export class StreamingTranscriber {
 
   /** Clear commit state for a fresh utterance (loop keeps running). */
   reset(): void {
+    this.generation++;
     this.prevWords = [];
     this.committedWords = [];
     this.tentativeText = "";
@@ -126,6 +143,11 @@ export class StreamingTranscriber {
     const samples = this.windowSamples();
     if (samples.length < SAMPLE_RATE * (this.opts.minWindowSec ?? 0.2)) {
       return this.committed.trim();
+    }
+    // Wait out any in-flight streaming pass so the final pass actually runs
+    // (the recognizer allows one transcription at a time).
+    for (let waited = 0; this.asr.isBusy && waited < 2_000; waited += 50) {
+      await sleep(50);
     }
     let hyp = "";
     try {
@@ -151,9 +173,14 @@ export class StreamingTranscriber {
 
     while (this.active) {
       const passStart = performance.now();
+      const passGeneration = this.generation;
       const samples = this.windowSamples();
 
-      if (samples.length < minWindow || this.asr.isBusy) {
+      if (
+        samples.length < minWindow ||
+        this.asr.isBusy ||
+        this.opts.pauseWhile?.()
+      ) {
         await sleep(minInterval);
         continue;
       }
@@ -167,6 +194,8 @@ export class StreamingTranscriber {
         continue;
       }
       if (!this.active) break;
+      // Discard results from a pass over a window that has since been reset.
+      if (passGeneration !== this.generation) continue;
 
       this.ingest(hyp);
 
