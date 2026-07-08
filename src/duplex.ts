@@ -38,13 +38,26 @@ const START_LEVEL = 0.05; // speech onset / barge-in threshold
 // are discarded before Whisper ever sees them; anything loud-but-short that
 // slips through still hits the empty-transcript discard after transcription.
 const GUARD_WINDOW = 480; // 30 ms at 16 kHz
-const GUARD_RMS_FLOOR = 0.02; // window counts as voiced above this RMS
+const GUARD_RMS_FLOOR = 0.02; // absolute floor for a voiced window
+const GUARD_RMS_CEIL = 0.055; // never demand more than soft speech delivers
 const MIN_VOICED_MS = 250; // real speech easily exceeds this; blips don't
 const MIN_PEAK_ABS = 0.04; // near-silence hallucination cutoff
 
-/** Voiced duration + peak of a PCM buffer (see phantom-turn guard). */
+/**
+ * Voiced duration + peak of a PCM buffer (see phantom-turn guard). The voiced
+ * threshold is ADAPTIVE: real mics with auto-gain boost quiet rooms until the
+ * ambient tone itself sits near/above any fixed floor, so a fixed threshold
+ * counts room tone as speech and the phantom turns come back. Speech clears
+ * the room tone by a large ratio regardless of gain, so the threshold is ~3×
+ * the buffer's 20th-percentile window RMS (an ambient estimate — the buffer
+ * starts at listening-start, so it holds pre-speech ambient), clamped between
+ * the absolute floor and a soft-speech ceiling. The 2× ratio is measured, not
+ * guessed: through the real capture path, room tone reads ~0.014 RMS while
+ * soft speech windows read 0.02-0.077 — 3× starved soft speech (~300 ms
+ * qualifying), 2× passes ~900 ms of it while tone and blips still fail.
+ */
 function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } {
-  let voiced = 0;
+  const windowRms: number[] = [];
   let peak = 0;
   for (let start = 0; start + GUARD_WINDOW <= samples.length; start += GUARD_WINDOW) {
     let energy = 0;
@@ -54,8 +67,15 @@ function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } 
       const a = Math.abs(s);
       if (a > peak) peak = a;
     }
-    if (Math.sqrt(energy / GUARD_WINDOW) > GUARD_RMS_FLOOR) voiced++;
+    windowRms.push(Math.sqrt(energy / GUARD_WINDOW));
   }
+  const sorted = [...windowRms].sort((a, b) => a - b);
+  const ambient = sorted.length ? sorted[Math.floor(sorted.length * 0.2)] : 0;
+  const threshold = Math.min(
+    GUARD_RMS_CEIL,
+    Math.max(GUARD_RMS_FLOOR, ambient * 2),
+  );
+  const voiced = windowRms.filter((r) => r > threshold).length;
   return { voicedMs: voiced * 30, peak };
 }
 const MAX_UTTERANCE_MS = 28_000;
