@@ -274,15 +274,16 @@ Quality gates:
    gate-design lesson, not a quality failure.)
 3. Live E2E on the real mic: correct transcript, coherent reply, turn ~1.3 s.
 
-Also shipped: **parallel weight fetches** (they were strictly sequential) and
-**deferred TTS** — readiness now gates on ASR+LLM only (~440 MB with the
-quantized Gemma, was 846 MB), while the 236 MB voice model downloads in the
-background behind a `DeferredTTS` handle that awaits it at first reply.
+Also shipped: **parallel weight fetches** (they were strictly sequential), so
+wall-clock ≈ the largest file instead of the sum. A deferred-TTS variant
+(ready after ASR+LLM, voice downloads in background) was built and then
+removed at the owner's call — one "ready" that means fully ready is simpler
+than a partial state whose first reply may stall on a download.
 
 | | before | after |
 | --- | --- | --- |
 | total download | 846 MB | **610 MB** |
-| bytes before "ready" | 846 MB (sequential) | **~374 MB** (parallel) |
+| fetch schedule | sequential | parallel |
 
 The quantized file is served from `public/weights/` (gitignored); fresh clones
 fall back to the fp16 HF file automatically.

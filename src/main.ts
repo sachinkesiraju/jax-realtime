@@ -31,11 +31,14 @@ app.innerHTML = `
         <h1>jax&#8209;realtime</h1>
         <p class="tagline">
           A full&#8209;duplex voice assistant running entirely in your browser with
-          <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a>
-          &mdash; no turn buttons: it listens while it talks, you can interrupt it
-          mid&#8209;sentence, and it backchannels while you speak, in the spirit of
-          <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">interaction models</a>
-          and the <a href="https://huggingface.co/blog/cerebras-gemma4-voice-ai" target="_blank">HF &times; Cerebras demo</a>.
+          <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a>.
+          <br />
+          It listens while it talks, you can interrupt it mid&#8209;sentence,
+          and it backchannels while you speak.
+          <br />
+          Inspired by the Thinking Machines
+          <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">interaction model</a>
+          and the <a href="https://huggingface.co/blog/cerebras-gemma4-voice-ai" target="_blank">Cerebras &times; HF demo</a>.
         </p>
       </div>
     </header>
@@ -46,19 +49,19 @@ app.innerHTML = `
         <span class="stage-model">Whisper tiny.en</span>
         <span class="stage-metric" id="metric-asr">&ndash;</span>
       </div>
-      <span class="rail-arrow">&rarr;</span>
+      <span class="rail-arrow">+</span>
       <div class="stage" id="stage-llm">
         <span class="stage-role"><span class="stage-dot" id="dot-llm"></span>Brain <span class="stage-lane">webgpu</span></span>
         <span class="stage-model" id="llm-label">Gemma 3 270M</span>
         <span class="stage-metric" id="metric-llm">&ndash;</span>
       </div>
-      <span class="rail-arrow">&rarr;</span>
+      <span class="rail-arrow">+</span>
       <div class="stage" id="stage-tts">
         <span class="stage-role"><span class="stage-dot" id="dot-tts"></span>Voice <span class="stage-lane">webgpu</span></span>
         <span class="stage-model">Kyutai Pocket TTS</span>
         <span class="stage-metric" id="metric-tts">&ndash;</span>
       </div>
-      <span class="rail-arrow rail-arrow-eye">&rarr;</span>
+      <span class="rail-arrow rail-arrow-eye">+</span>
       <div class="stage stage-eye" id="stage-eye">
         <span class="stage-role"><span class="stage-dot" id="dot-eye"></span>Eye <span class="stage-lane">webgpu</span></span>
         <span class="stage-model">D&#8209;FINE</span>
@@ -88,7 +91,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~750&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~610&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
@@ -169,6 +172,12 @@ const el = {
     asr: document.querySelector<HTMLSpanElement>("#dot-asr")!,
     llm: document.querySelector<HTMLSpanElement>("#dot-llm")!,
     tts: document.querySelector<HTMLSpanElement>("#dot-tts")!,
+  },
+  stages: {
+    asr: document.querySelector<HTMLDivElement>("#stage-asr")!,
+    llm: document.querySelector<HTMLDivElement>("#stage-llm")!,
+    tts: document.querySelector<HTMLDivElement>("#stage-tts")!,
+    eye: document.querySelector<HTMLDivElement>("#stage-eye")!,
   },
 };
 
@@ -338,11 +347,8 @@ async function handleLoad() {
     pipeline = await loadPipeline(onDownloadProgress);
     el.laneAsr.textContent = pipeline.asrDevice;
     el.backendChip.textContent = pipeline.dualLane ? "WebGPU + Wasm" : "WebGPU";
-    // Backchannel prep doubles as the TTS warmup; it runs in the background so
-    // "ready" isn't gated on the (deferred) 236 MB voice-model download.
-    void pipeline.tts
-      .prepareBackchannels(el.voiceSelect.value as TTSVoice)
-      .catch(() => {});
+    setStatus("preparing backchannels", "busy");
+    await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
     el.eyeToggle.disabled = false;
@@ -376,6 +382,7 @@ el.voiceSelect.addEventListener("change", () => {
 
 function stageActivity(stage: Stage, active: boolean) {
   el.dots[stage].classList.toggle("is-on", active);
+  el.stages[stage].classList.toggle("is-active", active);
 }
 
 // --- Vision "Eye" stage -------------------------------------------------
@@ -427,6 +434,7 @@ function drawPreview() {
   el.metricEye.textContent =
     people === 0 ? "no people" : `${people} ${people === 1 ? "person" : "people"}`;
   el.dotEye.classList.toggle("is-on", vision.active);
+  el.stages.eye.classList.toggle("is-active", vision.active);
 }
 
 async function enableVision(): Promise<void> {
@@ -467,6 +475,7 @@ function disableVision(): void {
   el.pip.hidden = true;
   el.stageEye.classList.remove("is-active");
   el.dotEye.classList.remove("is-on");
+  el.stages.eye.classList.remove("is-active");
   el.metricEye.textContent = "off";
 }
 

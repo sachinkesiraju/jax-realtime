@@ -1191,16 +1191,10 @@ function withFirstAudio(inner: AudioPlayer, onFirst: () => void): AudioPlayer {
   };
 }
 
-/** The TTS surface the app consumes (duplex engine + UI). */
-export type TTSStage = Pick<
-  SpeechSynthesizer,
-  "speak" | "speakStream" | "prepareBackchannels" | "playBackchannel"
->;
-
 export type VoicePipeline = {
   asr: SpeechRecognizer;
   llm: LocalChatModel;
-  tts: TTSStage;
+  tts: SpeechSynthesizer;
   /** Compute device the ASR lane runs on ("wasm" when available, else "webgpu"). */
   asrDevice: Device;
   /** True if ASR runs on wasm, i.e. concurrently with WebGPU TTS/LLM. */
@@ -1236,62 +1230,23 @@ export async function initDevice(): Promise<DeviceSetup> {
   return { devices, asrDevice: "webgpu", asrDtype: np.float16 };
 }
 
-/**
- * Deferred TTS handle: the ~236 MB voice model is the biggest single chunk of
- * the download but isn't needed to *start talking* — only for the first reply.
- * The pipeline flips to ready once ASR+LLM are warm; this wrapper transparently
- * awaits the still-downloading TTS on first use, and backchannels simply no-op
- * until it has landed.
- */
-class DeferredTTS implements TTSStage {
-  private real: SpeechSynthesizer | null = null;
-
-  constructor(private readonly loading: Promise<SpeechSynthesizer>) {
-    void loading.then((tts) => {
-      this.real = tts;
-    });
-  }
-
-  async speak(
-    ...args: Parameters<SpeechSynthesizer["speak"]>
-  ): ReturnType<SpeechSynthesizer["speak"]> {
-    return (this.real ?? (await this.loading)).speak(...args);
-  }
-
-  async speakStream(
-    ...args: Parameters<SpeechSynthesizer["speakStream"]>
-  ): ReturnType<SpeechSynthesizer["speakStream"]> {
-    return (this.real ?? (await this.loading)).speakStream(...args);
-  }
-
-  async prepareBackchannels(voice: TTSVoice): Promise<void> {
-    return (await this.loading).prepareBackchannels(voice);
-  }
-
-  playBackchannel(): void {
-    // Silent no-op while the voice model is still downloading.
-    this.real?.playBackchannel();
-  }
-}
-
 export async function loadPipeline(
   onProgress: ProgressFn,
 ): Promise<VoicePipeline> {
   const setup = await initDevice();
   // All three weight downloads run in parallel (they were sequential; HTTP/2
   // multiplexes them over one connection, so wall-clock ≈ the largest file).
-  const asrP = SpeechRecognizer.load(onProgress, {
-    device: setup.asrDevice,
-    dtype: setup.asrDtype,
-  });
-  const llmP = LocalChatModel.load(onProgress);
-  const ttsP = SpeechSynthesizer.load(onProgress);
-  const [asr, llm] = await Promise.all([asrP, llmP]);
+  const [asr, llm, tts] = await Promise.all([
+    SpeechRecognizer.load(onProgress, {
+      device: setup.asrDevice,
+      dtype: setup.asrDtype,
+    }),
+    LocalChatModel.load(onProgress),
+    SpeechSynthesizer.load(onProgress),
+  ]);
   // Compile the ASR + LLM kernels now (esp. slow to JIT on wasm) so the first
-  // real turn isn't hit with a multi-second cold start. TTS is deliberately
-  // NOT awaited: readiness only needs ears + brain, and DeferredTTS awaits the
-  // voice on first reply (prepareBackchannels doubles as its warmup once it
-  // lands — main.ts fires that in the background).
+  // real turn isn't hit with a multi-second cold start. (TTS is warmed via
+  // prepareBackchannels, which the UI calls right after load.)
   onProgress({ name: "Warming up models", loadedBytes: 0, done: false });
   await asr.warmup();
   await llm.warmup();
@@ -1299,7 +1254,7 @@ export async function loadPipeline(
   return {
     asr,
     llm,
-    tts: new DeferredTTS(ttsP),
+    tts,
     asrDevice: setup.asrDevice,
     dualLane: setup.asrDevice === "wasm",
   };

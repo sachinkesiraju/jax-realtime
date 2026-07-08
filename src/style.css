@@ -54,7 +54,9 @@ body {
 
 .tagline {
   margin: 0.6rem 0 0;
-  max-width: 58ch;
+  /* Wide enough that each <br />-separated line stays on one line on desktop
+     (the longest is ~95ch); narrow viewports still wrap naturally. */
+  max-width: 100ch;
   color: var(--ink-soft);
   font-size: 1.02rem;
 }
@@ -79,7 +81,15 @@ body {
 .rail-arrow {
   align-self: center;
   color: var(--ink-soft);
-  font-size: 1.1rem;
+  font-size: 1.15rem;
+  font-weight: 300;
+}
+
+/* Card lights up while its stage is actually computing (dot + border glow). */
+.stage.is-active {
+  border-color: var(--signal-deep);
+  background: oklch(97% 0.03 118);
+  box-shadow: 0 0 12px oklch(88% 0.19 118 / 0.35);
 }
 
 .stage {
