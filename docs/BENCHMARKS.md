@@ -221,6 +221,72 @@ output is the law above — perceived-audio quality needs an ears-in-the-loop ga
 and gap-masking must be a single-stream design — plus confirmation (again) that
 the GPU floor is the real ceiling.
 
+## Map-reduce campaign — cycle 4 (jax-js compute: fused decode + GPU sampling)
+
+The first campaign aimed at the GPU floor itself. DIAGNOSE (in-app
+`benchDecode`) measured the 46.7 ms/token decode budget: readback transfer only
+0.7 ms, JS scan 1.2 ms, **~4.4 ms/token of synchronous CPU dispatch across the
+~21 separate jit calls** per step, ASR pass cost flat vs window length (kills
+the window-cap idea). Verified from jax-js source: number args do NOT re-trace
+(trace cache keys on avals), so the dispatch cost is genuinely ~21
+command-buffer submits.
+
+Implementation (Opus subagent, audited line-by-line): single-jit fused decode
+step (`runGemmaDecodeStepFused`, token/position as np.Array inputs so the trace
+caches across tokens), GPU `lax.topK(64)` sampler with bit-identical selection,
+KV-cache reuse across turns, history windowing — all behind TUNABLES. The ASR
+GPU sampler was **declined honestly**: the timestamp gate needs full-vocab
+reductions whose exactness a topK candidate list can't guarantee.
+
+**Equivalence gate (hard):** 4-way greedy 32-token identity across
+{fused}×{sampler} — **all identical**. Zero quality risk by construction.
+
+**MAP (n=32 ×2 runs each):**
+
+| config | ms/token | Δ | dispatch-sync |
+| --- | --- | --- | --- |
+| base (js, unfused) | 46.9 / 40.6 | — | 4.3–4.6 ms |
+| fused | 39.1 / 33.3 | −17 % | 2.6–2.9 ms |
+| topk | 35.4 / 36.8 | −17 % | 3.7 ms |
+| **fused+topk (shipped)** | **34.7 / 33.6** | **−22 %** | 2.4 ms |
+
+**Shipped:** `llmFusedStep: true`, `llmSampler: "topk"` → ~22 → ~29 tok/s.
+KV reuse + windowing stay off by default (correct but unproven payoff for short
+demo sessions; available as tunables). Honest residual: ~34 ms/token floor is
+the per-token GPU submit→execute→map roundtrip — decode must sync every token
+to sample, and that roundtrip is the next (hard) wall.
+
+## Weights-download reduction (shipped)
+
+Measured reality: initial download was **846 MB** (Gemma 536 + TTS 236 +
+Whisper 74), of which ONE tensor — Gemma's tied embedding table
+(262,144×640 fp16 = 335 MB) — is 40 %. CDN serves uncompressed (confirmed) and
+fp16 is high-entropy, so transit compression is dead. jax-js has no int8
+compute dtype, but @jax-js/loaders parses I8 — so: **quantize the embedding to
+per-row int8 offline, dequantize to fp16 at load**. Compute unchanged.
+
+Quality gates:
+1. Reconstruction: worst-row cosine 0.9986, median 0.99991, max-abs-err 0.0037.
+2. Greedy equivalence vs fp16: identical for the first 31 tokens, then ONE
+   near-tie flip ("adapting"→"influenced") forked the sequence — both branches
+   fully coherent. (The pre-registered "≥95 % positional agreement" gate read
+   67 %, which is the wrong metric after a greedy fork; recorded as a
+   gate-design lesson, not a quality failure.)
+3. Live E2E on the real mic: correct transcript, coherent reply, turn ~1.3 s.
+
+Also shipped: **parallel weight fetches** (they were strictly sequential) and
+**deferred TTS** — readiness now gates on ASR+LLM only (~440 MB with the
+quantized Gemma, was 846 MB), while the 236 MB voice model downloads in the
+background behind a `DeferredTTS` handle that awaits it at first reply.
+
+| | before | after |
+| --- | --- | --- |
+| total download | 846 MB | **610 MB** |
+| bytes before "ready" | 846 MB (sequential) | **~374 MB** (parallel) |
+
+The quantized file is served from `public/weights/` (gitignored); fresh clones
+fall back to the fp16 HF file automatically.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

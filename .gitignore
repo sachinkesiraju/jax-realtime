@@ -10,3 +10,4 @@ dist/
 # Logs & OS cruft
 *.log
 .DS_Store
+public/weights/

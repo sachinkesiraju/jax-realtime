@@ -1,5 +1,6 @@
 import { numpy as np } from "@jax-js/jax";
 
+import { TUNABLES } from "../tunables";
 import type { WhisperConfig } from "./model";
 import { WhisperTokenizer } from "./tokenizer";
 
@@ -22,6 +23,17 @@ export async function sampleGreedy(
   duration: number,
   config: WhisperConfig,
 ): Promise<number> {
+  // TUNABLES.asrSampler exists for the bench harness, but only the "js" path
+  // preserves the gate semantics exactly. The gating needs two full-vocab
+  // reductions (a logSumExp over the admissible timestamp range vs a masked max
+  // over the admissible text range) whose comparison decides `forceTimestamp`,
+  // and then a masked argmax over a set that spans both ranges. A device-side
+  // topK candidate list can miss the masked argmax winner when the largest raw
+  // logits are all suppressed tokens, and a device reduction is not guaranteed
+  // bit-identical to the sequential JS reduction — either would change the
+  // sampled token. So we never approximate the gate: "gpu" falls through to the
+  // exact JS implementation below.
+  void TUNABLES.asrSampler;
   const values = (await logits.data()) as ArrayLike<number>;
   const gate = { tokens, duration, forceTimestamp: false };
   gate.forceTimestamp =

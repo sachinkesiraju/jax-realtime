@@ -203,6 +203,7 @@ if (import.meta.env.DEV) {
   dev.__detector = () => detector;
   dev.__tunables = TUNABLES;
   dev.__turnLog = TURN_LOG;
+  dev.__pipeline = () => pipeline;
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {
@@ -337,8 +338,11 @@ async function handleLoad() {
     pipeline = await loadPipeline(onDownloadProgress);
     el.laneAsr.textContent = pipeline.asrDevice;
     el.backendChip.textContent = pipeline.dualLane ? "WebGPU + Wasm" : "WebGPU";
-    setStatus("preparing backchannels", "busy");
-    await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    // Backchannel prep doubles as the TTS warmup; it runs in the background so
+    // "ready" isn't gated on the (deferred) 236 MB voice-model download.
+    void pipeline.tts
+      .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+      .catch(() => {});
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
     el.eyeToggle.disabled = false;
