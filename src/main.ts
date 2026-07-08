@@ -3,6 +3,8 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/600.css";
 import "./style.css";
 
+import { getWebGPUDevice } from "@jax-js/jax";
+
 import { DuplexSession } from "./duplex";
 import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
@@ -346,7 +348,17 @@ async function handleLoad() {
   try {
     pipeline = await loadPipeline(onDownloadProgress);
     el.laneAsr.textContent = pipeline.asrDevice;
-    el.backendChip.textContent = pipeline.dualLane ? "WebGPU + Wasm" : "WebGPU";
+    // The per-card lanes already say "webgpu"; make this chip earn its place by
+    // naming the actual GPU everything is running on.
+    try {
+      const info = getWebGPUDevice().adapterInfo;
+      const gpu =
+        info?.description ||
+        [info?.vendor, info?.architecture].filter(Boolean).join(" ");
+      el.backendChip.textContent = gpu ? `WebGPU · ${gpu}` : "WebGPU";
+    } catch {
+      el.backendChip.textContent = "WebGPU";
+    }
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
     el.loadBtn.hidden = true;
