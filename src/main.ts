@@ -344,16 +344,17 @@ async function handleLoad() {
   el.loadBtn.disabled = true;
   setStatus("downloading models", "busy");
   try {
-    // Preload + warm the Eye detector in parallel with the voice pipeline so
-    // enabling the Eye at "ready" doesn't stall on the D-FINE download/compile
-    // — that stall was the visible delay before "1 person" appeared.
+    pipeline = await loadPipeline(onDownloadProgress);
+    // Preload + warm the Eye detector now (not awaited) so enabling the Eye at
+    // "ready" doesn't stall on the D-FINE download/compile. Must start AFTER
+    // loadPipeline: it runs initDevice(), and constructing the ONNX detector
+    // before the WebGPU backend is initialized breaks detection silently.
     detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
       async (d) => {
         await d.warmup();
         return d;
       },
     );
-    pipeline = await loadPipeline(onDownloadProgress);
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);

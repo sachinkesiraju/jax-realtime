@@ -26,17 +26,38 @@ import type { VisionSession } from "./vision/vision";
 // TUNABLES so the optimization bench can vary them at runtime.
 const START_LEVEL = 0.05; // speech onset / barge-in threshold
 // Phantom-turn guard: Whisper hallucinates text on near-silence ("Thank you."
-// is its most famous), and a single noisy tick above START_LEVEL is enough to
-// latch an "utterance" that then endpoints into a fake turn. Require real
-// voiced evidence — a couple of ticks above the gate and a peak comfortably
-// over it — before a turn is transcribed at all. Signal-based on purpose: no
-// phrase blocklists, so a genuine quiet "thank you" still gets through.
-// NOTE: the level meter decays between words, so 150 ms tick sampling catches
-// only 1-2 voiced ticks across seconds of real speech — requiring ≥2 made the
-// guard a coin flip on legitimate turns (measured: voiced=2, peak=0.114 on a
-// 2 s utterance). The peak test is the reliable discriminator; keep ticks ≥1.
-const MIN_VOICED_TICKS = 1;
-const MIN_PEAK_LEVEL = 0.07; // must rise clearly above the 0.05 onset gate
+// is its most famous), and a brief blip above START_LEVEL is enough to latch
+// an "utterance" that then endpoints into a fake turn. Signal-based on purpose
+// — no phrase blocklists, so a genuine quiet "thank you" passes.
+// Evidence design (three attempts taught this): anything derived from the
+// tick-sampled level meter is a coin flip — the meter decays between words
+// and GPU work janks the tick cadence, so real 2 s speech and an ambient blip
+// measure alike. Instead the guard reads the CAPTURED PCM at endpoint time and
+// measures actual voiced duration (30 ms windows above an RMS floor) + peak
+// amplitude. Deterministic, no sampling artifacts. Sub-threshold "utterances"
+// are discarded before Whisper ever sees them; anything loud-but-short that
+// slips through still hits the empty-transcript discard after transcription.
+const GUARD_WINDOW = 480; // 30 ms at 16 kHz
+const GUARD_RMS_FLOOR = 0.02; // window counts as voiced above this RMS
+const MIN_VOICED_MS = 250; // real speech easily exceeds this; blips don't
+const MIN_PEAK_ABS = 0.04; // near-silence hallucination cutoff
+
+/** Voiced duration + peak of a PCM buffer (see phantom-turn guard). */
+function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } {
+  let voiced = 0;
+  let peak = 0;
+  for (let start = 0; start + GUARD_WINDOW <= samples.length; start += GUARD_WINDOW) {
+    let energy = 0;
+    for (let i = start; i < start + GUARD_WINDOW; i++) {
+      const s = samples[i];
+      energy += s * s;
+      const a = Math.abs(s);
+      if (a > peak) peak = a;
+    }
+    if (Math.sqrt(energy / GUARD_WINDOW) > GUARD_RMS_FLOOR) voiced++;
+  }
+  return { voicedMs: voiced * 30, peak };
+}
 const MAX_UTTERANCE_MS = 28_000;
 const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
 const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
@@ -148,9 +169,9 @@ export class DuplexSession {
   private aboveTicks = 0;
   private aboveBargeTicks = 0; // consecutive ticks above the energy-barge level
   private backchannelUsed = false;
-  // Voiced-evidence accumulators for the phantom-turn guard (see constants).
-  private voicedTicks = 0;
-  private peakLevel = 0;
+  // A barge-in continuation skips the phantom-turn guard (its sustained energy
+  // already proved itself to the barge detector).
+  private bargeContinuation = false;
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -182,6 +203,7 @@ export class DuplexSession {
   private personAbsentSince = 0;
   private stepAwayAnnounced = false;
   private phonePresentSince = 0;
+  private phoneGoneSince = 0;
   private phoneAnnounced = false;
   private slouchSince = 0;
   private slouchAnnounced = false;
@@ -332,8 +354,6 @@ export class DuplexSession {
     if (level > START_LEVEL) {
       if (!this.speechStartAt) this.speechStartAt = now;
       this.silenceStart = 0;
-      this.voicedTicks++;
-      if (level > this.peakLevel) this.peakLevel = level;
     } else if (this.speechStartAt && !this.silenceStart) {
       this.silenceStart = now;
     }
@@ -404,17 +424,20 @@ export class DuplexSession {
     const transcriber = this.transcriber;
     if (!transcriber) return;
 
-    // Phantom-turn guard: without enough voiced evidence this "utterance" was
-    // ambient noise, and transcribing near-silence makes Whisper hallucinate
-    // ("Thank you." etc.). Discard before transcription.
-    if (
-      this.voicedTicks < MIN_VOICED_TICKS ||
-      this.peakLevel < MIN_PEAK_LEVEL
-    ) {
-      this.cb.onEvent("noise · discarded");
-      this.startFreshListening();
-      return;
+    // Phantom-turn guard: without enough voiced evidence in the captured PCM
+    // this "utterance" was ambient noise, and transcribing near-silence makes
+    // Whisper hallucinate ("Thank you." etc.). Discard before transcription.
+    // Barge-in continuations skip the check — their sustained energy already
+    // proved itself to the barge detector.
+    if (!this.bargeContinuation) {
+      const stats = voicedStats(this.capture.samples());
+      if (stats.voicedMs < MIN_VOICED_MS || stats.peak < MIN_PEAK_ABS) {
+        this.cb.onEvent("noise · discarded");
+        this.startFreshListening();
+        return;
+      }
     }
+    this.bargeContinuation = false;
 
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
@@ -713,10 +736,9 @@ export class DuplexSession {
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     // The interrupting speech already proved itself (sustained energy above the
-    // barge threshold) — seed the voiced-evidence counters so the phantom-turn
-    // guard can't discard a genuine barge-in utterance.
-    this.voicedTicks = BARGE_ENERGY_TICKS;
-    this.peakLevel = Math.max(this.peakLevel, BARGE_ENERGY_LEVEL);
+    // barge threshold) — mark it so the phantom-turn guard doesn't second-guess
+    // a genuine barge-in utterance.
+    this.bargeContinuation = true;
   }
 
   // --- Time awareness ----------------------------------------------------
@@ -776,12 +798,18 @@ export class DuplexSession {
       this.personPresentSince = 0;
     }
 
-    // Track phone streak.
+    // Track phone streak. Re-arm the announcement only after the phone has
+    // been genuinely gone for a while — detection-score jitter around the
+    // threshold must not make the line repeat while the phone sits in frame.
     if (phonePresent) {
       if (!this.phonePresentSince) this.phonePresentSince = now;
+      this.phoneGoneSince = 0;
     } else {
       this.phonePresentSince = 0;
-      this.phoneAnnounced = false;
+      if (!this.phoneGoneSince) this.phoneGoneSince = now;
+      if (this.phoneAnnounced && now - this.phoneGoneSince > 60_000) {
+        this.phoneAnnounced = false;
+      }
     }
 
     // Track slouch streak.
@@ -890,8 +918,7 @@ export class DuplexSession {
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     this.backchannelUsed = false;
-    this.voicedTicks = 0;
-    this.peakLevel = 0;
+    this.bargeContinuation = false;
   }
 
   /** Fresh listening window: drop buffered audio and reset ASR commit state. */
