@@ -18,6 +18,9 @@ const POSTURE_BASELINE = 6; // rolling frames used for the slouch baseline
 // reported — this filters flickering false positives (a "cat" that D-FINE only
 // hallucinates for a single frame) out of what we tell the user.
 const STABILITY_FRAMES = 3;
+// Min score for a person box to COUNT toward the announced number (the overlay
+// still draws everything above the detector's own display threshold).
+const PERSON_COUNT_MIN_SCORE = 0.6;
 
 export type SceneState = {
   personCount: number;
@@ -56,6 +59,7 @@ export class VisionSession {
 
   // Recent per-frame label sets + the labels currently considered stable.
   private recentLabels: string[][] = [];
+  private recentPersonCounts: number[] = [];
   private stableSet = new Set<string>();
   private colorCanvas: HTMLCanvasElement | null = null;
 
@@ -95,6 +99,7 @@ export class VisionSession {
     this.heightHistory = [];
     this.slouchingNow = false;
     this.recentLabels = [];
+    this.recentPersonCounts = [];
     this.stableSet = new Set();
   }
 
@@ -206,6 +211,19 @@ export class VisionSession {
   private updateStability(detections: Detection[]): void {
     this.recentLabels.push([...new Set(detections.map((d) => d.label))]);
     if (this.recentLabels.length > STABILITY_FRAMES) this.recentLabels.shift();
+    // Per-frame person counts feed a median in `personCount`, so one dropped
+    // frame (yielded to audio) or one ghost box can't flap the reported number.
+    // Counting demands higher confidence than displaying: a tentative 0.5 box
+    // is worth drawing on the overlay, but announcing "2 people" is a claim —
+    // real people measure 0.74-0.93 here; posters/reflections sit near 0.5.
+    this.recentPersonCounts.push(
+      detections.filter(
+        (d) => d.label === "person" && d.score >= PERSON_COUNT_MIN_SCORE,
+      ).length,
+    );
+    if (this.recentPersonCounts.length > STABILITY_FRAMES) {
+      this.recentPersonCounts.shift();
+    }
     const counts = new Map<string, number>();
     for (const labels of this.recentLabels) {
       for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
@@ -224,10 +242,13 @@ export class VisionSession {
   // --- Derived scene state ------------------------------------------------
 
   get personCount(): number {
-    // Only count people once "person" is stable, and don't blink to 0 on a
-    // single dropped frame — report at least 1 while it stays stable.
+    // Only count people once "person" is stable, then report the MEDIAN count
+    // over the stability window (never below 1 while stable) — the instant
+    // latest-frame count flapped 0→2 on dropped frames and duplicate boxes.
     if (!this.stableSet.has("person")) return 0;
-    return Math.max(1, this.latest.filter((d) => d.label === "person").length);
+    const sorted = [...this.recentPersonCounts].sort((a, b) => a - b);
+    const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 1;
+    return Math.max(1, median);
   }
 
   get personPresent(): boolean {
@@ -343,7 +364,11 @@ export class VisionSession {
     // transcribing or the assistant is speaking. The scheduler retries soon.
     if (this.pauseWhile?.()) return false;
     try {
-      const detections = await this.detector.detect(this.video);
+      // Dedupe at the source: DETR-family models emit a duplicate overlapping
+      // box for the same object near the score threshold (e.g. one person as a
+      // 0.93 box plus a ~0.5 ghost), which inflated counts ("2 people") and
+      // drew double boxes on the overlay.
+      const detections = dedupeDetections(await this.detector.detect(this.video));
       if (!this.running) return true;
       this.sampleColors(detections);
       this.latest = detections;
@@ -461,4 +486,39 @@ function joinList(parts: string[]): string {
   if (parts.length === 1) return parts[0];
   if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
   return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+}
+
+/**
+ * Overlap of two [x, y, w, h] boxes, normalized by the SMALLER box's area
+ * (intersection-over-minimum). This catches both classic duplicates (high IoU)
+ * and contained ghosts — e.g. a face-only "person" box inside the full-body
+ * box, whose IoU is small because the areas differ hugely.
+ */
+function overlapOverMin(
+  a: [number, number, number, number],
+  b: [number, number, number, number],
+): number {
+  const x1 = Math.max(a[0], b[0]);
+  const y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[0] + a[2], b[0] + b[2]);
+  const y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const minArea = Math.min(a[2] * a[3], b[2] * b[3]);
+  return minArea > 0 ? inter / minArea : 0;
+}
+
+/**
+ * Drop same-label detections mostly covered by a stronger one — duplicates or
+ * parts of a single object, not a second object. Distinct objects of the same
+ * class (two chairs side by side) overlap little and are kept.
+ */
+function dedupeDetections(detections: Detection[]): Detection[] {
+  const kept: Detection[] = [];
+  for (const d of [...detections].sort((a, b) => b.score - a.score)) {
+    const dup = kept.some(
+      (k) => k.label === d.label && overlapOverMin(k.box, d.box) > 0.7,
+    );
+    if (!dup) kept.push(d);
+  }
+  return kept;
 }

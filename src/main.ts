@@ -400,6 +400,14 @@ function stageActivity(stage: Stage, active: boolean) {
 function drawPreview() {
   visionRaf = requestAnimationFrame(drawPreview);
   if (!vision) return;
+  // Scene metrics first — they must not depend on the pip canvas being laid
+  // out (the early returns below skip frames whenever it isn't, which used to
+  // leave the person count frozen at "no people").
+  const people = vision.personCount;
+  el.metricEye.textContent =
+    people === 0 ? "no people" : `${people} ${people === 1 ? "person" : "people"}`;
+  el.dotEye.classList.toggle("is-on", vision.active);
+  el.stages.eye.classList.toggle("is-active", vision.active);
   const video = vision.video;
   const overlay = el.pipOverlay;
   const cssSize = overlay.clientWidth;
@@ -438,13 +446,6 @@ function drawPreview() {
     ctx.fillStyle = "oklch(20% 0.05 118)";
     ctx.fillText(label, x + 3, Math.max(10, y - 3));
   }
-  // Highlight the number of people (the meaningful signal), not raw object
-  // count — a room full of chairs shouldn't read as "6 obj".
-  const people = vision.personCount;
-  el.metricEye.textContent =
-    people === 0 ? "no people" : `${people} ${people === 1 ? "person" : "people"}`;
-  el.dotEye.classList.toggle("is-on", vision.active);
-  el.stages.eye.classList.toggle("is-active", vision.active);
 }
 
 async function enableVision(): Promise<void> {
