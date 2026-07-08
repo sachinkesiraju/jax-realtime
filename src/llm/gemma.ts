@@ -1,4 +1,4 @@
-import { blockUntilReady, jit, nn, numpy as np, tree } from "@jax-js/jax";
+import { blockUntilReady, jit, lax, nn, numpy as np, tree } from "@jax-js/jax";
 import { safetensors, WeightMapper } from "@jax-js/loaders";
 
 export const GEMMA_CONFIG = {
@@ -592,7 +592,11 @@ function attentionStepInline(
  * The KV-cache write slot and the valid-length mask are derived from `position`
  * inside the trace, exactly as `runAttentionStep` does with plain numbers.
  */
-export const runGemmaDecodeStepFused = jit(function runGemmaDecodeStepFused(
+// The fused decode step's math, as plain (non-jitted) tracer ops so it can be
+// shared by both the logits-returning and top-k-folded jit wrappers below. This
+// is ordinary JS inlining — no jit boundary — so each wrapper traces to exactly
+// the same flat jaxpr it would have inlined directly. Returns full-vocab logits.
+function gemmaDecodeStepBody(
   model: GemmaModel,
   caches: GemmaKVCache[],
   tokenId: np.Array,
@@ -651,7 +655,53 @@ export const runGemmaDecodeStepFused = jit(function runGemmaDecodeStepFused(
     GEMMA_CONFIG.vocabSize,
   ]);
   return [logits, newCaches];
+}
+
+export const runGemmaDecodeStepFused = jit(function runGemmaDecodeStepFused(
+  model: GemmaModel,
+  caches: GemmaKVCache[],
+  tokenId: np.Array,
+  position: np.Array,
+): [np.Array, GemmaKVCache[]] {
+  return gemmaDecodeStepBody(model, caches, tokenId, position);
 });
+
+// Number of top-k candidates the decode sampler keeps (matches the topK used by
+// the JS/GPU samplers in pipeline.ts). Folded into the jit below so the topK
+// reduction rides the same dispatch as the decode step.
+export const GEMMA_TOPK = 64;
+
+/**
+ * Fused decode step with `lax.topK` folded into the same jitted dispatch (Task
+ * B2/B3). Instead of returning full-vocab logits (which cost a separate topK
+ * dispatch + sync per token in the sampler), this emits the top-`GEMMA_TOPK`
+ * candidates as a SINGLE readback array: `[values (fp32) ..k.., indices (fp32)
+ * ..k..]`, length `2*GEMMA_TOPK`. Packing values and indices into one array
+ * lets the caller read them back with one `.data()` instead of two round trips
+ * (indices are token ids < 2^24, exactly representable in fp32). Selection is
+ * identical to the shipped topK sampler — same top-`k` set, same values.
+ */
+export const runGemmaDecodeStepFusedTopK = jit(
+  function runGemmaDecodeStepFusedTopK(
+    model: GemmaModel,
+    caches: GemmaKVCache[],
+    tokenId: np.Array,
+    position: np.Array,
+  ): [np.Array, GemmaKVCache[]] {
+    const [logits, newCaches] = gemmaDecodeStepBody(
+      model,
+      caches,
+      tokenId,
+      position,
+    );
+    const [vals, idx] = lax.topK(logits, GEMMA_TOPK); // consumes logits
+    const combined = np.concatenate([
+      vals.astype(np.float32),
+      idx.astype(np.float32),
+    ]);
+    return [combined, newCaches];
+  },
+);
 
 /**
  * Fused-step counterpart to `runGemmaStep`: same signature and side effects
@@ -676,6 +726,32 @@ export function runGemmaStepFused(
   );
   state.position++;
   return logits;
+}
+
+/**
+ * Fused decode step returning the packed top-k readback array (see
+ * `runGemmaDecodeStepFusedTopK`) instead of full logits. Same side effects as
+ * `runGemmaStepFused` (advances `state`), so it swaps in behind
+ * TUNABLES.llmTopkInFused; the caller reads back the [2*GEMMA_TOPK] array once.
+ */
+export function runGemmaStepFusedTopK(
+  model: GemmaModel,
+  tokenId: number,
+  state: GemmaState,
+): np.Array {
+  ensureGemmaStateCapacity(state, state.position + 1);
+
+  const tokenIds = np.array([tokenId], { dtype: np.uint32 });
+  const posArr = np.array([state.position], { dtype: np.int32 });
+  let combined: np.Array;
+  [combined, state.caches] = runGemmaDecodeStepFusedTopK(
+    tree.ref(model),
+    state.caches,
+    tokenIds,
+    posArr,
+  );
+  state.position++;
+  return combined;
 }
 
 const mapper = new WeightMapper({

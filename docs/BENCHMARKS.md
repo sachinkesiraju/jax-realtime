@@ -353,6 +353,41 @@ Prediction audit: C1 predicted a win and delivered a rejection (the pre-fire
 signal doesn't exist — worth knowing); C2 predicted 55-75% and delivered 83/88%
 with the 0-false-trigger guard intact.
 
+## Audit cycle (post-cycle-5): bug audit + topK-in-jit
+
+Opus audit over the recent-change surface, Fable-validated line-by-line, all
+claims re-benched in-browser.
+
+**Bugs fixed:** detector-preload rejection stayed cached (Eye could never
+recover from one failed load — cleared on rejection now); TURN_LOG grew without
+bound (ring-capped at 500); calc/convert/clock chips mislabeled "web_search";
+[validator] the convert regex table's ungrouped alternations (`/\bmeters?|m\b/`
+matches "war**m**") — replaced wholesale, see below.
+
+**Design fix (owner call): no more pairwise unit table.** Conversion factors
+are definitional constants (a mile IS 1609.344 m — same class as the WMO code
+table), but the pairwise regex table was the wrong shape: 8 hand-picked pairs,
+O(n²) growth, one latent regex bug. Replaced with a unit LEXICON (alias →
+dimension + SI factor, ~20 units incl. inches/yards/ounces/gallons) and ONE
+generic rule: number + nearest unit after it + any other same-dimension unit.
+Verified: all old cases, new coverage (cm→inches, gallons→liters, °F→°C),
+no false trigger on "I ran 5 miles and it was warm" / "I'm 5 minutes late".
+
+**Perf:** the brief's Whisper-fusion premise was STALE — the decoder step is
+already a single fused jit (measured 9.7 ms/token; ASR pass cost is encoder +
+overhead, not decode). The real win: `lax.topK` folded INTO the fused Gemma
+jit, emitting a packed [values..64, indices..64] fp32 array — one dispatch and
+ONE readback per token instead of step+topK dispatches and two `.data()`
+round-trips (indices < 2^24 are exact in fp32). **Greedy-equivalence passed
+across all five sampler/fusion configs**; paired speed runs 42.7→38.0 and
+45.1→44.0 ms/token (small, direction-consistent, zero-risk). Shipped on
+(`llmTopkInFused`).
+
+**Reported, not fixed (recorded):** calc handles one binary op per utterance;
+CLOCK_RE misses some phrasings (expanding risks small-talk false positives);
+KV-reuse mid-loop-throw leaves inconsistent cache state (feature is off by
+default — must be fixed before ever enabling it).
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

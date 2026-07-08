@@ -59,6 +59,9 @@ function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } 
   return { voicedMs: voiced * 30, peak };
 }
 const MAX_UTTERANCE_MS = 28_000;
+// Cap on the rolling per-turn bench log so a long live session can't grow it
+// (and its retained strings) without bound.
+const TURN_LOG_MAX = 500;
 const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
 const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
 // Energy barge-in: with echoCancellation on, sustained loud mic input during
@@ -628,6 +631,10 @@ export class DuplexSession {
         reply: finalText,
         interrupted,
       });
+      // Bounded ring: the bench only ever inspects recent turns, and a long
+      // live session would otherwise grow this array (and its retained
+      // transcript/reply strings) without limit.
+      if (TURN_LOG.length > TURN_LOG_MAX) TURN_LOG.shift();
       this.turnMarks = {};
     }
 

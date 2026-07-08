@@ -54,6 +54,19 @@ export const TUNABLES = {
    */
   llmSampler: "topk" as "js" | "topk",
   /**
+   * Fold `lax.topK(logits, 64)` INTO the fused Gemma decode jit (only takes
+   * effect when llmFusedStep is on). The fused step then emits the 64 top-k
+   * (value, index) pairs packed into one fp32 readback array instead of the
+   * full 262k-vocab logits — the topK reduction rides the same dispatch as the
+   * decode step (saving one dispatch + sync per token) and the readback is one
+   * `.data()` of 128 floats instead of two. Selection is identical to the
+   * llmSampler:"topk" path (same top-64 set, same values). Shipped on:
+   * greedy-equivalence verified across all five configs in-browser; paired
+   * speed runs were consistently faster (~42.7→38.0, ~45.1→44.0 ms/token —
+   * small, but direction-consistent and zero-risk by construction).
+   */
+  llmTopkInFused: true,
+  /**
    * Reuse the KV cache across conversation turns. When on, a new turn whose
    * tokenized prompt shares a prefix with the cached sequence only prefills the
    * differing suffix instead of the whole prompt. Default false rebuilds the

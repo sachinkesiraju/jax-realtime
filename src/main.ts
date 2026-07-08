@@ -45,25 +45,25 @@ app.innerHTML = `
     <section class="rail" aria-label="Pipeline stages">
       <div class="stage" id="stage-asr">
         <span class="stage-role"><span class="stage-dot" id="dot-asr"></span>Ear <span class="stage-lane" id="lane-asr">webgpu</span></span>
-        <span class="stage-model">Whisper tiny.en</span>
+        <span class="stage-model"><a href="https://huggingface.co/mlx-community/whisper-tiny.en-asr-fp16" target="_blank">Whisper tiny.en</a></span>
         <span class="stage-metric" id="metric-asr">&ndash;</span>
       </div>
       <span class="rail-arrow">+</span>
       <div class="stage" id="stage-llm">
         <span class="stage-role"><span class="stage-dot" id="dot-llm"></span>Brain <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model" id="llm-label">Gemma 3 270M</span>
+        <span class="stage-model" id="llm-label"><a href="https://huggingface.co/ekzhang/jax-js-models" target="_blank">Gemma 3 270M</a></span>
         <span class="stage-metric" id="metric-llm">&ndash;</span>
       </div>
       <span class="rail-arrow">+</span>
       <div class="stage" id="stage-tts">
         <span class="stage-role"><span class="stage-dot" id="dot-tts"></span>Voice <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model">Kyutai Pocket TTS</span>
+        <span class="stage-model"><a href="https://huggingface.co/kyutai/pocket-tts-without-voice-cloning" target="_blank">Kyutai Pocket TTS</a></span>
         <span class="stage-metric" id="metric-tts">&ndash;</span>
       </div>
       <span class="rail-arrow rail-arrow-eye">+</span>
       <div class="stage stage-eye" id="stage-eye">
         <span class="stage-role"><span class="stage-dot" id="dot-eye"></span>Eye <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model">D&#8209;FINE</span>
+        <span class="stage-model"><a href="https://huggingface.co/bukuroo/D-FINE-ONNX" target="_blank">D&#8209;FINE</a></span>
         <span class="stage-metric" id="metric-eye">off</span>
       </div>
     </section>
@@ -102,6 +102,7 @@ app.innerHTML = `
       <div class="dock">
         <button id="load-btn" class="load-btn">Load models</button>
         <div class="dock-side">
+          <span id="backend-chip" class="backend-chip">WebGPU</span>
           <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
             <input type="checkbox" id="eye-toggle" disabled />
             <span>Eye &middot; webcam</span>
@@ -117,10 +118,7 @@ app.innerHTML = `
     </section>
 
     <footer class="colophon">
-      <span>Models: <a href="https://huggingface.co/mlx-community/whisper-tiny.en-asr-fp16" target="_blank">Whisper tiny.en</a>,
-      <a href="https://huggingface.co/ekzhang/jax-js-models" target="_blank">Gemma 3 270M</a>,
-      <a href="https://huggingface.co/kyutai/pocket-tts-without-voice-cloning" target="_blank">Kyutai Pocket TTS</a></span>
-      <span id="backend-chip" class="backend-chip">WebGPU</span>
+      <span>A project by <a href="https://sachinkesiraju.com" target="_blank">Sachin Kesiraju</a></span>
     </footer>
   </main>
 `;
@@ -250,7 +248,10 @@ function tick(text: string) {
 function addToolChip(kind: ToolKind, query: string): HTMLDivElement {
   const chip = document.createElement("div");
   chip.className = "tool-chip";
-  const verb = kind === "weather" ? "weather" : "web_search";
+  // Label the chip by the actual tool: the instant offline tools (calc/convert/
+  // clock) aren't web searches, so don't mislabel them as one.
+  const verb =
+    kind === "lookup" ? "web_search" : kind === "weather" ? "weather" : kind;
   const dot = document.createElement("span");
   dot.className = "chip-dot";
   const label = document.createElement("span");
@@ -458,7 +459,15 @@ async function enableVision(): Promise<void> {
         return d;
       },
     );
-    detector = await detectorPromise;
+    try {
+      detector = await detectorPromise;
+    } catch (error) {
+      // A rejected preload must NOT stay cached, or every later toggle awaits
+      // the same dead promise and the Eye can never recover. Clear it so a
+      // subsequent enable retries the load from scratch.
+      detectorPromise = null;
+      throw error;
+    }
     setTimeout(() => (el.downloads.hidden = true), 1500);
   }
   vision = new VisionSession(detector);
