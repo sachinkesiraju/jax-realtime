@@ -7,11 +7,10 @@ import { DuplexSession } from "./duplex";
 import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
-import type { ToolKind, UiCard } from "./tools/tools";
+import { detectTool, type ToolKind, type UiCard } from "./tools/tools";
 import { ObjectDetector } from "./vision/detector";
 import { VisionSession } from "./vision/vision";
 import {
-  CerebrasChatModel,
   type ChatModel,
   type DownloadProgress,
   loadPipeline,
@@ -46,25 +45,25 @@ app.innerHTML = `
     <section class="rail" aria-label="Pipeline stages">
       <div class="stage" id="stage-asr">
         <span class="stage-role"><span class="stage-dot" id="dot-asr"></span>Ear <span class="stage-lane" id="lane-asr">webgpu</span></span>
-        <span class="stage-model">Whisper tiny.en</span>
+        <span class="stage-model"><a href="https://huggingface.co/mlx-community/whisper-tiny.en-asr-fp16" target="_blank">Whisper tiny.en</a></span>
         <span class="stage-metric" id="metric-asr">&ndash;</span>
       </div>
       <span class="rail-arrow">+</span>
       <div class="stage" id="stage-llm">
         <span class="stage-role"><span class="stage-dot" id="dot-llm"></span>Brain <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model" id="llm-label">Gemma 3 270M</span>
+        <span class="stage-model" id="llm-label"><a href="https://huggingface.co/ekzhang/jax-js-models" target="_blank">Gemma 3 270M</a></span>
         <span class="stage-metric" id="metric-llm">&ndash;</span>
       </div>
       <span class="rail-arrow">+</span>
       <div class="stage" id="stage-tts">
         <span class="stage-role"><span class="stage-dot" id="dot-tts"></span>Voice <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model">Kyutai Pocket TTS</span>
+        <span class="stage-model"><a href="https://huggingface.co/kyutai/pocket-tts-without-voice-cloning" target="_blank">Kyutai Pocket TTS</a></span>
         <span class="stage-metric" id="metric-tts">&ndash;</span>
       </div>
       <span class="rail-arrow rail-arrow-eye">+</span>
       <div class="stage stage-eye" id="stage-eye">
         <span class="stage-role"><span class="stage-dot" id="dot-eye"></span>Eye <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model">D&#8209;FINE</span>
+        <span class="stage-model"><a href="https://huggingface.co/bukuroo/D-FINE-ONNX" target="_blank">D&#8209;FINE</a></span>
         <span class="stage-metric" id="metric-eye">off</span>
       </div>
     </section>
@@ -91,7 +90,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~610&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~680&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
@@ -103,6 +102,7 @@ app.innerHTML = `
       <div class="dock">
         <button id="load-btn" class="load-btn">Load models</button>
         <div class="dock-side">
+          <span id="backend-chip" class="backend-chip">WebGPU</span>
           <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
             <input type="checkbox" id="eye-toggle" disabled />
             <span>Eye &middot; webcam</span>
@@ -111,16 +111,6 @@ app.innerHTML = `
             <span>Voice</span>
             <select id="voice-select"></select>
           </label>
-          <details class="field cerebras">
-            <summary>LLM backend</summary>
-            <div class="cerebras-body">
-              <p>Default is Gemma running locally in your browser. Paste a
-              Cerebras API key to route the LLM stage through Cerebras inference
-              instead, as in the blog post.</p>
-              <input id="cerebras-key" type="password" placeholder="Cerebras API key (optional)" />
-              <input id="cerebras-model" type="text" value="gemma-4-31b" placeholder="Model name" />
-            </div>
-          </details>
         </div>
       </div>
 
@@ -128,10 +118,7 @@ app.innerHTML = `
     </section>
 
     <footer class="colophon">
-      <span>Models: <a href="https://huggingface.co/mlx-community/whisper-tiny.en-asr-fp16" target="_blank">Whisper tiny.en</a>,
-      <a href="https://huggingface.co/ekzhang/jax-js-models" target="_blank">Gemma 3 270M</a>,
-      <a href="https://huggingface.co/kyutai/pocket-tts-without-voice-cloning" target="_blank">Kyutai Pocket TTS</a></span>
-      <span id="backend-chip" class="backend-chip">WebGPU</span>
+      <span>A project by <a href="https://sachinkesiraju.com" target="_blank">Sachin Kesiraju</a></span>
     </footer>
   </main>
 `;
@@ -150,8 +137,6 @@ const el = {
   transcript: document.querySelector<HTMLDivElement>("#transcript")!,
   downloads: document.querySelector<HTMLDivElement>("#downloads")!,
   voiceSelect: document.querySelector<HTMLSelectElement>("#voice-select")!,
-  cerebrasKey: document.querySelector<HTMLInputElement>("#cerebras-key")!,
-  cerebrasModel: document.querySelector<HTMLInputElement>("#cerebras-model")!,
   llmLabel: document.querySelector<HTMLSpanElement>("#llm-label")!,
   backendChip: document.querySelector<HTMLSpanElement>("#backend-chip")!,
   laneAsr: document.querySelector<HTMLSpanElement>("#lane-asr")!,
@@ -181,6 +166,22 @@ const el = {
   },
 };
 
+// The per-card lanes already say "webgpu"; make the footer chip earn its place
+// by naming the actual GPU. Set at page init (not load time) so it's always
+// accurate; Chrome populates adapter-level info, not GPUDevice.adapterInfo.
+void (async () => {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    const info = adapter?.info;
+    const gpu =
+      info?.description ||
+      [info?.vendor, info?.architecture].filter(Boolean).join(" ");
+    if (gpu) el.backendChip.textContent = `WebGPU · ${gpu}`;
+  } catch {
+    // Leave the static "WebGPU" label.
+  }
+})();
+
 for (const voice of TTS_VOICES) {
   const option = document.createElement("option");
   option.value = voice;
@@ -200,6 +201,7 @@ let toolChip: HTMLDivElement | null = null;
 
 // Vision "Eye" stage (D-FINE). Loaded lazily when the dock toggle is enabled.
 let detector: ObjectDetector | null = null;
+let detectorPromise: Promise<ObjectDetector> | null = null;
 let vision: VisionSession | null = null;
 let visionRaf: number | null = null;
 let visionBusy = false;
@@ -213,6 +215,7 @@ if (import.meta.env.DEV) {
   dev.__tunables = TUNABLES;
   dev.__turnLog = TURN_LOG;
   dev.__pipeline = () => pipeline;
+  dev.__detectTool = detectTool;
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {
@@ -245,7 +248,10 @@ function tick(text: string) {
 function addToolChip(kind: ToolKind, query: string): HTMLDivElement {
   const chip = document.createElement("div");
   chip.className = "tool-chip";
-  const verb = kind === "weather" ? "weather" : "web_search";
+  // Label the chip by the actual tool: the instant offline tools (calc/clock)
+  // aren't web searches, so don't mislabel them as one.
+  const verb =
+    kind === "lookup" ? "web_search" : kind === "weather" ? "weather" : kind;
   const dot = document.createElement("span");
   dot.className = "chip-dot";
   const label = document.createElement("span");
@@ -299,12 +305,7 @@ function renderCard(card: UiCard) {
 }
 
 function currentModel(): ChatModel {
-  const key = el.cerebrasKey.value.trim();
-  if (key && pipeline) {
-    el.llmLabel.textContent = `Cerebras · ${el.cerebrasModel.value.trim()}`;
-    return new CerebrasChatModel(key, el.cerebrasModel.value.trim());
-  }
-  el.llmLabel.textContent = "Gemma 3 270M";
+  // Everything runs locally on jax-js; the Brain is always the local Gemma.
   return pipeline!.llm;
 }
 
@@ -345,22 +346,34 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
+    // Preload + warm the Eye detector now (not awaited) so enabling the Eye at
+    // "ready" doesn't stall on the D-FINE download/compile. Must start AFTER
+    // loadPipeline: it runs initDevice(), and constructing the ONNX detector
+    // before the WebGPU backend is initialized breaks detection silently.
+    // The Eye is on by default, so load + warm D-FINE as part of the loading
+    // screen (it starts here — after loadPipeline's initDevice, or the ONNX
+    // model races the WebGPU backend). Kicked off now so it downloads while the
+    // backchannels synthesize, then awaited before "ready" so the Eye actually
+    // detects the instant the standby screen appears, not seconds later.
+    detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
+      async (d) => {
+        await d.warmup();
+        return d;
+      },
+    );
     el.laneAsr.textContent = pipeline.asrDevice;
-    // The per-card lanes already say "webgpu"; make this chip earn its place by
-    // naming the actual GPU everything is running on. Chrome populates the
-    // adapter-level info (vendor/architecture), not GPUDevice.adapterInfo.
-    try {
-      const adapter = await navigator.gpu.requestAdapter();
-      const info = adapter?.info;
-      const gpu =
-        info?.description ||
-        [info?.vendor, info?.architecture].filter(Boolean).join(" ");
-      el.backendChip.textContent = gpu ? `WebGPU · ${gpu}` : "WebGPU";
-    } catch {
-      el.backendChip.textContent = "WebGPU";
-    }
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    // Await the detector's download + JIT warmup (no camera permission needed,
+    // safe to block on) so it's fully compiled by the time we're ready — the
+    // Eye then detects instantly instead of stalling seconds into the standby
+    // screen. Best-effort: a detector failure must not block the app.
+    setStatus("warming up the eye", "busy");
+    try {
+      detector = await detectorPromise;
+    } catch {
+      detectorPromise = null;
+    }
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
     el.eyeToggle.disabled = false;
@@ -373,9 +386,9 @@ async function handleLoad() {
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
-    // Eye ("webcam") is on by default — enable it after load. toggleVision
-    // fails gracefully (unchecks itself) if there's no camera or permission is
-    // denied, so this never blocks the rest of the app.
+    // Turn the Eye on now (not awaited): the detector is already warm, so once
+    // the camera stream starts it detects on the very first frame. Camera
+    // permission (first visit only) happens here without blocking "ready".
     el.eyeToggle.checked = true;
     void toggleVision(true);
   } catch (error) {
@@ -402,6 +415,14 @@ function stageActivity(stage: Stage, active: boolean) {
 function drawPreview() {
   visionRaf = requestAnimationFrame(drawPreview);
   if (!vision) return;
+  // Scene metrics first — they must not depend on the pip canvas being laid
+  // out (the early returns below skip frames whenever it isn't, which used to
+  // leave the person count frozen at "no people").
+  const people = vision.personCount;
+  el.metricEye.textContent =
+    people === 0 ? "no people" : `${people} ${people === 1 ? "person" : "people"}`;
+  el.dotEye.classList.toggle("is-on", vision.active);
+  el.stages.eye.classList.toggle("is-active", vision.active);
   const video = vision.video;
   const overlay = el.pipOverlay;
   const cssSize = overlay.clientWidth;
@@ -440,22 +461,29 @@ function drawPreview() {
     ctx.fillStyle = "oklch(20% 0.05 118)";
     ctx.fillText(label, x + 3, Math.max(10, y - 3));
   }
-  // Highlight the number of people (the meaningful signal), not raw object
-  // count — a room full of chairs shouldn't read as "6 obj".
-  const people = vision.personCount;
-  el.metricEye.textContent =
-    people === 0 ? "no people" : `${people} ${people === 1 ? "person" : "people"}`;
-  el.dotEye.classList.toggle("is-on", vision.active);
-  el.stages.eye.classList.toggle("is-active", vision.active);
 }
 
 async function enableVision(): Promise<void> {
   if (!pipeline) return;
   setStatus("loading D-FINE detector", "busy");
   if (!detector) {
-    detector = await ObjectDetector.load(onDownloadProgress);
-    setStatus("warming up D-FINE", "busy");
-    await detector.warmup();
+    // Usually already resolved: handleLoad preloads + warms it in parallel
+    // with the voice pipeline.
+    detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
+      async (d) => {
+        await d.warmup();
+        return d;
+      },
+    );
+    try {
+      detector = await detectorPromise;
+    } catch (error) {
+      // A rejected preload must NOT stay cached, or every later toggle awaits
+      // the same dead promise and the Eye can never recover. Clear it so a
+      // subsequent enable retries the load from scratch.
+      detectorPromise = null;
+      throw error;
+    }
     setTimeout(() => (el.downloads.hidden = true), 1500);
   }
   vision = new VisionSession(detector);
@@ -525,6 +553,10 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
       },
       onUserTurn(text) {
         el.captions.hidden = true;
+        // A tool card belongs to the exchange that produced it; once a new user
+        // turn starts, that answer is stale — clear it so it doesn't linger.
+        el.canvasPanel.hidden = true;
+        el.canvasPanel.replaceChildren();
         addBubble("user").textContent = text;
       },
       onAssistantStart() {

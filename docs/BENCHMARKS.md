@@ -288,6 +288,121 @@ than a partial state whose first reply may stall on a download.
 The quantized file is served from `public/weights/` (gitignored); fresh clones
 fall back to the fp16 HF file automatically.
 
+## Map-reduce campaign — cycle 5 (GPT-Live-inspired: patience + delegation)
+
+Source: OpenAI's GPT-Live launch (July 2026). Its two transferable ideas for a
+cascade: turn-taking *patience* ("waits while you think" — their stated fix for
+silence-based endpointing) and *delegation* (decouple the interaction model
+from intelligence; hand hard questions to a background brain).
+
+### Campaign 1 — patience endpointing (ALL CANDIDATES REJECTED, law recorded)
+
+Predicted: baseline false-cuts ~100% on mid-clause pauses ≥0.7 s; candidates
+→ ~0. Baseline confirmed exactly (3/3 plays truncated at the pause). But the
+candidates went 0-for-5:
+
+- P1(static)/P2(cue)/P3(nonterminal)/P4(tentative-activity): **inert.** The
+  diagnose showed every false-cut fires via the PUNCT path — at a mid-clause
+  pause, LocalAgreement's committed text ends at the last complete sentence
+  (terminal punct), so committed-text gating never engages.
+- P5(hypothesis — hold both windows while committed+tentative ends
+  non-terminal): **rejected, 3/3 false-cuts, identical to baseline.** The
+  mechanism is absent at decision time: streaming-ASR passes lag the audio by
+  more than the 380 ms punct window, so the tentative "unfinished" tail does
+  not exist yet when the endpoint decides.
+
+**Law: in a lagging cascade ASR there is NO reliable pre-fire continuation
+signal.** Patience cannot be bought before the endpoint fires without slowing
+every turn (the forbidden cycle-1/3 trade). The design that fits the physics is
+post-fire **continuation-merge**: fire the turn, and if speech resumes during
+the ~1.2 s before first reply audio, silently abort the response and re-open
+the utterance (append, don't restart). Specced for a future cycle; not built.
+
+Bench side-finds fixed on the way: the phantom-turn guard required ≥2 voiced
+ticks, but the level meter decays between words so real 2 s utterances measured
+1-2 ticks — a coin flip that silently discarded genuine turns (relaxed to ≥1
+tick + the peak test, which is the reliable half); the Eye must be disabled
+during benches (it spotted a phone mid-run and talked about it).
+
+### Campaign 2 — delegation deepening (SHIPPED: toolRouting "broad")
+
+Diagnose on a 12-question factual QA set + 6 small-talk controls: conservative
+routing fired on only 3/12; routing misses (5) and missing tools (4) dominated,
+as predicted. Gemma-270M alone is fine on encyclopedic one-liners but
+catastrophically wrong on numbers (17×23=411; 15% of 80=1200; 26 mi=26,000 ft;
+today="July 21 2024").
+
+Candidates shipped as "broad": D1 wh-question → Wikipedia lookup routing,
+D2 weather-query cleanup ("in Paris right now" → "Paris"), D3 instant offline
+tools (calculator, unit conversion, clock/date; no holding line — the result is
+immediate).
+
+| | conservative (shipped before) | broad |
+| --- | --- | --- |
+| MAP QA accuracy (12 q) | 5/12 (42 %) | **10/12 (83 %)** |
+| HOLDOUT (8 unseen q) | ~5-6/8 | **7/8 (88 %) — no reversal** |
+| small-talk false triggers | 0/6, 0/4 | **0/6, 0/4** |
+
+Residuals (recorded, not shipped): phrase queries that aren't Wikipedia titles
+("tallest mountain in the world") miss honestly; a title-search fallback was
+tried and REJECTED — it converted honest misses into confidently irrelevant
+answers ("how far is the moon" → a 2007 film). Summary-lacks-the-number
+(population questions) needs snippet retrieval, not title summaries.
+
+Prediction audit: C1 predicted a win and delivered a rejection (the pre-fire
+signal doesn't exist — worth knowing); C2 predicted 55-75% and delivered 83/88%
+with the 0-false-trigger guard intact.
+
+## Audit cycle (post-cycle-5): bug audit + topK-in-jit
+
+Opus audit over the recent-change surface, Fable-validated line-by-line, all
+claims re-benched in-browser.
+
+**Bugs fixed:** detector-preload rejection stayed cached (Eye could never
+recover from one failed load — cleared on rejection now); TURN_LOG grew without
+bound (ring-capped at 500); calc/convert/clock chips mislabeled "web_search";
+[validator] the convert regex table's ungrouped alternations (`/\bmeters?|m\b/`
+matches "war**m**") — replaced wholesale, see below.
+
+**Design ruling (owner call): the unit-conversion tool is DELETED.** It went
+pairwise-regex-table → generic lexicon in one day, but the owner's challenge
+held up: conversion factors are stored knowledge — a hand-maintained
+mini-almanac with no principled stopping point (currencies? time zones?), and
+the query class was on the QA set because the eval author put it there
+(eval-driven feature invention — a campaign-2 methodology flaw, recorded).
+The line now drawn: instant tools must be CAPABILITIES (calculator = pure
+arithmetic, clock = device state), never knowledge. Conversion queries fall
+through to Gemma, which will sometimes be wrong — an honest demo of why
+delegation matters rather than a curated illusion. QA scores restated:
+MAP 9/12, holdout 6/8 (conversion items ceded).
+
+**Perf:** the brief's Whisper-fusion premise was STALE — the decoder step is
+already a single fused jit (measured 9.7 ms/token; ASR pass cost is encoder +
+overhead, not decode). The real win: `lax.topK` folded INTO the fused Gemma
+jit, emitting a packed [values..64, indices..64] fp32 array — one dispatch and
+ONE readback per token instead of step+topK dispatches and two `.data()`
+round-trips (indices < 2^24 are exact in fp32). **Greedy-equivalence passed
+across all five sampler/fusion configs**; paired speed runs 42.7→38.0 and
+45.1→44.0 ms/token (small, direction-consistent, zero-risk). Shipped on
+(`llmTopkInFused`).
+
+**Reported, not fixed (recorded):** calc handles one binary op per utterance;
+CLOCK_RE misses some phrasings (expanding risks small-talk false positives);
+KV-reuse mid-loop-throw leaves inconsistent cache state (feature is off by
+default — must be fixed before ever enabling it).
+
+## TTS decode fusion (shipped)
+
+Pocket TTS generation was the pipeline bottleneck (~1.1x realtime under GPU
+contention -> longer replies stuttered). Same lever as the Gemma fusion: the
+per-frame decode dispatched ~11 separate jits (+ ~25 eager ops); an Opus pass
+fused it to 2 (flow-LM step -> 1, Mimi decode -> 1) via verbatim inline copies
+(no nested-jit boundaries), per-frame dynamics as np.Array trace inputs. Bench
+(fixed seed): gen 1291->1010 ms (~22%), realtime factor 0.40->0.31, IDENTICAL
+frame count both paths (same EOS decision, same 3200 ms audio) = equivalent
+output. E2E verified (62 audio chunks, coherent reply). Shipped on
+(ttsFusedStep). Prefill step 0 stays unfused (fuse-decode-only, like Gemma).
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

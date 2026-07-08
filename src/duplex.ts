@@ -26,22 +26,95 @@ import type { VisionSession } from "./vision/vision";
 // TUNABLES so the optimization bench can vary them at runtime.
 const START_LEVEL = 0.05; // speech onset / barge-in threshold
 // Phantom-turn guard: Whisper hallucinates text on near-silence ("Thank you."
-// is its most famous), and a single noisy tick above START_LEVEL is enough to
-// latch an "utterance" that then endpoints into a fake turn. Require real
-// voiced evidence — a couple of ticks above the gate and a peak comfortably
-// over it — before a turn is transcribed at all. Signal-based on purpose: no
-// phrase blocklists, so a genuine quiet "thank you" still gets through.
-const MIN_VOICED_TICKS = 2; // ≥ ~300 ms of voiced audio across the utterance
-const MIN_PEAK_LEVEL = 0.07; // must rise clearly above the 0.05 onset gate
+// is its most famous), and a brief blip above START_LEVEL is enough to latch
+// an "utterance" that then endpoints into a fake turn. Signal-based on purpose
+// — no phrase blocklists, so a genuine quiet "thank you" passes.
+// Evidence design (three attempts taught this): anything derived from the
+// tick-sampled level meter is a coin flip — the meter decays between words
+// and GPU work janks the tick cadence, so real 2 s speech and an ambient blip
+// measure alike. Instead the guard reads the CAPTURED PCM at endpoint time and
+// measures actual voiced duration (30 ms windows above an RMS floor) + peak
+// amplitude. Deterministic, no sampling artifacts. Sub-threshold "utterances"
+// are discarded before Whisper ever sees them; anything loud-but-short that
+// slips through still hits the empty-transcript discard after transcription.
+const GUARD_WINDOW = 480; // 30 ms at 16 kHz
+const GUARD_RMS_FLOOR = 0.02; // absolute floor for a voiced window
+const GUARD_RMS_CEIL = 0.055; // never demand more than soft speech delivers
+// 150 ms, not 250: a one-syllable word ("what?") clears ~150 ms of voiced
+// audio, and the peak floor + adaptive noise floor are what actually reject
+// ambient (a swell fails the peak test regardless of length), so the duration
+// bar can be short enough to admit snappy replies.
+const MIN_VOICED_MS = 150;
+// Peak amplitude a turn must reach to be real. Raised from 0.04 after idle
+// hallucinations on long sessions: HVAC/fan swells peak ~0.03-0.06 and were
+// clearing the old bar, while real speech peaks 0.2-0.7, so 0.09 rejects
+// ambient with enormous margin on genuine speech.
+const MIN_PEAK_ABS = 0.09;
+// A peak this high is unambiguously speech (ambient/HVAC swells top out ~0.06),
+// so an utterance reaching it is real even if it's too short to clear the
+// voiced-duration bar — this is what lets one-word replies ("what?", "no")
+// through the phantom guard.
+const STRONG_PEAK_ABS = 0.2;
+
+/**
+ * Voiced duration + peak of a PCM buffer (see phantom-turn guard). The voiced
+ * threshold is ADAPTIVE: real mics with auto-gain boost quiet rooms until the
+ * ambient tone itself sits near/above any fixed floor, so a fixed threshold
+ * counts room tone as speech and the phantom turns come back. Speech clears
+ * the room tone by a large ratio regardless of gain, so the threshold is ~3×
+ * the buffer's 20th-percentile window RMS (an ambient estimate — the buffer
+ * starts at listening-start, so it holds pre-speech ambient), clamped between
+ * the absolute floor and a soft-speech ceiling. The 2× ratio is measured, not
+ * guessed: through the real capture path, room tone reads ~0.014 RMS while
+ * soft speech windows read 0.02-0.077 — 3× starved soft speech (~300 ms
+ * qualifying), 2× passes ~900 ms of it while tone and blips still fail.
+ */
+function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } {
+  const windowRms: number[] = [];
+  let peak = 0;
+  for (let start = 0; start + GUARD_WINDOW <= samples.length; start += GUARD_WINDOW) {
+    let energy = 0;
+    for (let i = start; i < start + GUARD_WINDOW; i++) {
+      const s = samples[i];
+      energy += s * s;
+      const a = Math.abs(s);
+      if (a > peak) peak = a;
+    }
+    windowRms.push(Math.sqrt(energy / GUARD_WINDOW));
+  }
+  const sorted = [...windowRms].sort((a, b) => a - b);
+  const ambient = sorted.length ? sorted[Math.floor(sorted.length * 0.2)] : 0;
+  const threshold = Math.min(
+    GUARD_RMS_CEIL,
+    Math.max(GUARD_RMS_FLOOR, ambient * 2),
+  );
+  const voiced = windowRms.filter((r) => r > threshold).length;
+  return { voicedMs: voiced * 30, peak };
+}
 const MAX_UTTERANCE_MS = 28_000;
+// Hard cap on how long the engine may stay in "responding". A real reply
+// (generate + speak, even a long one with a background tool) finishes well
+// inside this; exceeding it means the response path wedged, and the watchdog
+// force-recovers to listening so the session can't die silently.
+const RESPONDING_MAX_MS = 30_000;
+// Cap on the rolling per-turn bench log so a long live session can't grow it
+// (and its retained strings) without bound.
+const TURN_LOG_MAX = 500;
 const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
 const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
 // Energy barge-in: with echoCancellation on, sustained loud mic input during
 // the assistant's reply is the user talking over it (not our own playback), so
 // interrupt on energy alone — the ASR path often misses it because the mic
 // picks up a mix of user + assistant and the self-echo filter drops it.
-const BARGE_ENERGY_LEVEL = 0.08;
-const BARGE_ENERGY_TICKS = 3; // ~450 ms sustained → interrupt
+// Adaptive energy barge-in. The threshold is the per-reply echo floor (the
+// loudest the mic hears during the calibration window, when only our own
+// playback is audible) times a ratio, with an absolute minimum so a silent
+// echo floor doesn't make a whisper trigger. Fewer sustained ticks than before
+// so short interjections ("wait", "stop") interrupt.
+const BARGE_FLOOR_CALIB_TICKS = 3; // ~450 ms to estimate the echo floor
+const BARGE_ENERGY_RATIO = 1.8; // user must clear the echo floor by this much
+const BARGE_ENERGY_MIN = 0.05; // absolute floor (level units, min·4 RMS)
+const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
 const BACKCHANNEL_PAUSE_MIN = 450;
 const BACKCHANNEL_PAUSE_MAX = 800;
@@ -136,6 +209,7 @@ export class DuplexSession {
   readonly history: ChatMessage[] = [];
 
   private phase: Phase = "listening";
+  private respondingSince = 0; // perf.now() when the current reply began (watchdog)
   private sessionStart = 0;
 
   // User-speech tracking (listening phase).
@@ -143,10 +217,13 @@ export class DuplexSession {
   private silenceStart = 0;
   private aboveTicks = 0;
   private aboveBargeTicks = 0; // consecutive ticks above the energy-barge level
+  // Adaptive barge-in echo-floor calibration (reset each reply).
+  private bargeFloor = 0;
+  private bargeFloorTicks = 0;
   private backchannelUsed = false;
-  // Voiced-evidence accumulators for the phantom-turn guard (see constants).
-  private voicedTicks = 0;
-  private peakLevel = 0;
+  // A barge-in continuation skips the phantom-turn guard (its sustained energy
+  // already proved itself to the barge detector).
+  private bargeContinuation = false;
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -162,6 +239,7 @@ export class DuplexSession {
   // Bench instrumentation: stage marks for the turn currently being answered;
   // pushed to TURN_LOG when the response ends.
   private turnMarks: Partial<TurnRecord> = {};
+  private lastEndCause: "punct" | "silence" | "max" = "punct";
 
   private timers: PendingTimer[] = [];
 
@@ -177,6 +255,7 @@ export class DuplexSession {
   private personAbsentSince = 0;
   private stepAwayAnnounced = false;
   private phonePresentSince = 0;
+  private phoneGoneSince = 0;
   private phoneAnnounced = false;
   private slouchSince = 0;
   private slouchAnnounced = false;
@@ -292,25 +371,49 @@ export class DuplexSession {
 
     if (level > START_LEVEL) this.aboveTicks++;
     else this.aboveTicks = 0;
-    if (level > BARGE_ENERGY_LEVEL) this.aboveBargeTicks++;
-    else this.aboveBargeTicks = 0;
 
-    // 1. Barge-in: stop the assistant the moment the user talks over it. Two
-    //    independent triggers — sustained mic energy (robust: the ASR path
-    //    frequently misses talk-over because the self-echo filter discards the
-    //    user's words mixed with our playback), or a freshly-committed word.
+    // 1. Barge-in: stop the assistant the moment the user talks over it.
+    //    Energy-based, and ADAPTIVE — a fixed threshold failed in the wild: on
+    //    real hardware the assistant's own playback leaks into the mic (echo
+    //    cancellation is imperfect) and, worse, the mic's AGC ducks the user
+    //    during double-talk, so the absolute level of a genuine interruption
+    //    varies wildly by device. Instead we calibrate the echo/ambient floor
+    //    over the reply's first few ticks (before the user could react) and
+    //    fire when the level clears that floor by a ratio. The ASR path can't
+    //    help here — it's paused during assistant speech to free the GPU.
     if (this.phase === "responding" && this.assistant) {
-      const energyBarge = this.aboveBargeTicks >= BARGE_ENERGY_TICKS;
-      const asrBarge =
-        this.aboveTicks >= BARGE_TICKS &&
-        this.transcriber.committedWordCount >= BARGE_MIN_WORDS;
-      if (energyBarge || asrBarge) {
-        this.handleBargeIn(now);
-        return;
+      if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
+        // Calibration window: the loudest thing the mic hears now is our own
+        // echo, so take the max as the floor to beat.
+        this.bargeFloor = Math.max(this.bargeFloor, level);
+        this.bargeFloorTicks++;
+      } else {
+        const threshold = Math.max(
+          BARGE_ENERGY_MIN,
+          this.bargeFloor * BARGE_ENERGY_RATIO,
+        );
+        if (level > threshold) this.aboveBargeTicks++;
+        else this.aboveBargeTicks = 0;
+        if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
+          this.handleBargeIn(now);
+          return;
+        }
       }
     }
 
     if (this.phase === "responding") {
+      // Watchdog: a reply should never take this long. If we're still
+      // "responding" past the cap, something wedged (an unhandled error in the
+      // response path, a stalled generation) and the session would otherwise be
+      // dead forever — every tick early-returns here. Force-recover to
+      // listening so the user isn't stuck talking to a frozen assistant.
+      if (this.respondingSince && now - this.respondingSince > RESPONDING_MAX_MS) {
+        this.cb.onEvent("recovered · response stalled");
+        this.assistant?.controller.abort();
+        this.assistant = null;
+        this.proactiveSpeaking = false;
+        this.startFreshListening();
+      }
       // Nothing else to do while responding (barge-in handled above).
       return;
     }
@@ -327,8 +430,6 @@ export class DuplexSession {
     if (level > START_LEVEL) {
       if (!this.speechStartAt) this.speechStartAt = now;
       this.silenceStart = 0;
-      this.voicedTicks++;
-      if (level > this.peakLevel) this.peakLevel = level;
     } else if (this.speechStartAt && !this.silenceStart) {
       this.silenceStart = now;
     }
@@ -358,12 +459,23 @@ export class DuplexSession {
     const committed = this.transcriber.committed;
     const endsTerminal = TERMINAL_PUNCT.test(committed);
 
-    // 2. User turn end (adaptive endpointing).
+    // 2. User turn end (adaptive endpointing). Patience modes widen the
+    //    SILENCE window when the utterance doesn't look finished, so a
+    //    mid-thought pause isn't mistaken for the end of the turn; the punct
+    //    fast-path is never affected.
+    // NOTE (cycle-5 campaign, all candidates rejected): "patience" endpointing
+    // — extending these windows when the utterance looks unfinished — cannot
+    // work pre-fire in this cascade. At a mid-clause pause the committed text
+    // ends at the last complete sentence (terminal punct = false end-of-turn
+    // signal), and the tentative tail that knows better lags the audio by more
+    // than the punct window. The viable design is post-fire continuation-merge
+    // (abort the reply if speech resumes before first audio); see BENCHMARKS.
     const endByPunct =
       endsTerminal && trailingSilence >= TUNABLES.endpointPunctMs;
     const endBySilence = trailingSilence >= TUNABLES.endpointSilenceMs;
     const endByMax = speechMs >= MAX_UTTERANCE_MS;
     if (speechMs >= TUNABLES.minSpeechMs && (endByPunct || endBySilence || endByMax)) {
+      this.lastEndCause = endByPunct ? "punct" : endBySilence ? "silence" : "max";
       void this.endUserTurn(this.silenceStart || now);
       return;
     }
@@ -388,26 +500,39 @@ export class DuplexSession {
     const transcriber = this.transcriber;
     if (!transcriber) return;
 
-    // Phantom-turn guard: without enough voiced evidence this "utterance" was
-    // ambient noise, and transcribing near-silence makes Whisper hallucinate
-    // ("Thank you." etc.). Discard before transcription.
-    if (
-      this.voicedTicks < MIN_VOICED_TICKS ||
-      this.peakLevel < MIN_PEAK_LEVEL
-    ) {
-      this.cb.onEvent("noise · discarded");
-      this.startFreshListening();
-      return;
+    // Phantom-turn guard: without enough voiced evidence in the captured PCM
+    // this "utterance" was ambient noise, and transcribing near-silence makes
+    // Whisper hallucinate ("Thank you." etc.). Discard before transcription.
+    // Barge-in continuations skip the check — their sustained energy already
+    // proved itself to the barge detector.
+    if (!this.bargeContinuation) {
+      const stats = voicedStats(this.capture.samples());
+      // Reject only genuine noise. A too-quiet peak is always ambient. A short
+      // utterance is normally suspect (a blip), BUT a short-and-LOUD one is a
+      // real snappy word — "what?", "no", "stop", "yes" — and must get through,
+      // or the assistant ignores one-word replies. So the duration bar is
+      // waived when the peak is unambiguously speech-level.
+      const clearlyVoiced = stats.peak >= STRONG_PEAK_ABS;
+      const tooQuiet = stats.peak < MIN_PEAK_ABS;
+      const tooShort = stats.voicedMs < MIN_VOICED_MS && !clearlyVoiced;
+      if (tooQuiet || tooShort) {
+        this.cb.onEvent("noise · discarded");
+        this.startFreshListening();
+        return;
+      }
     }
+    this.bargeContinuation = false;
 
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
+    this.respondingSince = performance.now(); // watchdog clock
 
     // Bench instrumentation: per-turn stage marks (see tunables.ts).
     this.turnMarks = {
       endOfSpeech: endOfSpeechAt,
       fired: performance.now(),
       usedBestText: true,
+      endCause: this.lastEndCause,
     };
 
     // Latency hillclimb: the streaming loop has already transcribed this
@@ -434,6 +559,13 @@ export class DuplexSession {
 
     if (!text.trim()) {
       // Empty/noise turn: discard and go back to listening.
+      this.startFreshListening();
+      return;
+    }
+    if (isDegenerateTranscript(text)) {
+      // Whisper repetition loop ("All in all. All in all. …") — a decoder
+      // artifact, not something the user said. Never answer it.
+      this.cb.onEvent("asr · garbled, discarded");
       this.startFreshListening();
       return;
     }
@@ -497,7 +629,9 @@ export class DuplexSession {
     // "responding" phase), then speak the holding line while the fetch runs —
     // the user can keep talking / interrupt / be backchanneled meanwhile.
     this.startFreshListening();
-    void this.speakProactive(tool.holding);
+    // Instant tools (calc/convert/clock) have no holding line — their result
+    // arrives immediately and is spoken from the pending queue instead.
+    if (tool.holding) void this.speakProactive(tool.holding);
     this.backgroundTask = tool
       .run()
       .then((result) => {
@@ -525,6 +659,10 @@ export class DuplexSession {
     };
     this.assistant = state;
     this.currentTtsText = "";
+    // Recalibrate the adaptive barge-in echo floor for this reply.
+    this.bargeFloor = 0;
+    this.bargeFloorTicks = 0;
+    this.aboveBargeTicks = 0;
     this.cb.onAssistantStart();
     this.cb.onStageActivity("llm", true);
 
@@ -581,10 +719,15 @@ export class DuplexSession {
         firstDelta: this.turnMarks.firstDelta ?? 0,
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
+        endCause: this.turnMarks.endCause,
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
         interrupted,
       });
+      // Bounded ring: the bench only ever inspects recent turns, and a long
+      // live session would otherwise grow this array (and its retained
+      // transcript/reply strings) without limit.
+      if (TURN_LOG.length > TURN_LOG_MAX) TURN_LOG.shift();
       this.turnMarks = {};
     }
 
@@ -632,8 +775,16 @@ export class DuplexSession {
       // Fastest first audio: flush the first clause as soon as a comma/colon/
       // semicolon appears (once there's enough to sound natural), so speech
       // starts after "The weather in Tokyo," instead of the whole sentence.
+      // If no punctuation shows up, flush at a WORD BOUNDARY once ~2× the
+      // clause minimum has accumulated — otherwise the reply text is fully
+      // written on screen while the voice still waits for the first sentence
+      // to complete before it can even start synthesizing.
       if (!firstEmitted) {
-        const clauseIdx = findClauseEnd(buffer);
+        let clauseIdx = findClauseEnd(buffer);
+        if (clauseIdx === -1 && buffer.length >= TUNABLES.firstClauseMinChars * 2) {
+          const lastSpace = buffer.lastIndexOf(" ");
+          if (lastSpace >= TUNABLES.firstClauseMinChars) clauseIdx = lastSpace + 1;
+        }
         if (clauseIdx !== -1) {
           const clause = buffer.slice(0, clauseIdx).trim();
           buffer = buffer.slice(clauseIdx);
@@ -693,10 +844,9 @@ export class DuplexSession {
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     // The interrupting speech already proved itself (sustained energy above the
-    // barge threshold) — seed the voiced-evidence counters so the phantom-turn
-    // guard can't discard a genuine barge-in utterance.
-    this.voicedTicks = BARGE_ENERGY_TICKS;
-    this.peakLevel = Math.max(this.peakLevel, BARGE_ENERGY_LEVEL);
+    // barge threshold) — mark it so the phantom-turn guard doesn't second-guess
+    // a genuine barge-in utterance.
+    this.bargeContinuation = true;
   }
 
   // --- Time awareness ----------------------------------------------------
@@ -756,12 +906,18 @@ export class DuplexSession {
       this.personPresentSince = 0;
     }
 
-    // Track phone streak.
+    // Track phone streak. Re-arm the announcement only after the phone has
+    // been genuinely gone for a while — detection-score jitter around the
+    // threshold must not make the line repeat while the phone sits in frame.
     if (phonePresent) {
       if (!this.phonePresentSince) this.phonePresentSince = now;
+      this.phoneGoneSince = 0;
     } else {
       this.phonePresentSince = 0;
-      this.phoneAnnounced = false;
+      if (!this.phoneGoneSince) this.phoneGoneSince = now;
+      if (this.phoneAnnounced && now - this.phoneGoneSince > 60_000) {
+        this.phoneAnnounced = false;
+      }
     }
 
     // Track slouch streak.
@@ -870,13 +1026,13 @@ export class DuplexSession {
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     this.backchannelUsed = false;
-    this.voicedTicks = 0;
-    this.peakLevel = 0;
+    this.bargeContinuation = false;
   }
 
   /** Fresh listening window: drop buffered audio and reset ASR commit state. */
   private startFreshListening(): void {
     this.phase = "listening";
+    this.respondingSince = 0;
     this.capture.clear();
     this.transcriber?.reset();
     this.resetUtterance();
@@ -893,6 +1049,23 @@ export class DuplexSession {
 function displayWordCount(text: string): number {
   const trimmed = text.trim();
   return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
+/**
+ * Whisper's repetition-loop failure mode: on ambiguous audio the decoder can
+ * emit one phrase over and over ("All in all. All in all. All in all…"). That
+ * is a decode artifact, not speech — a real utterance of ≥6 words has far more
+ * lexical variety. Signal-based (a repetition statistic), no phrase lists.
+ */
+function isDegenerateTranscript(text: string): boolean {
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens.length < 6) return false;
+  const unique = new Set(tokens).size;
+  return unique / tokens.length < 0.4;
 }
 
 function findSentenceEnd(buffer: string): number {

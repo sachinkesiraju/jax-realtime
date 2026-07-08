@@ -138,6 +138,17 @@ body {
   color: oklch(60% 0.03 105);
 }
 
+.stage-model a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.stage-model a:hover {
+  color: var(--signal-deep);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .stage-model {
   font-weight: 600;
   font-size: 0.95rem;
@@ -681,12 +692,13 @@ summary:focus-visible {
 .colophon {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   gap: 1rem;
   flex-wrap: wrap;
   color: var(--ink-soft);
   font-size: 0.82rem;
 }
+
 
 .colophon a {
   color: inherit;
@@ -698,12 +710,28 @@ summary:focus-visible {
 }
 
 .backend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
   font-family: var(--mono);
   font-size: 0.72rem;
-  border: 1px solid oklch(85% 0.02 105);
+  letter-spacing: 0.01em;
+  border: 1px solid oklch(38% 0.04 118);
   border-radius: 999px;
-  padding: 0.15rem 0.6rem;
-  background: oklch(99% 0.005 105);
+  padding: 0.28rem 0.75rem;
+  background: oklch(24% 0.02 118);
+  color: oklch(84% 0.05 118);
+  white-space: nowrap;
+}
+
+/* Live dot: the GPU this whole thing runs on. */
+.backend-chip::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 999px;
+  background: var(--signal-deep);
+  box-shadow: 0 0 6px oklch(88% 0.19 118 / 0.8);
 }
 
 @media (max-width: 640px) {

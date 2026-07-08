@@ -945,6 +945,512 @@ export type StreamingConvTranspose1d = {
   convtr: ConvTranspose1d;
 };
 
+// ---------------------------------------------------------------------------
+// Fused per-frame decode (TUNABLES.ttsFusedStep).
+//
+// The shipped per-frame TTS decode issues ~35 command-buffer submits: the
+// flow-LM step makes ~8 jit dispatches (6 streaming-transformer layers + the
+// out-norm layernorm + the LSD flow net) plus ~10 eager ops (input/out-eos
+// linears, slice, greater, noise); the Mimi decode makes ~3 jit dispatches
+// (2 decoder-transformer layers + SEANet decoder) plus ~12 eager ops (quantizer
+// conv, upsample convtranspose, transposes, slices). Just like the Gemma decode
+// step, that per-dispatch submit overhead — not GPU compute — dominates the
+// ~1.1x realtime factor. The functions below inline the *identical* math into
+// ONE jitted function per stage so each stage traces to a single dispatch.
+//
+// Why these are separate, non-jitted copies of runLayerNorm / runResBlock /
+// runSimpleMLPAdaLN / runStreamingTransformerLayer / runSEANetDecoder: those
+// originals are `jit(...)`, and calling a jitted function inside another trace
+// emits a nested-jit boundary. Inlining plain-tracer ops instead keeps
+// everything in one flat jaxpr — the whole point of the fusion. The remaining
+// helpers reused here (runLinear, runRope, runMimiStreamingMultiheadAttention,
+// runTimestepEmbedder, runRMSNorm, runConv1d, runConvTranspose1d,
+// runSEANetResnetBlock, modulate, lsdDecode) are already plain functions, so
+// they inline into the enclosing trace with no boundary.
+//
+// Trace-cache note: jit keys its cache on arg avals (shape+dtype), not values,
+// so passing the per-frame position/offset/kv-length as np.Array scalars and
+// the noise as an np.Array reuses the same trace across frames. The KV-cache
+// capacity only grows stepwise (padded to the next multiple of 64 / to 272),
+// which legitimately re-traces per shape — exactly as the unfused path does.
+
+// Verbatim copy of runLayerNorm's body without the jit wrapper.
+function layerNormInline(
+  { weight, bias }: Partial<LayerNorm> = {},
+  x: np.Array,
+  eps: number = 1e-5,
+) {
+  const dtype = x.dtype;
+  x = x.astype(np.float32);
+  const mean = x.ref.mean(-1, { keepdims: true });
+  const var_ = np.var_(x.ref, -1, {
+    mean: mean.ref,
+    correction: 0,
+    keepdims: true,
+  });
+  x = x.sub(mean).div(np.sqrt(var_.add(eps)));
+  if (weight) {
+    x = x.mul(weight).add(bias!);
+  }
+  return x.astype(dtype);
+}
+
+// Verbatim copy of runResBlock with the inner runLayerNorm inlined.
+function resBlockInline(
+  { inLN, mlp, adaLNModulation }: ResBlock,
+  x: np.Array,
+  y: np.Array,
+): np.Array {
+  const [, adaLNLinear] = adaLNModulation;
+  const modulation = runLinear(adaLNLinear, nn.silu(y));
+  const [shiftMlp, scaleMlp, gateMlp] = np.split(modulation, 3, -1);
+
+  let h = layerNormInline(inLN, x.ref, 1e-6);
+  h = modulate(h, shiftMlp, scaleMlp);
+
+  const [mlpLinear1, , mlpLinear2] = mlp;
+  h = runLinear(mlpLinear1, h);
+  h = nn.silu(h);
+  h = runLinear(mlpLinear2, h);
+
+  return x.add(gateMlp.mul(h));
+}
+
+// Verbatim copy of runSimpleMLPAdaLN's body with the inner runResBlock /
+// runLayerNorm inlined.
+function simpleMLPAdaLNInline(
+  { timeEmbed, condEmbed, inputProj, resBlocks, finalLayer }: SimpleMLPAdaLN,
+  c: np.Array,
+  s: np.Array,
+  t: np.Array,
+  x: np.Array,
+): np.Array {
+  x = runLinear(inputProj, x);
+
+  const sEmb = runTimestepEmbedder(timeEmbed[0], s);
+  const tEmb = runTimestepEmbedder(timeEmbed[1], t);
+  const tCombined = sEmb.add(tEmb).div(2);
+
+  const cEmb = runLinear(condEmbed, c);
+  const y = tCombined.add(cEmb);
+
+  for (const block of resBlocks) {
+    x = resBlockInline(block, x, y.ref);
+  }
+
+  const [, finalAdaLNLinear] = finalLayer.adaLNModulation;
+  const finalMod = runLinear(finalAdaLNLinear, nn.silu(y));
+  const [shift, scale] = np.split(finalMod, 2, -1);
+
+  x = layerNormInline({}, x, 1e-6);
+  x = modulate(x, shift, scale);
+  x = runLinear(finalLayer.linear, x);
+
+  return x;
+}
+
+// Verbatim copy of runStreamingTransformerLayer's body with the inner
+// runLayerNorm inlined (runMimiStreamingMultiheadAttention is already plain).
+function streamingTransformerLayerInline(
+  {
+    selfAttn,
+    norm1,
+    norm2,
+    linear1,
+    linear2,
+    layerScale1,
+    layerScale2,
+  }: StreamingTransformerLayer,
+  kvCache: KVCache,
+  x: np.Array,
+  offset: np.Array,
+  kvCacheLen: np.Array,
+  {
+    context = 0,
+    numHeads,
+    maxPeriod = 10000,
+  }: { context?: number; numHeads: number; maxPeriod?: number },
+): [np.Array, KVCache] {
+  const xOrig = x.ref;
+  x = layerNormInline(norm1, x);
+  let update: np.Array;
+  [update, kvCache] = runMimiStreamingMultiheadAttention(
+    selfAttn,
+    kvCache,
+    x,
+    offset,
+    kvCacheLen,
+    context,
+    numHeads,
+    maxPeriod,
+  );
+  if (layerScale1) {
+    update = update.mul(layerScale1);
+  }
+  x = xOrig.add(update);
+
+  const xOrig2 = x.ref;
+  x = layerNormInline(norm2, x);
+  let ffnOut = runLinear(linear1, x);
+  ffnOut = nn.gelu(ffnOut, { approximate: false });
+  ffnOut = runLinear(linear2, ffnOut);
+  if (layerScale2) {
+    ffnOut = ffnOut.mul(layerScale2);
+  }
+  x = xOrig2.add(ffnOut);
+
+  return [x, kvCache];
+}
+
+// Verbatim copy of runSEANetDecoder's body without the jit wrapper (every
+// helper it calls is already plain).
+function seanetDecoderInline(
+  { model }: SEANetDecoder,
+  state: SEANetDecoderState,
+  x: np.Array,
+): [np.Array, SEANetDecoderState] {
+  const ratios = [6, 5, 4];
+
+  x = np.expandDims(x, 0);
+  [x, state.conv1] = runConv1d(model[0].conv, state.conv1, x);
+
+  let idx = 1;
+  for (let i = 0; i < 3; i++) {
+    const blockState = state.blocks[i];
+    x = nn.elu(x);
+    idx++;
+    const stride = ratios[i];
+    [x, blockState.convtr] = runConvTranspose1d(
+      (model[idx] as StreamingConvTranspose1d).convtr,
+      blockState.convtr,
+      x,
+      stride,
+    );
+    idx++;
+    [x, blockState.res] = runSEANetResnetBlock(
+      model[idx] as SEANetResnetBlock,
+      blockState.res,
+      x,
+    );
+    idx++;
+  }
+
+  x = nn.elu(x);
+  [x, state.conv2] = runConv1d(model[11].conv, state.conv2, x);
+
+  return [x.slice(0), state];
+}
+
+/** Fields of the flow-LM the fused decode step actually consumes. */
+type FlowLMDecodeModel = Pick<
+  FlowLMModel,
+  "inputLinear" | "transformer" | "outNorm" | "outEos" | "flowNet"
+>;
+
+// The fused flow-LM decode step as plain tracer ops (no jit boundary), shared
+// by the jit wrapper below. Mirrors runFlowLMStep exactly for the decode case
+// (T=1, no conditioning embeds): input projection → transformer stack (KV
+// scatter in-trace) → out-norm → EOS logit → LSD flow decode. `offset` and
+// `kvCacheLen` are np.Array scalars (reused per layer → `.ref` per use, dispose
+// after the loop); `noise` is precomputed by the caller so the RNG draw is
+// byte-identical to the unfused path.
+function flowLMDecodeStepBody(
+  { inputLinear, transformer, outNorm, outEos, flowNet }: FlowLMDecodeModel,
+  kvCaches: KVCache[],
+  sequence: np.Array,
+  offset: np.Array,
+  kvCacheLen: np.Array,
+  noise: np.Array,
+  eosThreshold: number,
+  lsdDecodeSteps: number,
+): [np.Array, np.Array, KVCache[]] {
+  let input = runLinear(inputLinear, sequence);
+
+  for (let i = 0; i < transformer.length; i++) {
+    [input, kvCaches[i]] = streamingTransformerLayerInline(
+      transformer[i],
+      kvCaches[i],
+      input,
+      offset.ref,
+      kvCacheLen.ref,
+      { numHeads: 16 },
+    );
+  }
+  offset.dispose();
+  kvCacheLen.dispose();
+
+  let transformerOut = layerNormInline(outNorm, input);
+  transformerOut = transformerOut.slice([-1]); // [1, dim]
+
+  const eosLogit = runLinear(outEos, transformerOut.ref);
+  const isEos = np.greater(eosLogit, eosThreshold);
+
+  const conditionedFlow = (s: np.Array, t: np.Array, x: np.Array) =>
+    simpleMLPAdaLNInline(tree.ref(flowNet), transformerOut.ref, s, t, x);
+  const latent = lsdDecode(conditionedFlow, noise, lsdDecodeSteps);
+  tree.dispose([flowNet, transformerOut]);
+
+  return [latent, isEos, kvCaches];
+}
+
+const runFlowLMDecodeFused = jit(
+  function runFlowLMDecodeFused(
+    model: FlowLMDecodeModel,
+    kvCaches: KVCache[],
+    sequence: np.Array,
+    offset: np.Array,
+    kvCacheLen: np.Array,
+    noise: np.Array,
+    eosThreshold: number,
+    lsdDecodeSteps: number,
+  ): [np.Array, np.Array, KVCache[]] {
+    return flowLMDecodeStepBody(
+      model,
+      kvCaches,
+      sequence,
+      offset,
+      kvCacheLen,
+      noise,
+      eosThreshold,
+      lsdDecodeSteps,
+    );
+  },
+  { staticArgnums: [6, 7] },
+);
+
+/**
+ * Fused-dispatch counterpart to `runFlowLMStep` for the steady-state decode
+ * frame (T=1, no conditioning embeds — the flow-LM prefill on step 0 keeps the
+ * unfused path, mirroring Gemma's fuse-decode-only split). Same signature minus
+ * `embeds` and identical side effects (advances the KV caches / kvCacheLen,
+ * returns `{ latent, isEos, state }`), so playTTS swaps it in behind
+ * TUNABLES.ttsFusedStep. Noise is drawn here exactly as runFlowLMStep does, so
+ * for a fixed seed the draw is byte-identical.
+ */
+export function runFlowLMStepFused(
+  {
+    bosEmb,
+    conditionerEmbed,
+    embMean,
+    embStd,
+    flowNet,
+    inputLinear,
+    outNorm,
+    outEos,
+    speakerProjWeight,
+    transformer,
+  }: FlowLMModel,
+  { kvCaches, kvCacheLen }: FlowLMState,
+  key: np.Array,
+  sequence: np.Array,
+  offset: number,
+  lsdDecodeSteps: number = 1,
+  temperature: number = 0.7,
+  noiseClamp: number | null = null,
+  eosThreshold: number = -4.0,
+): { latent: np.Array; isEos: np.Array; state: FlowLMState } {
+  // Unused fields (match runFlowLMStep). ldim comes off bosEmb before dispose.
+  conditionerEmbed.dispose();
+  embMean.dispose();
+  embStd.dispose();
+  speakerProjWeight.dispose();
+  const ldim = bosEmb.shape[0];
+  bosEmb.dispose();
+
+  // KV-cache capacity growth (shape op, kept in JS) — identical to the loop in
+  // runFlowLMStep. All layers grow together.
+  for (let i = 0; i < transformer.length; i++) {
+    if (kvCacheLen > 0 && kvCaches[i].key.shape[0] === kvCacheLen) {
+      const newCapacity = Math.ceil((kvCacheLen + 1) / 64) * 64;
+      kvCaches[i].key = np.pad(kvCaches[i].key, {
+        0: [0, newCapacity - kvCacheLen],
+      });
+      kvCaches[i].value = np.pad(kvCaches[i].value, {
+        0: [0, newCapacity - kvCacheLen],
+      });
+    }
+  }
+
+  // Noise drawn exactly as runFlowLMStep, then handed to the trace as an input.
+  const std = Math.sqrt(temperature);
+  let noise = random.normal(key, [1, ldim]).mul(std);
+  if (noiseClamp !== null) {
+    noise = np.clip(noise, -noiseClamp, noiseClamp);
+  }
+
+  const offsetArr = np.array(offset, { dtype: np.int32 });
+  const kvCacheLenArr = np.array(kvCacheLen, { dtype: np.int32 });
+
+  let latent: np.Array;
+  let isEos: np.Array;
+  let newCaches: KVCache[];
+  [latent, isEos, newCaches] = runFlowLMDecodeFused(
+    { inputLinear, transformer, outNorm, outEos, flowNet },
+    kvCaches,
+    sequence,
+    offsetArr,
+    kvCacheLenArr,
+    noise,
+    eosThreshold,
+    lsdDecodeSteps,
+  );
+
+  return {
+    latent,
+    isEos,
+    state: { kvCaches: newCaches, kvCacheLen: kvCacheLen + 1 },
+  };
+}
+
+/** Fields of the Mimi model the fused decode step actually consumes. */
+type MimiDecodeModel = Pick<
+  MimiModel,
+  "quantizer" | "upsample" | "decoderTransformer" | "decoder"
+>;
+
+// The fused Mimi decode step as plain tracer ops (no jit boundary): dummy
+// quantizer conv → depthwise upsample → 2 decoder-transformer layers → SEANet
+// decoder. Mirrors runMimiDecode's compute exactly; the KV-cache padding/cycling
+// (shape ops) stay in the JS wrapper. `offset`/`kvCacheLen` are np.Array scalars
+// reused per layer (`.ref` per use, dispose after the loop).
+function mimiDecodeStepBody(
+  { quantizer, upsample, decoderTransformer, decoder }: MimiDecodeModel,
+  kvCaches: KVCache[],
+  seanetStates: SEANetDecoderState,
+  initialConvState: np.Array,
+  offset: np.Array,
+  kvCacheLen: np.Array,
+  latent: np.Array, // [T, 32]
+): [np.Array, KVCache[], SEANetDecoderState, np.Array] {
+  latent = np.expandDims(latent.transpose([1, 0]), 0); // [1, 32, T]
+  latent = lax.conv(latent, quantizer.outputProj.weight, [1], "VALID"); // [1, 512, T]
+
+  let x: np.Array;
+  [x, initialConvState] = runConvTranspose1d(
+    upsample.convtr,
+    initialConvState,
+    latent,
+    16,
+    latent.shape[1],
+  ); // [1, 512, 16*T]
+  x = x.slice(0);
+
+  x = x.transpose([1, 0]); // [C, 16*T] -> [16*T, C]
+  for (let i = 0; i < decoderTransformer.length; i++) {
+    [x, kvCaches[i]] = streamingTransformerLayerInline(
+      decoderTransformer[i],
+      kvCaches[i],
+      x,
+      offset.ref,
+      kvCacheLen.ref,
+      { context: 250, numHeads: 8 },
+    );
+  }
+  offset.dispose();
+  kvCacheLen.dispose();
+  x = x.transpose([1, 0]); // [C, 16*T]
+
+  [x, seanetStates] = seanetDecoderInline(decoder, seanetStates, x); // [1, 1920*T]
+
+  return [x, kvCaches, seanetStates, initialConvState];
+}
+
+const runMimiDecodeStepFused = jit(function runMimiDecodeStepFused(
+  model: MimiDecodeModel,
+  kvCaches: KVCache[],
+  seanetStates: SEANetDecoderState,
+  initialConvState: np.Array,
+  offset: np.Array,
+  kvCacheLen: np.Array,
+  latent: np.Array,
+): [np.Array, KVCache[], SEANetDecoderState, np.Array] {
+  return mimiDecodeStepBody(
+    model,
+    kvCaches,
+    seanetStates,
+    initialConvState,
+    offset,
+    kvCacheLen,
+    latent,
+  );
+});
+
+/**
+ * Fused-dispatch counterpart to `runMimiDecode`. Same signature and side
+ * effects (advances the streaming KV caches / conv states / offsets, returns
+ * `[audio, state]`), so playTTS swaps it in behind TUNABLES.ttsFusedStep. The
+ * one jitted dispatch covers both the first-frame prefill and the steady-state
+ * decode (the isPrefill branch resolves at trace time from the cache shape); the
+ * KV-cache padding/cycling shape ops stay in JS, identical to runMimiDecode.
+ */
+export function runMimiDecodeFused(
+  {
+    encoder,
+    encoderTransformer,
+    decoder,
+    decoderTransformer,
+    quantizer,
+    downsample,
+    upsample,
+  }: MimiModel,
+  {
+    kvCaches,
+    kvCacheLen,
+    offset,
+    initialConvState,
+    seanetStates,
+  }: MimiDecodeState,
+  latent: np.Array, // [T, 32]
+): [np.Array, MimiDecodeState] {
+  tree.dispose([encoder, encoderTransformer, downsample]);
+
+  const offsetArr = np.array(offset, { dtype: np.int32 });
+  const kvCacheLenArr = np.array(kvCacheLen, { dtype: np.int32 });
+
+  let x: np.Array;
+  let newKvCaches: KVCache[];
+  let newSeanet: SEANetDecoderState;
+  let newInitialConvState: np.Array;
+  [x, newKvCaches, newSeanet, newInitialConvState] = runMimiDecodeStepFused(
+    { quantizer, upsample, decoderTransformer, decoder },
+    kvCaches,
+    seanetStates,
+    initialConvState,
+    offsetArr,
+    kvCacheLenArr,
+    latent,
+  );
+
+  // KV-cache maintenance (shape ops, kept in JS) — identical to runMimiDecode.
+  kvCacheLen += 16;
+  offset += 16;
+  if (newKvCaches[0].key.shape[0] !== 272) {
+    const padAmount = 272 - newKvCaches[0].key.shape[0];
+    for (const c of newKvCaches) {
+      c.key = np.pad(c.key, { 0: [0, padAmount] });
+      c.value = np.pad(c.value, { 0: [0, padAmount] });
+    }
+  }
+  if (kvCacheLen === 272) {
+    kvCacheLen -= 16;
+    for (const c of newKvCaches) {
+      c.key = np.pad(c.key.slice([16]), { 0: [0, 16] });
+      c.value = np.pad(c.value.slice([16]), { 0: [0, 16] });
+    }
+  }
+
+  return [
+    x,
+    {
+      kvCaches: newKvCaches,
+      kvCacheLen,
+      offset,
+      initialConvState: newInitialConvState,
+      seanetStates: newSeanet,
+    },
+  ];
+}
+
 const weightMapper = new WeightMapper({
   prefix: {
     "flow_lm.": "flowLM.",

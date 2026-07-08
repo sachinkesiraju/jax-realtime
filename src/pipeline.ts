@@ -39,9 +39,11 @@ import {
   fromSafetensors as gemmaFromSafetensors,
   type GemmaModel,
   type GemmaState,
+  GEMMA_TOPK,
   runGemmaPrefill,
   runGemmaStep,
   runGemmaStepFused,
+  runGemmaStepFusedTopK,
 } from "./llm/gemma";
 import { type AudioPlayer, createStreamingPlayer } from "./tts/audio";
 import { playTTS } from "./tts/inference";
@@ -67,8 +69,12 @@ export type DownloadProgress = {
 
 export type ProgressFn = (progress: DownloadProgress) => void;
 
+// base.en over tiny.en: tiny is the most hallucination-prone Whisper size (it
+// invents "thank you" / repeats on near-silence and garbles fast speech), and
+// base is markedly more accurate for ~+70 MB. On WebGPU a pass is still well
+// under real-time, so captions keep up.
 const WHISPER_CONFIG: WhisperConfig = WHISPER_MODELS.find(
-  (m) => m.id === "tiny.en",
+  (m) => m.id === "base.en",
 )!;
 const ASR_MAX_NEW_TOKENS = 96;
 
@@ -183,6 +189,84 @@ export class SpeechRecognizer {
       // Warmup is best-effort; a failure here just means the first real pass
       // pays the compilation cost.
     }
+  }
+
+  /**
+   * DEV diagnostic: per-token Whisper decoder-step cost. The decoder step is
+   * ALREADY a single fused jit (see asr/model.ts `decoderStepJit`: embedding →
+   * all layers → norm → logits in one dispatch), so unlike Gemma there is no
+   * per-layer "unfused" path to A/B against — this just reports the ms/token of
+   * the shipped fused step (including the realistic full-vocab readback the gate
+   * needs), so the orchestrator can confirm the ASR pass cost. Not used by the
+   * app.
+   */
+  async benchDecodeStep(n = 24): Promise<Record<string, unknown>> {
+    const config = WHISPER_CONFIG;
+    const device = this.device;
+    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+    const features = whisperLogMel(new Float32Array(16_000 * 3));
+    let inputFeatures = np.array(features.data as Float32Array<ArrayBuffer>, {
+      shape: [1, features.mels, features.frames],
+      dtype: np.float32,
+      device,
+    });
+    if (this.dtype !== np.float32) inputFeatures = inputFeatures.astype(this.dtype);
+    const encoded = runWhisperEncoder(this.model.encoder, inputFeatures, config);
+    const crossKV = prepareWhisperCrossKV(this.model.decoder, encoded, config);
+    const state = createWhisperState(
+      ASR_MAX_NEW_TOKENS + config.promptTokens.length + 8,
+      this.dtype,
+      config,
+      device,
+    );
+
+    let logits: np.Array | null = null;
+    for (const token of config.promptTokens) {
+      logits?.dispose();
+      logits = runWhisperDecoderStep(
+        this.model.decoder,
+        crossKV,
+        state,
+        token,
+        config,
+        device,
+      );
+    }
+
+    const dispatchMs: number[] = [];
+    const fixedToken = config.timestampBeginToken; // any valid decode token
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) {
+      await logits!.data(); // consumes logits (realistic full-vocab readback)
+      const d0 = performance.now();
+      logits = runWhisperDecoderStep(
+        this.model.decoder,
+        crossKV,
+        state,
+        fixedToken,
+        config,
+        device,
+      );
+      dispatchMs.push(performance.now() - d0);
+    }
+    await blockUntilReady(logits!.ref);
+    const msPerTok = (performance.now() - t0) / n;
+    logits!.dispose();
+    tree.dispose(crossKV);
+    tree.dispose(state);
+
+    return {
+      nTokens: n,
+      msPerTok: +msPerTok.toFixed(2),
+      fused: true,
+      note: "decoder step is already single-jit fused; no unfused path to A/B",
+      dispatchSyncMs: {
+        first5: dispatchMs.slice(0, 5).map((x) => +x.toFixed(2)),
+        mean: +mean(dispatchMs).toFixed(2),
+        max: +Math.max(...dispatchMs).toFixed(2),
+      },
+    };
   }
 
   /** Transcribe 16 kHz mono PCM samples to text. */
@@ -473,7 +557,7 @@ export class LocalChatModel implements ChatModel {
 
   async benchDecode(
     n = 24,
-    opts?: { fused?: boolean; sampler?: "js" | "topk" },
+    opts?: { fused?: boolean; sampler?: "js" | "topk"; topkInFused?: boolean },
   ): Promise<Record<string, unknown>> {
     // When a specific configuration is requested, measure just that config's
     // ms/token and per-call sync dispatch cost (used by the map-reduce run).
@@ -569,43 +653,68 @@ export class LocalChatModel implements ChatModel {
    */
   private async benchConfig(
     n: number,
-    { fused = false, sampler = "js" as "js" | "topk" },
+    {
+      fused = false,
+      sampler = "js" as "js" | "topk",
+      topkInFused = false,
+    },
   ): Promise<Record<string, unknown>> {
     const prompt = this.benchPrompt();
     const stepFn = fused ? runGemmaStepFused : runGemmaStep;
-    const opts = { temperature: 0.7, topK: 64, topP: 0.95 };
+    const opts = { temperature: 0.7, topK: GEMMA_TOPK, topP: 0.95 };
     const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
 
     const state = createGemmaState({ dtype: np.float16 });
-    let logits = runGemmaPrefill(
+    // `out` is the current sampleable: full-vocab logits, or the packed top-k
+    // array once the folded step is producing them (isCombined tracks which).
+    let out = runGemmaPrefill(
       tree.ref(this.model),
       np.array(prompt, { dtype: np.uint32 }),
       state,
     );
+    let isCombined = false;
+
+    const sampleCombined = (packed: ArrayLike<number>): number => {
+      const values = new Array(GEMMA_TOPK);
+      const indices = new Array(GEMMA_TOPK);
+      for (let j = 0; j < GEMMA_TOPK; j++) {
+        values[j] = packed[j];
+        indices[j] = packed[GEMMA_TOPK + j];
+      }
+      return sampleTopKPairs(values, indices, opts);
+    };
 
     const dispatchMs: number[] = [];
     const t0 = performance.now();
     for (let i = 0; i < n; i++) {
       let tok: number;
-      if (sampler === "topk") {
-        const [vals, idx] = lax.topK(logits, 64); // consumes logits
+      if (isCombined) {
+        tok = sampleCombined((await out.data()) as ArrayLike<number>);
+      } else if (sampler === "topk") {
+        const [vals, idx] = lax.topK(out, 64); // consumes out
         const v = (await vals.data()) as ArrayLike<number>;
         const ix = (await idx.data()) as ArrayLike<number>;
         tok = sampleTopKPairs(v, ix, opts);
       } else {
-        tok = sampleLogits((await logits.data()) as Float32Array, opts);
+        tok = sampleLogits((await out.data()) as Float32Array, opts);
       }
       const d0 = performance.now();
-      logits = stepFn(tree.ref(this.model), tok, state);
+      if (topkInFused) {
+        out = runGemmaStepFusedTopK(tree.ref(this.model), tok, state);
+        isCombined = true;
+      } else {
+        out = stepFn(tree.ref(this.model), tok, state);
+        isCombined = false;
+      }
       dispatchMs.push(performance.now() - d0);
     }
-    await blockUntilReady(logits.ref);
+    await blockUntilReady(out.ref);
     const msPerTok = (performance.now() - t0) / n;
-    logits.dispose();
+    out.dispose();
     tree.dispose(state);
 
     return {
-      config: { fused, sampler },
+      config: { fused, sampler, topkInFused },
       nTokens: n,
       msPerTok: +msPerTok.toFixed(2),
       dispatchSyncMs: {
@@ -629,31 +738,48 @@ export class LocalChatModel implements ChatModel {
     const run = async (
       fused: boolean,
       sampler: "js" | "topk",
+      topkInFused = false,
     ): Promise<number[]> => {
       const stepFn = fused ? runGemmaStepFused : runGemmaStep;
       const state = createGemmaState({ dtype: np.float16 });
-      let logits = runGemmaPrefill(
+      let cur = runGemmaPrefill(
         tree.ref(this.model),
         np.array(prompt, { dtype: np.uint32 }),
         state,
       );
+      let isCombined = false;
       const out: number[] = [];
       try {
         for (let i = 0; i < nTokens; i++) {
           let tok: number;
-          if (sampler === "topk") {
-            const [vals, idx] = lax.topK(logits, 64); // consumes logits
+          if (isCombined) {
+            const packed = (await cur.data()) as ArrayLike<number>;
+            const values = new Array(GEMMA_TOPK);
+            const indices = new Array(GEMMA_TOPK);
+            for (let j = 0; j < GEMMA_TOPK; j++) {
+              values[j] = packed[j];
+              indices[j] = packed[GEMMA_TOPK + j];
+            }
+            tok = sampleTopKPairs(values, indices, greedy);
+          } else if (sampler === "topk") {
+            const [vals, idx] = lax.topK(cur, 64); // consumes cur
             const v = (await vals.data()) as ArrayLike<number>;
             const ix = (await idx.data()) as ArrayLike<number>;
             tok = sampleTopKPairs(v, ix, greedy);
           } else {
-            tok = sampleLogits((await logits.data()) as Float32Array, greedy);
+            tok = sampleLogits((await cur.data()) as Float32Array, greedy);
           }
           out.push(tok);
-          logits = stepFn(tree.ref(this.model), tok, state);
+          if (topkInFused) {
+            cur = runGemmaStepFusedTopK(tree.ref(this.model), tok, state);
+            isCombined = true;
+          } else {
+            cur = stepFn(tree.ref(this.model), tok, state);
+            isCombined = false;
+          }
         }
       } finally {
-        logits.dispose();
+        cur.dispose();
         tree.dispose(state);
       }
       return out;
@@ -664,6 +790,7 @@ export class LocalChatModel implements ChatModel {
       jsFused: await run(true, "js"),
       topkUnfused: await run(false, "topk"),
       topkFused: await run(true, "topk"),
+      topkInFused: await run(true, "topk", true),
     };
   }
 
@@ -694,6 +821,27 @@ export class LocalChatModel implements ChatModel {
       return sampleTopKPairs(v, ix, opts);
     }
     return sampleLogits((await logits.data()) as Float32Array, opts);
+  }
+
+  /**
+   * Sample from the packed top-k array emitted by the topk-in-fused decode step
+   * (see runGemmaDecodeStepFusedTopK): one readback of [values ..k.., indices
+   * ..k..] fp32, split back into pairs and fed through the same selection as
+   * `sampleTopKPairs` — identical semantics, one `.data()` instead of two.
+   */
+  private async sampleNextFromCombined(
+    combined: np.Array,
+    temperature: number,
+  ): Promise<number> {
+    const opts = { temperature, topK: GEMMA_TOPK, topP: 0.95 };
+    const packed = (await combined.data()) as ArrayLike<number>; // consumes
+    const values = new Array(GEMMA_TOPK);
+    const indices = new Array(GEMMA_TOPK);
+    for (let i = 0; i < GEMMA_TOPK; i++) {
+      values[i] = packed[i];
+      indices[i] = packed[GEMMA_TOPK + i];
+    }
+    return sampleTopKPairs(values, indices, opts);
   }
 
   /**
@@ -808,23 +956,32 @@ export class LocalChatModel implements ChatModel {
     // Fused single-dispatch decode vs the shipped per-layer path; same signature
     // and side effects, so it swaps in transparently.
     const stepFn = TUNABLES.llmFusedStep ? runGemmaStepFused : runGemmaStep;
+    // When on, the fused step folds topK into its jit and returns the packed
+    // top-k array instead of full logits (only meaningful with the fused step).
+    const topkInFused = TUNABLES.llmFusedStep && TUNABLES.llmTopkInFused;
     const startTime = performance.now();
     let firstTokenMs = 0;
     let emitted = "";
 
     const prepared = this.prepareState(promptTokens);
     const { state, fedTokens, persistent } = prepared;
-    let logits: np.Array | null = prepared.logits;
+    // `pending` is the next thing to sample from: the prefill's full-vocab
+    // logits for token 0, then either full logits or a packed top-k array from
+    // each step (pendingIsCombined tracks which, so the right sampler is used).
+    let pending: np.Array | null = prepared.logits;
+    let pendingIsCombined = false;
 
     try {
       const stopTokens = [this.tokenizer.eosToken, GEMMA_END_OF_TURN];
 
       for (let i = 0; i < maxNewTokens; i++) {
-        const sampledLogits = logits!;
-        logits = null;
+        const sampleable = pending!;
+        pending = null;
         // The plain chat template (no instruction preamble) responds best at a
         // natural sampling temperature, matching the jax-js chat demo.
-        const nextToken = await this.sampleNext(sampledLogits, 0.7);
+        const nextToken = pendingIsCombined
+          ? await this.sampleNextFromCombined(sampleable, 0.7)
+          : await this.sampleNext(sampleable, 0.7);
         if (i === 0) firstTokenMs = performance.now() - startTime;
         if (stopTokens.includes(nextToken)) break;
 
@@ -835,7 +992,13 @@ export class LocalChatModel implements ChatModel {
         if (delta) yield delta;
 
         if (i === maxNewTokens - 1) break;
-        logits = stepFn(tree.ref(this.model), nextToken, state);
+        if (topkInFused) {
+          pending = runGemmaStepFusedTopK(tree.ref(this.model), nextToken, state);
+          pendingIsCombined = true;
+        } else {
+          pending = stepFn(tree.ref(this.model), nextToken, state);
+          pendingIsCombined = false;
+        }
         fedTokens.push(nextToken);
       }
 
@@ -846,7 +1009,7 @@ export class LocalChatModel implements ChatModel {
         totalMs: performance.now() - startTime,
       };
     } finally {
-      logits?.dispose();
+      pending?.dispose();
       // With KV reuse the state is persisted for the next turn; otherwise it is
       // released here (shipped behavior).
       if (persistent) this.commitState(state, fedTokens);
@@ -1132,6 +1295,96 @@ export class SpeechSynthesizer {
       totalMs: performance.now() - startTime,
       aborted: !!signal?.aborted,
     };
+  }
+
+  /**
+   * DEV A/B bench hook: synthesize `sentence` once (off the audio graph) and
+   * measure pure generation cost, so the harness can compare the fused
+   * per-frame decode (TUNABLES.ttsFusedStep) against the shipped path on an
+   * identical sentence. A fixed seed makes fused-vs-unfused frame counts (and
+   * thus audio duration) comparable. Because the player collects PCM without
+   * touching the speakers, `genMs` is the wall-clock of generation alone (GPU
+   * dispatch + per-frame EOS readback), not real-time playback.
+   *
+   * `realtimeFactor = genMs / audioDurationMs`; < 1 means we generate faster
+   * than real time (the goal). A `warmup` run (default on) is done first so the
+   * timed run does not eat the one-time JIT compile of the fused/unfused traces.
+   *
+   * Usage: `await window.__pipeline().tts.benchSynth("some sentence.", { fused: true })`
+   */
+  async benchSynth(
+    sentence: string,
+    {
+      fused = false,
+      voice = TTS_VOICES[0],
+      seed = 1234,
+      warmup = true,
+    }: {
+      fused?: boolean;
+      voice?: TTSVoice;
+      seed?: number;
+      warmup?: boolean;
+    } = {},
+  ): Promise<{
+    genMs: number;
+    firstAudioMs: number;
+    audioDurationMs: number;
+    realtimeFactor: number;
+  }> {
+    const [prepared, framesAfterEos] = this.prepareTextPrompt(sentence);
+    const tokens = this.tokenizer.encode(prepared);
+    const voiceEmbed = await this.getVoiceEmbed(voice);
+
+    const runOnce = async (): Promise<{
+      genMs: number;
+      firstAudioMs: number;
+      audioDurationMs: number;
+    }> => {
+      const tokensAr = np.array(tokens, { dtype: np.uint32 });
+      let embeds = this.model.flowLM.conditionerEmbed.ref.slice(tokensAr);
+      embeds = np.concatenate([voiceEmbed.ref, embeds]);
+
+      const inner = createStreamingPlayer({ collectPcm: true });
+      let firstAudioMs = 0;
+      const start = performance.now();
+      const player = withFirstAudio(inner, () => {
+        if (firstAudioMs === 0) firstAudioMs = performance.now() - start;
+      });
+      try {
+        await playTTS(player, tree.ref(this.model), embeds, {
+          framesAfterEos,
+          seed,
+          temperature: 0.7,
+          lsdDecodeSteps: 1,
+          signal: null,
+        });
+      } finally {
+        // playTTS consumed the embeds ref; drain any pending PCM copy.
+      }
+      const genMs = performance.now() - start;
+      const samples = inner.pcm().length;
+      await inner.close();
+      return {
+        genMs,
+        firstAudioMs,
+        audioDurationMs: (samples / TTS_SAMPLE_RATE) * 1000,
+      };
+    };
+
+    const prev = TUNABLES.ttsFusedStep;
+    TUNABLES.ttsFusedStep = fused;
+    try {
+      if (warmup) await runOnce();
+      const { genMs, firstAudioMs, audioDurationMs } = await runOnce();
+      return {
+        genMs,
+        firstAudioMs,
+        audioDurationMs,
+        realtimeFactor: audioDurationMs > 0 ? genMs / audioDurationMs : NaN,
+      };
+    } finally {
+      TUNABLES.ttsFusedStep = prev;
+    }
   }
 
   /**

@@ -10,14 +10,30 @@ import type { Detection, ObjectDetector } from "./detector";
 // ASR/LLM/TTS — so it detects infrequently and yields the GPU to the audio
 // pipeline (see `pauseWhile`).
 const FRAME_INTERVAL_MS = 2200;
+// While the scene isn't yet established (no stable person), poll faster so a
+// person who just sat down registers within ~1 s instead of up to one full
+// low-priority interval. Once a person is stable we relax to FRAME_INTERVAL_MS.
+const SEARCH_INTERVAL_MS = 700;
 // Retry cadence after a tick was skipped for priority reasons — cheap (no GPU
 // work happened) and keeps the Eye from starving while audio stays busy.
 const SKIP_RETRY_MS = 250;
+// Confidence floor for a detection to be reported in the scene description /
+// answers (the overlay still draws everything above the detector threshold).
+// D-FINE-S (COCO) confidently confuses similar furniture (bed/couch/chair) in
+// the 0.55-0.7 band on a webcam; 0.62 trims the worst of it. Genuine confusions
+// above this are a small-detector accuracy limit, not something the app can fix.
+const SCENE_MIN_SCORE = 0.62;
+// Cap the scene description to its most confident objects — a long tail of
+// low-ish detections reads as noise even when each clears the floor.
+const SCENE_MAX_OBJECTS = 4;
 const POSTURE_BASELINE = 6; // rolling frames used for the slouch baseline
 // A label must appear in ≥2 of the last STABILITY_FRAMES detector frames to be
 // reported — this filters flickering false positives (a "cat" that D-FINE only
 // hallucinates for a single frame) out of what we tell the user.
 const STABILITY_FRAMES = 3;
+// Min score for a person box to COUNT toward the announced number (the overlay
+// still draws everything above the detector's own display threshold).
+const PERSON_COUNT_MIN_SCORE = 0.6;
 
 export type SceneState = {
   personCount: number;
@@ -56,6 +72,7 @@ export class VisionSession {
 
   // Recent per-frame label sets + the labels currently considered stable.
   private recentLabels: string[][] = [];
+  private recentPersonCounts: number[] = [];
   private stableSet = new Set<string>();
   private colorCanvas: HTMLCanvasElement | null = null;
 
@@ -95,12 +112,19 @@ export class VisionSession {
     this.heightHistory = [];
     this.slouchingNow = false;
     this.recentLabels = [];
+    this.recentPersonCounts = [];
     this.stableSet = new Set();
   }
 
   /** Detections in the latest frame limited to temporally-stable labels. */
   private stableDetections(): Detection[] {
-    return this.latest.filter((d) => this.stableSet.has(d.label));
+    // Confidence floor on top of stability: D-FINE confidently flickers
+    // background furniture (a "couch"/"bed" at ~0.5) in a webcam scene, and
+    // reporting those as fact reads as hallucination. Real, salient objects
+    // (the person, a held phone) sit well above this.
+    return this.latest.filter(
+      (d) => d.score >= SCENE_MIN_SCORE && this.stableSet.has(d.label),
+    );
   }
 
   /**
@@ -130,11 +154,15 @@ export class VisionSession {
     for (const d of detections) {
       let [x, y, w, h] = d.box;
       if (d.label === "person") {
-        // Torso ≈ clothing: middle horizontally, upper-mid vertically.
+        // Clothing band: LOWER-middle of the box. A seated webcam framing gives
+        // a head-and-shoulders box where 40-70% height is still face/neck —
+        // sampling there described skin ("orange person", "dark red shirt" on a
+        // navy polo). 58-90% height hits the chest/shirt in that framing, and
+        // still lands on clothing (pants) for a full-body box.
         x += w * 0.3;
         w *= 0.4;
-        y += h * 0.42;
-        h *= 0.28;
+        y += h * 0.58;
+        h *= 0.32;
       } else {
         x += w * 0.25;
         y += h * 0.25;
@@ -190,14 +218,15 @@ export class VisionSession {
     if (byLabel.size === 0) return "";
     const parts = [...byLabel.entries()]
       .sort((a, b) => b[1].length - a[1].length)
-      .slice(0, 6)
+      .slice(0, SCENE_MAX_OBJECTS)
       .map(([label, dets]) => {
         const n = dets.length;
-        if (n === 1) {
-          const color = dets[0].color;
-          const desc = color ? `${color} ${label}` : label;
-          return `${/^[aeiou]/.test(color ?? label) ? "an" : "a"} ${desc}`;
-        }
+        // Colours are deliberately NOT volunteered here: the cheap box-average
+        // sampler is unreliable under webcam lighting (it has called a navy
+        // polo "dark red" and a person "orange"), so stating a colour unasked
+        // reads as hallucination. A direct "what colour is X" still answers
+        // from the measurement in answer(), where it's explicitly requested.
+        if (n === 1) return `${/^[aeiou]/.test(label) ? "an" : "a"} ${label}`;
         return `${numWord(n)} ${pluralize(label)}`;
       });
     return joinList(parts);
@@ -206,6 +235,19 @@ export class VisionSession {
   private updateStability(detections: Detection[]): void {
     this.recentLabels.push([...new Set(detections.map((d) => d.label))]);
     if (this.recentLabels.length > STABILITY_FRAMES) this.recentLabels.shift();
+    // Per-frame person counts feed a median in `personCount`, so one dropped
+    // frame (yielded to audio) or one ghost box can't flap the reported number.
+    // Counting demands higher confidence than displaying: a tentative 0.5 box
+    // is worth drawing on the overlay, but announcing "2 people" is a claim —
+    // real people measure 0.74-0.93 here; posters/reflections sit near 0.5.
+    this.recentPersonCounts.push(
+      detections.filter(
+        (d) => d.label === "person" && d.score >= PERSON_COUNT_MIN_SCORE,
+      ).length,
+    );
+    if (this.recentPersonCounts.length > STABILITY_FRAMES) {
+      this.recentPersonCounts.shift();
+    }
     const counts = new Map<string, number>();
     for (const labels of this.recentLabels) {
       for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
@@ -224,10 +266,13 @@ export class VisionSession {
   // --- Derived scene state ------------------------------------------------
 
   get personCount(): number {
-    // Only count people once "person" is stable, and don't blink to 0 on a
-    // single dropped frame — report at least 1 while it stays stable.
+    // Only count people once "person" is stable, then report the MEDIAN count
+    // over the stability window (never below 1 while stable) — the instant
+    // latest-frame count flapped 0→2 on dropped frames and duplicate boxes.
     if (!this.stableSet.has("person")) return 0;
-    return Math.max(1, this.latest.filter((d) => d.label === "person").length);
+    const sorted = [...this.recentPersonCounts].sort((a, b) => a - b);
+    const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 1;
+    return Math.max(1, median);
   }
 
   get personPresent(): boolean {
@@ -331,7 +376,13 @@ export class VisionSession {
     // to appear after enabling the Eye.
     void this.tick().then((ran) => {
       if (!this.running) return;
-      const delay = ran ? FRAME_INTERVAL_MS : SKIP_RETRY_MS;
+      // Completed frame: fast search cadence until a person is established,
+      // then relax to the low-priority interval. Skipped frame: retry soon.
+      const delay = ran
+        ? this.personCount > 0
+          ? FRAME_INTERVAL_MS
+          : SEARCH_INTERVAL_MS
+        : SKIP_RETRY_MS;
       this.timer = setTimeout(() => this.loop(), delay);
     });
   }
@@ -343,7 +394,11 @@ export class VisionSession {
     // transcribing or the assistant is speaking. The scheduler retries soon.
     if (this.pauseWhile?.()) return false;
     try {
-      const detections = await this.detector.detect(this.video);
+      // Dedupe at the source: DETR-family models emit a duplicate overlapping
+      // box for the same object near the score threshold (e.g. one person as a
+      // 0.93 box plus a ~0.5 ghost), which inflated counts ("2 people") and
+      // drew double boxes on the overlay.
+      const detections = dedupeDetections(await this.detector.detect(this.video));
       if (!this.running) return true;
       this.sampleColors(detections);
       this.latest = detections;
@@ -461,4 +516,39 @@ function joinList(parts: string[]): string {
   if (parts.length === 1) return parts[0];
   if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
   return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+}
+
+/**
+ * Overlap of two [x, y, w, h] boxes, normalized by the SMALLER box's area
+ * (intersection-over-minimum). This catches both classic duplicates (high IoU)
+ * and contained ghosts — e.g. a face-only "person" box inside the full-body
+ * box, whose IoU is small because the areas differ hugely.
+ */
+function overlapOverMin(
+  a: [number, number, number, number],
+  b: [number, number, number, number],
+): number {
+  const x1 = Math.max(a[0], b[0]);
+  const y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[0] + a[2], b[0] + b[2]);
+  const y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const minArea = Math.min(a[2] * a[3], b[2] * b[3]);
+  return minArea > 0 ? inter / minArea : 0;
+}
+
+/**
+ * Drop same-label detections mostly covered by a stronger one — duplicates or
+ * parts of a single object, not a second object. Distinct objects of the same
+ * class (two chairs side by side) overlap little and are kept.
+ */
+function dedupeDetections(detections: Detection[]): Detection[] {
+  const kept: Detection[] = [];
+  for (const d of [...detections].sort((a, b) => b.score - a.score)) {
+    const dup = kept.some(
+      (k) => k.label === d.label && overlapOverMin(k.box, d.box) > 0.7,
+    );
+    if (!dup) kept.push(d);
+  }
+  return kept;
 }

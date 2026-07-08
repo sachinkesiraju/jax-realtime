@@ -4,7 +4,12 @@
 // Everything here is CORS-open and keyless so it works out of the box:
 //   - weather → open-meteo (geocode + forecast)
 //   - lookup  → Wikipedia REST summary
+//   - calc / clock → instant, fully offline (TUNABLES.toolRouting
+//     "broad"; the GPT-Live-style posture of delegating what the tiny local
+//     model can't answer reliably)
 // Each result carries both a spoken line and a plain-data UiCard to render.
+
+import { TUNABLES } from "../tunables";
 
 export type UiCard =
   | {
@@ -20,7 +25,7 @@ export type UiCard =
 
 export type ToolResult = { speech: string; card: UiCard };
 
-export type ToolKind = "weather" | "lookup";
+export type ToolKind = "weather" | "lookup" | "calc" | "clock";
 
 export interface ToolCall {
   kind: ToolKind;
@@ -138,14 +143,17 @@ async function runWeather(query: string): Promise<ToolResult> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}` +
     `&longitude=${place.longitude}` +
-    `&current=temperature_2m,weather_code,wind_speed_10m`;
+    `&current=temperature_2m,weather_code,wind_speed_10m` +
+    // Fahrenheit + mph by default (US-oriented). open-meteo does the unit
+    // conversion server-side, so temp/wind come back already in these units.
+    `&temperature_unit=fahrenheit&wind_speed_unit=mph`;
   const data = await fetch(url).then((r) => r.json());
   const cur = data?.current ?? {};
   const temp = Math.round(Number(cur.temperature_2m));
   const wind = Math.round(Number(cur.wind_speed_10m));
   const [condition, emoji] = wmoDescribe(Number(cur.weather_code));
-  const unit = data?.current_units?.temperature_2m ?? "°C";
-  const speech = `It's ${temp} degrees and ${condition} in ${place.name}, with winds around ${wind}.`;
+  const unit = data?.current_units?.temperature_2m ?? "°F";
+  const speech = `It's ${temp} degrees and ${condition} in ${place.name}, with winds around ${wind} miles per hour.`;
   return {
     speech,
     card: {
@@ -164,10 +172,15 @@ async function runLookup(query: string): Promise<ToolResult> {
     .split(/\s+/)
     .map((w) => (w.length > 2 ? w[0].toUpperCase() + w.slice(1) : w))
     .join(" ");
-  const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(
-    title.replace(/\s+/g, "_"),
-  )}`;
-  const res = await fetch(url);
+  // NOTE (campaign 2): a title-search fallback for phrase queries was tried and
+  // rejected — it turned honest misses into confidently irrelevant answers
+  // ("how far is the moon" → a 2007 film). An honest "couldn't find" is the
+  // right behavior until a snippet-based retrieval source exists.
+  const res = await fetch(
+    `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(
+      title.replace(/\s+/g, "_"),
+    )}`,
+  );
   if (!res.ok) {
     const speech = `I couldn't find anything about ${query}.`;
     return {
@@ -189,16 +202,118 @@ async function runLookup(query: string): Promise<ToolResult> {
   };
 }
 
+// --- Instant deterministic tools (broad routing only) -----------------------
+
+const NUM = "(-?\\d+(?:[.,]\\d+)?)";
+const num = (s: string) => Number(s.replace(",", "."));
+const fmt = (x: number) =>
+  Math.abs(x - Math.round(x)) < 1e-9 ? String(Math.round(x)) : x.toFixed(2);
+
+/** Spoken-arithmetic parser: "17 times 23", "15 percent of 80", "144 / 12". */
+function detectCalc(text: string): ToolCall | null {
+  const t = text.toLowerCase().replace(/[?.!]+$/, "");
+  const patterns: [RegExp, (a: number, b: number) => number, string][] = [
+    [new RegExp(`${NUM}\\s*(?:times|multiplied by|x|\\*)\\s*${NUM}`), (a, b) => a * b, "times"],
+    [new RegExp(`${NUM}\\s*(?:divided by|over|/)\\s*${NUM}`), (a, b) => a / b, "divided by"],
+    [new RegExp(`${NUM}\\s*(?:plus|\\+)\\s*${NUM}`), (a, b) => a + b, "plus"],
+    [new RegExp(`${NUM}\\s*(?:minus|-)\\s*${NUM}`), (a, b) => a - b, "minus"],
+    [new RegExp(`${NUM}\\s*(?:percent|%)\\s*of\\s*${NUM}`), (a, b) => (a / 100) * b, "percent of"],
+  ];
+  for (const [re, op, word] of patterns) {
+    const m = t.match(re);
+    if (!m) continue;
+    const a = num(m[1]);
+    const b = num(m[2]);
+    const result = op(a, b);
+    if (!Number.isFinite(result)) continue;
+    const speech = `${fmt(a)} ${word} ${fmt(b)} is ${fmt(result)}.`;
+    return {
+      kind: "calc",
+      query: m[0],
+      holding: "",
+      run: async () => ({
+        speech,
+        card: { kind: "factcard", title: `${fmt(result)}`, extract: speech, source: "calculator" },
+      }),
+    };
+  }
+  return null;
+}
+
+// Unit conversions: factor to the target unit (linear), plus temperature.
+// NOTE (owner call): a unit-conversion tool lived here briefly and was deleted.
+// Conversion factors are stored knowledge — a hand-maintained mini-almanac with
+// no principled stopping point (currencies? time zones?) — which is the
+// hardcoding pattern this project rejects. Calculator (pure arithmetic) and
+// clock (device state) are capabilities, not knowledge, so they stay.
+
+const CLOCK_RE =
+  /\b(what day is (it|today)|what('s| is) (the date|today's date)|what time is it|what('s| is) the time)\b/i;
+
+/** Local date/time — the one thing even a big LLM can't know offline. */
+function detectClock(text: string): ToolCall | null {
+  if (!CLOCK_RE.test(text)) return null;
+  const now = new Date();
+  const wantsTime = /time/i.test(text);
+  const speech = wantsTime
+    ? `It's ${now.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}.`
+    : `It's ${now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}.`;
+  return {
+    kind: "clock",
+    query: wantsTime ? "time" : "date",
+    holding: "",
+    run: async () => ({
+      speech,
+      card: { kind: "factcard", title: speech.replace(/^It's /, ""), extract: speech, source: "clock" },
+    }),
+  };
+}
+
+// Broad lookup routing: wh-questions route to Wikipedia (which answers factual
+// questions far more reliably than a 270M model). Small-talk stays protected by
+// validQuery + the stoplist, exactly as in conservative mode.
+const BROAD_LOOKUP_RE = /\b(?:what|who|where)(?:'s| is| are| was| were)\b/i;
+const MEANING_RE = /\bwhat does\s+(.+?)\s+mean\b/i;
+const HOWFAR_RE = /\bhow (?:far|big|tall|old|heavy|deep|long) is\b/i;
+
+function broadLookupQuery(text: string): string {
+  const meaning = text.match(MEANING_RE);
+  if (meaning) return meaning[1].trim();
+  const cleaned = text.trim().replace(/[?.!]+$/, "");
+  // Strip the leading wh-phrase and articles: "What is the Eiffel Tower" →
+  // "Eiffel Tower"; "How far is the moon from Earth" → "moon from Earth".
+  return cleaned
+    .replace(/^(?:what|who|where|how (?:far|big|tall|old|heavy|deep|long))(?:'s| is| are| was| were)?\s+/i, "")
+    .replace(/^(the|a|an)\s+/i, "")
+    .trim();
+}
+
 /**
  * Detect a tool intent on a finalized user turn, or null for a normal reply.
  * Deliberately conservative: casual conversation ("what's up", "how are you")
  * must fall through to the LLM, not trigger a web lookup.
  */
 export function detectTool(text: string): ToolCall | null {
+  const broad = TUNABLES.toolRouting === "broad";
+
+  // Instant deterministic tools first — their patterns are precise (numbers,
+  // explicit clock phrases) so they can't shadow conversation.
+  if (broad) {
+    const instant = detectCalc(text) ?? detectClock(text);
+    if (instant) return instant;
+  }
+
   if (WEATHER_RE.test(text)) {
     // Only when the user named a place; "what's the weather" with no location
     // is better answered (or deflected) by the LLM than by a failed geocode.
-    const query = extractPlace(text);
+    let query = extractPlace(text);
+    if (broad) {
+      // Query cleanup: strip trailing time words so "in Paris right now"
+      // geocodes as "Paris".
+      query = query
+        .replace(/\b(right now|now|today|currently|at the moment|please)\b/gi, "")
+        .trim();
+    }
     if (validQuery(query)) {
       return {
         kind: "weather",
@@ -209,6 +324,7 @@ export function detectTool(text: string): ToolCall | null {
     }
     return null;
   }
+
   if (LOOKUP_RE.test(text)) {
     const query = extractTail(text, LOOKUP_RE);
     if (validQuery(query)) {
@@ -220,5 +336,21 @@ export function detectTool(text: string): ToolCall | null {
       };
     }
   }
+
+  // Broad mode: wh-questions become Wikipedia lookups — factual questions are
+  // the 270M model's weakest axis, and delegation answers them reliably. The
+  // stoplist/validQuery guard keeps small talk ("what's up") with the LLM.
+  if (broad && (BROAD_LOOKUP_RE.test(text) || HOWFAR_RE.test(text) || MEANING_RE.test(text))) {
+    const query = broadLookupQuery(text);
+    if (validQuery(query)) {
+      return {
+        kind: "lookup",
+        query,
+        holding: "Let me look that up.",
+        run: () => runLookup(query),
+      };
+    }
+  }
+
   return null;
 }

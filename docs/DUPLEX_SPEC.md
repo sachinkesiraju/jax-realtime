@@ -3,31 +3,16 @@
 Goal: evolve this app from a turn-based voice assistant into an emulation of
 Thinking Machines' interaction models (https://thinkingmachines.ai/blog/interaction-models/)
 — continuous micro-turn processing, no hard turn boundaries, barge-in
-interruption, backchanneling, time awareness, proactive interjections — all
-in-browser with jax-js. We keep the cascaded pipeline (Whisper → Gemma →
-Pocket TTS) but restructure the harness into a 150–200 ms tick loop.
+interruption, backchanneling, time awareness, proactive interjections, vision,
+concurrent tool use, and simultaneous speech — all in-browser with jax-js. We
+keep the cascaded pipeline (Whisper → Gemma → Pocket TTS) but restructure the
+harness into a 150–200 ms tick loop.
 
-Reference source for all jax-js patterns: a clone of ekzhang/jax-js lives at
-`/private/tmp/claude-501/-Users-sachinkesiraju-Downloads-jax-realtime/ab484e12-d6f3-4126-829e-4773697d2671/scratchpad/jax-js`
-(especially `website/src/routes/{whisper,chat,tts,mobileclip}` and
-`src/backend/wasm/parallel.ts`).
+---
 
-## Current state (all working, verified end to end)
+# Part I — Full-duplex core (built)
 
-- `src/pipeline.ts` — SpeechRecognizer (Whisper tiny.en fp16 WebGPU),
-  LocalChatModel (Gemma 3 270M fp16 WebGPU, streaming tokens),
-  SpeechSynthesizer (Pocket TTS fp16 WebGPU, streaming playback),
-  CerebrasChatModel (optional cloud LLM). Weights cached in OPFS.
-- `src/mic.ts` — VoiceCapture: AudioWorklet 16 kHz PCM ring, `level()`,
-  pause/resume by dropping samples (never suspend the AudioContext — Chrome
-  kills MediaStream feeds after suspend/resume).
-- `src/main.ts` — hands-free session: energy VAD, incremental Whisper partials
-  every 1.5 s, orb UI (`src/orb.ts`), transcript bubbles, per-stage metrics.
-- `npx tsc --noEmit` is clean; `npm run dev` on port 5173.
-
-## Architecture changes
-
-### 1. Two compute lanes (critical)
+## 1. Two compute lanes (critical)
 
 ASR moves to the **wasm backend** so Whisper passes run continuously without
 stalling TTS/LLM on WebGPU:
@@ -54,7 +39,7 @@ stalling TTS/LLM on WebGPU:
   with a one-off test that a wasm transcribe pass and a webgpu TTS call can
   run concurrently (Promise.all) without errors.
 
-### 2. Streaming ASR (`src/asr/streaming.ts`, new)
+## 2. Streaming ASR (`src/asr/streaming.ts`)
 
 Class `StreamingTranscriber` wrapping SpeechRecognizer:
 
@@ -73,7 +58,7 @@ Class `StreamingTranscriber` wrapping SpeechRecognizer:
   current TTS text (lowercase, strip punctuation, ≥70 % of words present in
   the TTS line ⇒ treat as echo, not user speech).
 
-### 3. Abortable, streaming TTS
+## 3. Abortable, streaming TTS
 
 - `src/tts/inference.ts` `playTTS`: add `signal?: AbortSignal` in options;
   check `signal.aborted` at the top of each generation step; on abort, stop
@@ -95,7 +80,7 @@ Class `StreamingTranscriber` wrapping SpeechRecognizer:
   hits the GPU. If pre-synthesis is awkward, acceptable fallback: synthesize
   each backchannel live once on first use and cache the PCM then.
 
-### 4. LLM
+## 4. LLM
 
 Keep `LocalChatModel.generate(history, onToken)` but expose the raw token
 stream as an async iterator (`generateStream`) so main.ts can feed the
@@ -105,7 +90,7 @@ answers must be 1–3 short spoken sentences; if the user message ends with
 working (non-streaming is fine there; wrap its full reply as a one-item
 stream).
 
-### 5. Micro-turn engine (`src/duplex.ts`, new — the heart)
+## 5. Micro-turn engine (`src/duplex.ts` — the heart)
 
 A `DuplexSession` class driven by a ~150 ms `setInterval` tick. Mic is
 **always capturing** (never paused, even while the assistant speaks).
@@ -124,9 +109,9 @@ Policy per tick (deterministic, in priority order):
 2. **User turn end**: user was speaking, now silent. Adaptive endpointing:
    silence ≥ 450 ms AND committed text ends in terminal punctuation → end
    turn; otherwise silence ≥ 800 ms → end turn; max utterance 28 s.
-   On end: `finalize()` ASR, push history, start LLM stream → sentence
-   splitter → `speakStream`. Record turn latency (end-of-speech →
-   first TTS audio) for the metrics rail.
+   On end: finalize the user turn (see Part II Feature 1 for the fast path),
+   push history, start LLM stream → sentence splitter → `speakStream`. Record
+   turn latency (end-of-speech → first TTS audio) for the metrics rail.
 3. **Backchannel**: user mid-utterance pause 450–800 ms, utterance ≥ 2 s so
    far, at most one per utterance, assistant not speaking → `playBackchannel()`
    (do NOT treat as a turn end; ASR keeps accumulating the same utterance).
@@ -141,7 +126,7 @@ Policy per tick (deterministic, in priority order):
 Session start/stop stays on the orb click. On stop: abort everything, close
 mic.
 
-### 6. UI (`src/main.ts`, `src/orb.ts`, `src/style.css`)
+## 6. UI (`src/main.ts`, `src/orb.ts`, `src/style.css`)
 
 - Orb shows **both parties at once**: user level drives an outer ring
   (red) while assistant TTS analyser drives the core (lime) — full-duplex
@@ -160,35 +145,217 @@ mic.
   per-stage activity dots that light while each stage is actually computing
   (ASR can be active while Voice is speaking — show that).
 
-### 7. Vision "Eye" stage — stretch goal, implement LAST
+---
 
-Port MobileCLIP from the clone (`website/src/routes/mobileclip`) into
-`src/vision/`. Webcam via getUserMedia video, one frame/second onto WebGPU
-(or wasm if webgpu contended), scored against prompt embeddings:
-"a person slouching", "a person sitting up straight", "a person waving at
-the camera", "an empty chair". If a non-neutral state wins for 3 consecutive
-ticks and the user isn't speaking, proactive line via TTS ("Hey — sit up
-straight!", "Hello! I see you waving.", "Did you leave? I'll wait.").
-Toggle in the dock ("Eye · webcam"), off by default. Camera preview thumb in
-the corner like the TML demos. If time or complexity blows up, skip — do not
-let this break the core.
+# Part II — Closing the gap with the TML demo (roadmap)
 
-## Constraints & gotchas (learned the hard way)
+Build IN THIS ORDER; each is independently shippable.
 
-- NEVER `AudioContext.suspend()` on the capture context (breaks the feed).
-- `playTTS` disposes the model refs passed in — always pass `tree.ref(model)`.
+## Feature 1 — Latency hillclimb (do FIRST; foundational)
+
+Today `endUserTurn` calls `transcriber.finalize()` — a full extra wasm Whisper
+pass (~3.6 s warm) on the whole utterance — before the LLM even starts. That
+pass dominates turn latency. The streaming loop has ALREADY transcribed the
+utterance incrementally; use that.
+
+In `src/asr/streaming.ts`:
+- Add `bestText(): string` returning `(committed + " " + tentative).trim()`.
+
+In `src/duplex.ts` `endUserTurn`:
+- Replace the blocking `finalize()` with: `const text = transcriber.bestText()`.
+  If `text` has ≥ 3 words, use it directly and DO NOT finalize (save the pass).
+  If it's shorter/empty (streaming hadn't caught up), fall back to `finalize()`.
+- Optionally kick a background `finalize()` that, if it returns materially more
+  text than `bestText()` before the LLM has emitted its first token, replaces
+  the user bubble text — but only if trivial to do safely; otherwise skip.
+- Metric: this should drop end-of-speech→first-audio substantially; keep
+  reporting `turnLatencyMs` (already wired to the rail).
+
+Acceptance: warm turn latency (end of speech → first assistant audio) should be
+roughly LLM-first-token + TTS-first-audio, with no separate multi-second ASR
+finalize on the critical path. Live captions must still show during speech.
+
+## Feature 2 — Vision "Eye" stage (proactive visual interjections)
+
+Their signature (SLOUCHING, DANGER, ProactiveVideoQA). Port jax-js's **D-FINE**
+object detector (webcam, COCO-80), which runs on jax-js's own backends via
+`@jax-js/onnx` (NOT onnxruntime). Reference:
+`website/src/routes/d-fine/+page.svelte` and `website/src/routes/detr-resnet-50/coco.ts`
+in the clone.
+
+Setup:
+- `npm i @jax-js/onnx onnx-buf` (onnx-buf is a peer of the loader path used by
+  the demo; add whatever the D-FINE page imports).
+- Copy `coco.ts` (COCO_CLASSES) into `src/vision/coco.ts`.
+- Model URL (COCO): `https://huggingface.co/bukuroo/D-FINE-ONNX/resolve/main/dfine_s_obj2coco.onnx`.
+
+`src/vision/detector.ts`:
+- `class ObjectDetector` wrapping `ONNXModel` (see D-FINE page for load + the
+  exact input tensor prep: letterbox resize to the model's expected size,
+  RGB float normalization, NCHW; and output post-processing → boxes, scores,
+  labels; threshold ~0.4). Expose:
+  - `static load(onProgress): Promise<ObjectDetector>` (fetch weights via the
+    existing DownloadManager-style progress) and a `warmup()` (one dummy frame).
+  - `detect(source: HTMLVideoElement | HTMLCanvasElement): Promise<Detection[]>`
+    where `Detection = { label: string; score: number; box: [x,y,w,h] }`
+    (box in source-pixel coords). One detection at a time (guard `isBusy`).
+- Run on webgpu by default (shares the lane; 1 fps is light). If that visibly
+  stalls TTS in the reviewer's tests, allow wasm via a device param.
+
+`src/vision/vision.ts`:
+- `class VisionSession`:
+  - `start()`: `getUserMedia({ video: { facingMode: "user" } })`, attach to an
+    off-DOM (or preview) `<video>`, and loop: every ~1200 ms grab the current
+    frame and run `detector.detect`. Store `latest: Detection[]`.
+  - Derived scene state getters: `personCount`, `personPresent`,
+    `phonePresent` (COCO "cell phone"), and a coarse posture proxy from the
+    largest person's box (e.g. `slouching` when the box top drops and height
+    shrinks vs. a short rolling baseline — best-effort, label it approximate).
+  - `describe(): string` → compact scene string for the LLM, e.g.
+    `"1 person, holding a cell phone"` or `"no one in frame"`.
+  - `stop()`, and expose `latest` + the video element for the preview.
+
+Wire into `DuplexSession` (constructor takes an optional `vision`):
+- Proactive interjections (only when user NOT speaking, assistant NOT speaking,
+  not responding; throttle: one per state-change, ≥8 s cooldown, via the same
+  `speakProactive()` path already used by timers):
+  - person was present ≥3 frames, now absent ≥3 frames → "Did you step away?
+    I'll be here when you're back."
+  - "cell phone" newly appears and persists ≥3 frames → "Phone again? I can
+    wait."
+  - posture `slouching` persists ≥4 frames → "Hey — sit up straight."
+  Keep these as a small rule table; make the lines a const array.
+- Scene grounding for Q&A (ProactiveVideoQA-lite): when a user turn is finalized
+  and vision is on, prepend `[scene: <describe()>]` to that user message
+  (like the `[t+Ns]` tag) so "what do you see?" / "how many people?" work. Do
+  NOT read the tag aloud (system hint already covers bracket tags).
+
+UI (`main.ts`, `style.css`):
+- Add a 4th rail stage card **Eye — D-FINE** with an activity dot; only shows
+  active state when vision is enabled.
+- Webcam preview thumbnail in the console (corner PiP like the TML demos) with
+  optional detection boxes drawn on a canvas overlay.
+- Dock toggle "Eye · webcam" (off by default). Enabling loads+warms the model
+  (progress in the downloads panel), starts VisionSession, and passes it to the
+  active/next DuplexSession. Disabling stops the camera.
+
+Skip rep-*counting* of motion (unreliable); object counting ("how many people")
+is fine and covered by `describe()`.
+
+## Feature 3 — Two-tier architecture + concurrent tool use + generative UI
+
+Their headline (UBER, SEARCH, the real-time + async background model). The fast
+local model stays present and talking while a **background async task** does the
+slow work, then results are woven back + rendered as a generative UI card.
+
+`src/tools/tools.ts`:
+- Intent detection on a finalized user turn (regex/keywords), returning a
+  `ToolCall | null`:
+  - `weather`: /weather|temperature|forecast/ + a location → open-meteo
+    (CORS-open, no key): geocode `https://geocoding-api.open-meteo.com/v1/search?name=<q>&count=1`
+    then `https://api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current=temperature_2m,weather_code,wind_speed_10m`.
+  - `lookup` (web search stand-in): /search|look up|who is|what is|tell me about/
+    + an entity → Wikipedia REST summary (CORS-open):
+    `https://en.wikipedia.org/api/rest_v1/page/summary/<Title>` → title + extract.
+  - (timers already handled by the duplex time-awareness path — leave as is.)
+- Each ToolCall has `{ kind, query, run(): Promise<ToolResult> }` where
+  `ToolResult = { speech: string; card: UiCard }` and `UiCard` is a small tagged
+  union (`weather`, `factcard`, `list`) with plain data for rendering.
+
+Two-tier flow in `DuplexSession`:
+- When a finalized user turn produces a ToolCall, DO NOT run the normal LLM
+  reply path. Instead:
+  1. Immediately speak a holding line via `speakProactive`-style TTS
+     ("Let me look that up.") and emit a **tool-call chip** event (a new
+     callback `onToolCall(kind, query)`), then return the tick loop to
+     listening — the user can still talk / interrupt / be backchanneled while
+     the background task runs (this IS the two-tier "stays present" behavior).
+  2. Run `toolCall.run()` as a background promise (NOT awaited in the tick).
+  3. On resolve: if the user isn't mid-utterance, speak `result.speech` and fire
+     `onToolResult(card)`; push a synthetic assistant history entry
+     (`content: result.speech`) so context stays coherent. If the user is
+     speaking, queue it and deliver at the next silence.
+- Guard against overlap: only one background tool task at a time; if another
+  intent arrives, replace/queue sensibly.
+
+Generative UI (`main.ts`, `style.css`):
+- A "canvas" panel (right of / below the transcript, or a slide-in) that renders
+  the latest `UiCard`:
+  - weather: location, big temp, condition text/emoji, wind.
+  - factcard: title, extract (clamped), "via Wikipedia" source line.
+  - list: title + bullet items.
+- Tool-call chip in the transcript stream (small monospace pill like the TML
+  `web_search` chip) shown while the task runs, resolving to done.
+- A background-activity indicator on the rail (e.g. a "Background" pill that
+  pulses while a tool task runs) to make the two-tier concurrency legible.
+
+Everything CORS-open and keyless so it works out of the box. If a Cerebras key
+is present, you MAY route the final summary phrasing through it, but the tool
+fetch itself must be keyless.
+
+## Feature 4 — Simultaneous speech / streaming response (do LAST; best-effort)
+
+Their ANGER demo: user and model speak concurrently (e.g. live translation).
+True same-stream concurrency is the hardest; our two lanes (ASR wasm, TTS
+webgpu) already run concurrently, and we have a text self-echo filter. Build a
+**"Simultaneous" mode** toggle (off by default):
+
+- When ON, do NOT wait for end-of-turn. As the streaming transcriber COMMITS
+  each new sentence (terminal punct in committed text), immediately process that
+  sentence while the user keeps talking:
+  - Translation sub-mode (a small target-language `<select>`: Spanish/French/
+    German): translate the committed sentence via the LLM
+    (`"Translate to <lang>, output only the translation: <sentence>"`) and speak
+    it. NOTE + document honestly: Kyutai Pocket TTS is English-only, so a
+    non-English translation is spoken with an English voice reading foreign text
+    — the point demonstrated is the *simultaneity* (speak while listening), not
+    TTS quality. Cerebras key (if set) gives much better translations.
+  - The self-echo filter must keep our TTS out of the ASR commit stream; verify
+    the filter also works when languages differ (word-overlap will be low, which
+    is fine — it just won't false-trigger).
+- Concurrency requirement: the ASR streaming loop keeps running and committing
+  new sentences WHILE `speakStream` is playing the previous sentence's
+  translation. Use a queue: committed sentences enqueue; a single consumer
+  translates+speaks them in order on one shared player; the mic never pauses.
+- Barge-in/normal endpointing are disabled in this mode (it's a continuous
+  interpreter cadence). Exiting the mode returns to normal duplex.
+- If multilingual INPUT is needed later, note that `src/asr/model.ts` already
+  has a multilingual Whisper config path; for this pass assume English input →
+  target-language output.
+
+Acceptance: with Simultaneous mode on, speaking several sentences continuously
+produces spoken output for earlier sentences while later ones are still being
+transcribed — ASR (wasm) and TTS (webgpu) demonstrably overlap. Honestly
+document the English-TTS limitation in the README.
+
+---
+
+# Constraints & gotchas (learned the hard way)
+
+- NEVER `AudioContext.suspend()` on the capture context (breaks the mic feed).
+- `playTTS` disposes the model refs it receives — always pass `tree.ref(model)`.
 - jax-js arrays are refcounted: match every `.ref` / `.dispose()`; jit fns
   consume their inputs. Follow the existing patterns exactly.
-- Whisper wasm = fp32 (double weight RAM; tiny.en is 74 MB fp16 → ~150 MB
-  fp32, fine).
-- One transcribe pass at a time per SpeechRecognizer instance (guard flag).
+- Whisper on wasm = fp32 (fp16 is webgpu-only; double weight RAM — tiny.en is
+  74 MB fp16 → ~150 MB fp32, fine).
+- One transcribe pass at a time per SpeechRecognizer instance (guarded by
+  `isBusy`).
 - Keep the Cerebras path compiling and working.
-- `npx tsc --noEmit` must stay clean. `npm run build` must succeed.
-- Do NOT run browser tests; the reviewer will drive Chrome. You may run
-  `npx tsc --noEmit` and `npm run build`.
-- Do not commit; leave the working tree dirty.
+- `npx tsc --noEmit` + `npm run build` must stay green.
+- Do NOT run the browser or commit; the reviewer (Fable) drives Chrome and
+  finishes verification. You may run `npx tsc --noEmit` and `npm run build`.
+  Leave the working tree dirty.
 
-## Acceptance checklist (reviewer will verify in Chrome)
+## New deps
+
+- Part II Feature 2 (vision): `@jax-js/onnx`, `onnx-buf`.
+- No other runtime deps (tools use fetch; UI is hand-rendered).
+
+---
+
+# Acceptance checklists
+
+## Part I — core (reviewer verifies in Chrome)
 
 - [ ] Models load; conversation starts with one orb press; mic stays hot.
 - [ ] Speaking produces live committed/tentative captions (<1.5 s lag).
@@ -204,3 +371,34 @@ let this break the core.
       dots / no audio stutter).
 - [ ] Session ends cleanly on second orb press; models stay loaded; a new
       session works.
+
+## Part II — roadmap features
+
+- Feature 1: warm turn latency ≈ LLM-first-token + TTS-first-audio, no
+  multi-second ASR finalize on the critical path; live captions still show.
+- Feature 2: Eye toggle loads D-FINE; scene state feeds proactive lines and
+  `[scene:]` grounding for "what do you see?"; degrades gracefully with no
+  camera.
+- Feature 3: a tool-triggering turn speaks a holding line, keeps listening
+  while the background task runs, then speaks the result and renders a UiCard;
+  only one background task at a time.
+- Feature 4: Simultaneous mode overlaps ASR (wasm) and TTS (webgpu) across
+  sentences; English-TTS translation caveat documented.
+
+---
+
+# Cross-cutting
+
+- Keep the tagline/README honest: everything runs in-browser on jax-js; call out
+  what's emulated vs. native (cascade vs. TML's single model), and the
+  English-TTS translation caveat.
+- Update README with the new modes and a one-line "how close to TML" table.
+- Reviewer will verify in Chrome with a fake mic + (for vision) may need to
+  point the camera or use a canvas-fed fake video; make vision degrade
+  gracefully if no camera.
+
+## Final report (agent → reviewer)
+
+Per-feature: what you built, deviations + why, files touched, what compiles,
+what you could NOT finish, and the top things for the reviewer to check in
+Chrome (with any device/perf risks, esp. webgpu contention from vision).

@@ -1,12 +1,15 @@
 import { numpy as np, random, tree } from "@jax-js/jax";
 
+import { TUNABLES } from "../tunables";
 import type { AudioPlayer } from "./audio";
 import {
   createFlowLMState,
   createMimiDecodeState,
   type PocketTTS,
   runFlowLMStep,
+  runFlowLMStepFused,
   runMimiDecode,
+  runMimiDecodeFused,
 } from "./pocket-tts";
 
 export interface PlayTTSOptions {
@@ -55,21 +58,36 @@ export async function playTTS(
 
       let stepKey: np.Array;
       [key, stepKey] = random.split(key);
+      // Fuse the steady-state flow-LM decode into one dispatch when enabled.
+      // Step 0 is the prefill (conditioning embeds concatenated), which stays on
+      // the unfused path — mirroring Gemma's fuse-decode-only split.
+      const fuseFlow = TUNABLES.ttsFusedStep && step > 0;
       const {
         latent,
         isEos,
         state: newFlowLMState,
-      } = runFlowLMStep(
-        tree.ref(model.flowLM),
-        flowLMState,
-        stepKey,
-        lastLatent.ref,
-        step === 0 ? embeds.ref : null,
-        flowLMState.kvCacheLen, // same as offset
-        lsdDecodeSteps,
-        temperature,
-        noiseClamp,
-      );
+      } = fuseFlow
+        ? runFlowLMStepFused(
+            tree.ref(model.flowLM),
+            flowLMState,
+            stepKey,
+            lastLatent.ref,
+            flowLMState.kvCacheLen, // same as offset
+            lsdDecodeSteps,
+            temperature,
+            noiseClamp,
+          )
+        : runFlowLMStep(
+            tree.ref(model.flowLM),
+            flowLMState,
+            stepKey,
+            lastLatent.ref,
+            step === 0 ? embeds.ref : null,
+            flowLMState.kvCacheLen, // same as offset
+            lsdDecodeSteps,
+            temperature,
+            noiseClamp,
+          );
       flowLMState = newFlowLMState;
 
       const isEosData = await isEos.data();
@@ -99,11 +117,11 @@ export async function playTTS(
         .mul(model.flowLM.embStd.ref)
         .add(model.flowLM.embMean.ref);
 
-      const [audio, newMimiState] = runMimiDecode(
-        tree.ref(model.mimi),
-        mimiState,
-        mimiInput,
-      );
+      // The Mimi decode fuses both its first-frame prefill and steady-state
+      // decode into one dispatch, so it can gate on the flag alone.
+      const [audio, newMimiState] = TUNABLES.ttsFusedStep
+        ? runMimiDecodeFused(tree.ref(model.mimi), mimiState, mimiInput)
+        : runMimiDecode(tree.ref(model.mimi), mimiState, mimiInput);
       mimiState = newMimiState;
 
       const lastAudioPromise = audioPromise;
