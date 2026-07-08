@@ -44,9 +44,10 @@ repetition on repeated identical input (a test artifact + 270M variance).
 
 Critical path after skip-finalize = endpoint wait (~0.4–0.6 s) + LLM first-token
 (~0.6–0.8 s, Gemma 270M prefill) + TTS first-audio (~0.6–0.8 s). We're ~4–5× off
-TML's 0.40 s; the remaining big lever is **speculative LLM prefill during the
-user's pause** (start Gemma on the stable committed prefix so first-token is
-pre-paid) — not yet implemented (risk of false starts).
+TML's 0.40 s. The obvious lever — **speculative LLM prefill during the user's
+pause** — was built and benched in cycle 2 (below) and *falsified*: on a single
+WebGPU device the speculation contends with the streaming ASR, so it doesn't
+pre-pay first-token and even regresses. The real ceiling is the single GPU.
 
 ### Response quality note
 Gemma 270M is the local ceiling. A too-long/negative system prompt was priming
@@ -94,15 +95,70 @@ structurally, not with knobs:
 2. **Faster commit** — endpoint on a stability signal over tentative text
    rather than waiting for LocalAgreement to promote it to committed.
 
+## Map-reduce campaign — cycle 2 (speculative LLM prefill)
+
+Cycle 1 diagnosed the budget as endpoint-settle + **LLM first-token**, and named
+speculative prefill as the biggest structural lever: start Gemma on the stable
+committed prefix *during the user's pause*, so first-token is pre-paid by the
+time the endpoint fires. Cycle 2 built it (behind `TUNABLES.speculativePrefill`)
+and benched it — a producer/consumer `DeltaStream` lets an in-flight speculation
+be adopted by `respond()` if the finalized turn text matches, else aborted.
+
+**Instrumentation confirmed it works as designed:** on the MAP clip the
+speculation *fired and was adopted on 3 of 4 turns* (~75 %). So the mechanism is
+sound; the question was only whether it pays.
+
+**MAP (n=4 each, `dialogue.wav[0:2.6s]`), turn latency = firstAudio − endOfSpeech:**
+
+| cond | turn lat (med) | endpoint→first-delta (med) | note |
+| --- | --- | --- | --- |
+| baseline (OFF) | **1731 ms** | 435 ms | — |
+| speculative ON (run 1) | 2012 ms | 1054 ms | worse |
+| speculative ON (run 2) | 2425 ms | 756 ms | 3/4 adopted, still worse |
+
+**Verdict — negative result, and the most important design law of the two
+cycles.** Speculative prefill is consistently *slower*, and the tell is
+`endpoint→first-delta` rising from 435 ms to 756–1054 ms. It should have
+*dropped* toward zero if the head start were real (deltas buffered before the
+endpoint). It rose because **ASR and the LLM share the single WebGPU device.**
+Running Gemma prefill during the pause time-slices the GPU with the still-running
+streaming-ASR passes, so:
+1. the speculative generation is GPU-starved — it hasn't produced even its first
+   token by the time the endpoint fires (nothing buffered to adopt), and
+2. stealing GPU from ASR delays committed-text settle, pushing the *endpoint
+   itself* later (endpoint median 749 → 830 ms).
+
+Net: the "overlap" is fictional on a single-GPU pipeline — the two stages
+serialize on the device regardless of how we schedule them. Rejected at MAP (no
+holdout needed; there was no win to confirm). **Code reverted; default stays
+OFF — the whole family is removed, not flag-gated, because it's a proven
+dead-end on this architecture.**
+
+**What this means for the ceiling.** Both cycles now point to the same wall:
+turn latency on jax-realtime is **serialized by the single WebGPU device**, not
+by our policy timers or our scheduling. You cannot make it faster by overlapping
+stages (cycle 2) or shaving endpoint windows (cycle 1). The only levers that can
+actually move it *reduce total GPU work on the critical path*:
+- a smaller / faster LLM, or fewer first-token FLOPs (shorter prompt → cheaper
+  prefill; the dominant first-token cost is Gemma prefill);
+- fewer tokens before first audio (already flushing on the first clause);
+- a faster TTS first-frame.
+TML's 0.40 s almost certainly comes from dedicated per-stage compute (separate
+accelerators) that a single browser GPU context doesn't offer. Our realistic
+floor with a cascade on one WebGPU device is the ~1.3–1.7 s warm turn we already
+have; further wins require a cheaper model, not cleverer scheduling.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
 (ASR is now off the path). So:
 
-1. **Speculative LLM prefill during user speech** — when committed text is stable
-   for ~1 tick and the user is mid-pause, start Gemma prefill on the committed
-   prefix; if the turn then ends with that prefix unchanged, first-token is
-   already paid. Biggest single win; guard against wasted prefill on false ends.
+1. ~~**Speculative LLM prefill during user speech**~~ — *tried and rejected in
+   cycle 2.* It fires and adopts ~75 % of the time but regresses turn latency:
+   the speculation contends with streaming ASR on the single WebGPU device, so
+   first-token isn't pre-paid and the endpoint is pushed later. Removed. The
+   takeaway reorders this list: on one GPU you cannot buy latency by overlapping
+   stages — only by cutting total GPU work (items 3–4).
 2. **TTS first-audio** — Pocket TTS `framesAfterEos`/`lsdDecodeSteps=1` already
    minimal; ensure the first *sentence* is as short as safely possible (the
    sentence splitter already flushes on first terminal punct). Consider emitting
