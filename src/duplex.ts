@@ -25,6 +25,14 @@ import type { VisionSession } from "./vision/vision";
 // Latency-critical knobs (tick, endpoint windows, min speech) live in
 // TUNABLES so the optimization bench can vary them at runtime.
 const START_LEVEL = 0.05; // speech onset / barge-in threshold
+// Phantom-turn guard: Whisper hallucinates text on near-silence ("Thank you."
+// is its most famous), and a single noisy tick above START_LEVEL is enough to
+// latch an "utterance" that then endpoints into a fake turn. Require real
+// voiced evidence — a couple of ticks above the gate and a peak comfortably
+// over it — before a turn is transcribed at all. Signal-based on purpose: no
+// phrase blocklists, so a genuine quiet "thank you" still gets through.
+const MIN_VOICED_TICKS = 2; // ≥ ~300 ms of voiced audio across the utterance
+const MIN_PEAK_LEVEL = 0.07; // must rise clearly above the 0.05 onset gate
 const MAX_UTTERANCE_MS = 28_000;
 const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
 const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
@@ -136,6 +144,9 @@ export class DuplexSession {
   private aboveTicks = 0;
   private aboveBargeTicks = 0; // consecutive ticks above the energy-barge level
   private backchannelUsed = false;
+  // Voiced-evidence accumulators for the phantom-turn guard (see constants).
+  private voicedTicks = 0;
+  private peakLevel = 0;
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -316,6 +327,8 @@ export class DuplexSession {
     if (level > START_LEVEL) {
       if (!this.speechStartAt) this.speechStartAt = now;
       this.silenceStart = 0;
+      this.voicedTicks++;
+      if (level > this.peakLevel) this.peakLevel = level;
     } else if (this.speechStartAt && !this.silenceStart) {
       this.silenceStart = now;
     }
@@ -374,6 +387,19 @@ export class DuplexSession {
   private async endUserTurn(endOfSpeechAt: number): Promise<void> {
     const transcriber = this.transcriber;
     if (!transcriber) return;
+
+    // Phantom-turn guard: without enough voiced evidence this "utterance" was
+    // ambient noise, and transcribing near-silence makes Whisper hallucinate
+    // ("Thank you." etc.). Discard before transcription.
+    if (
+      this.voicedTicks < MIN_VOICED_TICKS ||
+      this.peakLevel < MIN_PEAK_LEVEL
+    ) {
+      this.cb.onEvent("noise · discarded");
+      this.startFreshListening();
+      return;
+    }
+
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
 
@@ -666,6 +692,11 @@ export class DuplexSession {
     this.backchannelUsed = false;
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
+    // The interrupting speech already proved itself (sustained energy above the
+    // barge threshold) — seed the voiced-evidence counters so the phantom-turn
+    // guard can't discard a genuine barge-in utterance.
+    this.voicedTicks = BARGE_ENERGY_TICKS;
+    this.peakLevel = Math.max(this.peakLevel, BARGE_ENERGY_LEVEL);
   }
 
   // --- Time awareness ----------------------------------------------------
@@ -839,6 +870,8 @@ export class DuplexSession {
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     this.backchannelUsed = false;
+    this.voicedTicks = 0;
+    this.peakLevel = 0;
   }
 
   /** Fresh listening window: drop buffered audio and reset ASR commit state. */
