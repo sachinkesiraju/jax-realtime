@@ -11,6 +11,8 @@ import {
 } from "@jax-js/jax";
 import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
 
+import { TUNABLES } from "./tunables";
+
 import {
   decodeTranscriptTokens,
   sampleGreedy,
@@ -404,7 +406,7 @@ export class LocalChatModel implements ChatModel {
     // Kept short so spoken replies stay to a couple of sentences — without a
     // length instruction (which the 270M model echoes) this cap is what keeps
     // it from monologuing.
-    maxNewTokens = 96,
+    maxNewTokens = TUNABLES.llmMaxNewTokens,
   ): AsyncGenerator<string, GenerateStats, void> {
     const promptTokens = [
       this.tokenizer.bosToken,
@@ -461,7 +463,7 @@ export class LocalChatModel implements ChatModel {
   async generate(
     history: ChatMessage[],
     onText: (partial: string) => void,
-    maxNewTokens = 160,
+    maxNewTokens = TUNABLES.llmMaxNewTokens,
   ): Promise<{ text: string; stats: GenerateStats }> {
     let text = "";
     const stream = this.generateStream(history, maxNewTokens);

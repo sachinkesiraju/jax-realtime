@@ -19,13 +19,12 @@ import {
   type ToolKind,
   type UiCard,
 } from "./tools/tools";
+import { TUNABLES, TURN_LOG, type TurnRecord } from "./tunables";
 import type { VisionSession } from "./vision/vision";
 
-const TICK_MS = 150;
+// Latency-critical knobs (tick, endpoint windows, min speech) live in
+// TUNABLES so the optimization bench can vary them at runtime.
 const START_LEVEL = 0.05; // speech onset / barge-in threshold
-const MIN_SPEECH_MS = 350; // ignore sub-blip "utterances"
-const ENDPOINT_PUNCT_MS = 380; // silence to end a turn that ends in . ! ?
-const ENDPOINT_SILENCE_MS = 620; // silence to end a turn otherwise
 const MAX_UTTERANCE_MS = 28_000;
 const BARGE_TICKS = 2; // sustained loud ticks required for the ASR barge path
 const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
@@ -149,6 +148,10 @@ export class DuplexSession {
   private ttsAnalyser: AnalyserNode | null = null;
   private analyserBuffer = new Float32Array(1024);
 
+  // Bench instrumentation: stage marks for the turn currently being answered;
+  // pushed to TURN_LOG when the response ends.
+  private turnMarks: Partial<TurnRecord> = {};
+
   private timers: PendingTimer[] = [];
 
   // Two-tier tool use: one background fetch at a time; resolved speech is queued
@@ -216,10 +219,8 @@ export class DuplexSession {
       (update) => this.onTranscript(update),
       () => (this.isAssistantAudible() ? this.currentTtsText : null),
       {
-        // WebGPU passes are ~250 ms, so refresh captions ~4×/s. Pause while the
-        // assistant is speaking so ASR doesn't steal the GPU from TTS.
-        minPassIntervalMs: 150,
-        maxWindowSec: 28,
+        // Interval/window come from TUNABLES (read live by the loop). Pause
+        // while the assistant is speaking so ASR doesn't steal the GPU from TTS.
         pauseWhile: () => this.isAssistantAudible(),
       },
     );
@@ -229,7 +230,7 @@ export class DuplexSession {
     this.phase = "listening";
     this.sessionStart = performance.now();
     this.resetUtterance();
-    this.tick = setInterval(() => this.onTick(), TICK_MS);
+    this.tick = setInterval(() => this.onTick(), TUNABLES.tickMs);
   }
 
   async stop(): Promise<void> {
@@ -346,10 +347,10 @@ export class DuplexSession {
 
     // 2. User turn end (adaptive endpointing).
     const endByPunct =
-      endsTerminal && trailingSilence >= ENDPOINT_PUNCT_MS;
-    const endBySilence = trailingSilence >= ENDPOINT_SILENCE_MS;
+      endsTerminal && trailingSilence >= TUNABLES.endpointPunctMs;
+    const endBySilence = trailingSilence >= TUNABLES.endpointSilenceMs;
     const endByMax = speechMs >= MAX_UTTERANCE_MS;
-    if (speechMs >= MIN_SPEECH_MS && (endByPunct || endBySilence || endByMax)) {
+    if (speechMs >= TUNABLES.minSpeechMs && (endByPunct || endBySilence || endByMax)) {
       void this.endUserTurn(this.silenceStart || now);
       return;
     }
@@ -376,12 +377,20 @@ export class DuplexSession {
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
 
+    // Bench instrumentation: per-turn stage marks (see tunables.ts).
+    this.turnMarks = {
+      endOfSpeech: endOfSpeechAt,
+      fired: performance.now(),
+      usedBestText: true,
+    };
+
     // Latency hillclimb: the streaming loop has already transcribed this
     // utterance incrementally, so prefer its result and skip the extra
     // multi-second Whisper finalize pass that used to dominate turn latency.
     // Only fall back to finalize() when streaming hasn't caught up (short/empty).
     let text = transcriber.bestText();
     if (displayWordCount(text) < 3) {
+      this.turnMarks.usedBestText = false;
       this.cb.onStageActivity("asr", true);
       try {
         text = await transcriber.finalize();
@@ -391,6 +400,8 @@ export class DuplexSession {
         this.cb.onStageActivity("asr", false);
       }
     }
+    this.turnMarks.transcriptReady = performance.now();
+    this.turnMarks.transcript = text;
     const asrLagMs = performance.now() - endOfSpeechAt;
 
     if (!this.running) return;
@@ -534,6 +545,23 @@ export class DuplexSession {
     }
     this.cb.onAssistantEnd(state.spoken.trim() || state.fullText.trim(), interrupted);
 
+    // Bench instrumentation: complete and log this turn's stage record.
+    if (this.turnMarks.endOfSpeech) {
+      TURN_LOG.push({
+        endOfSpeech: this.turnMarks.endOfSpeech,
+        fired: this.turnMarks.fired ?? 0,
+        transcriptReady: this.turnMarks.transcriptReady ?? 0,
+        usedBestText: this.turnMarks.usedBestText ?? true,
+        firstDelta: this.turnMarks.firstDelta ?? 0,
+        firstSentence: this.turnMarks.firstSentence ?? 0,
+        firstAudio: firstAudioAt,
+        transcript: this.turnMarks.transcript ?? "",
+        reply: finalText,
+        interrupted,
+      });
+      this.turnMarks = {};
+    }
+
     if (interrupted) {
       if (this.bargeAt) {
         this.cb.onMetric({ interruptStopMs: performance.now() - this.bargeAt });
@@ -570,6 +598,7 @@ export class DuplexSession {
         return;
       }
       const delta = result.value;
+      if (!this.turnMarks.firstDelta) this.turnMarks.firstDelta = performance.now();
       buffer += delta;
       state.fullText += delta;
       this.cb.onAssistantPartial(state.fullText);
@@ -614,6 +643,9 @@ export class DuplexSession {
   }
 
   private trackSpoken(state: AssistantState, sentence: string): string {
+    if (!this.turnMarks.firstSentence) {
+      this.turnMarks.firstSentence = performance.now();
+    }
     state.spoken += (state.spoken ? " " : "") + sentence;
     this.currentTtsText = state.spoken;
     return sentence;
@@ -629,7 +661,7 @@ export class DuplexSession {
     // cancellation keeps our own playback out of the buffer), so treat it as a
     // fresh user utterance already in progress — don't clear it.
     this.phase = "listening";
-    this.speechStartAt = now - BARGE_ENERGY_TICKS * TICK_MS;
+    this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
     this.silenceStart = 0;
     this.backchannelUsed = false;
     this.aboveTicks = 0;
@@ -847,7 +879,7 @@ function findSentenceEnd(buffer: string): number {
  * first chunk, to minimize time-to-first-audio on longer opening sentences.
  */
 function findClauseEnd(buffer: string): number {
-  const MIN = 18;
+  const MIN = TUNABLES.firstClauseMinChars;
   for (let i = 0; i < buffer.length - 1; i++) {
     const c = buffer[i];
     const isBreak =

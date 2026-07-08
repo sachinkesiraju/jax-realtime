@@ -5,6 +5,7 @@ import "./style.css";
 
 import { DuplexSession } from "./duplex";
 import { VoiceCapture } from "./mic";
+import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
 import type { ToolKind, UiCard } from "./tools/tools";
 import { ObjectDetector } from "./vision/detector";
@@ -200,6 +201,8 @@ if (import.meta.env.DEV) {
   dev.__getDuplex = () => duplex;
   dev.__vision = () => vision;
   dev.__detector = () => detector;
+  dev.__tunables = TUNABLES;
+  dev.__turnLog = TURN_LOG;
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {

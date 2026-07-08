@@ -5,6 +5,7 @@
 // (self-echo) so barge-in detection only fires on real user speech.
 
 import type { SpeechRecognizer } from "../pipeline";
+import { TUNABLES } from "../tunables";
 
 const SAMPLE_RATE = 16_000;
 
@@ -160,7 +161,8 @@ export class StreamingTranscriber {
   }
 
   private windowSamples(): Float32Array {
-    const maxWindow = (this.opts.maxWindowSec ?? 28) * SAMPLE_RATE;
+    const maxWindow =
+      (this.opts.maxWindowSec ?? TUNABLES.asrMaxWindowSec) * SAMPLE_RATE;
     const samples = this.getSamples();
     return samples.length > maxWindow
       ? samples.subarray(samples.length - maxWindow)
@@ -168,10 +170,11 @@ export class StreamingTranscriber {
   }
 
   private async loop(): Promise<void> {
-    const minInterval = this.opts.minPassIntervalMs ?? 400;
     const minWindow = (this.opts.minWindowSec ?? 0.2) * SAMPLE_RATE;
 
     while (this.active) {
+      // Read per-iteration so the bench can tune it live.
+      const minInterval = this.opts.minPassIntervalMs ?? TUNABLES.asrPassIntervalMs;
       const passStart = performance.now();
       const passGeneration = this.generation;
       const samples = this.windowSamples();

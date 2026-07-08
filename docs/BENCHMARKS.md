@@ -56,6 +56,44 @@ cooler sampling (temp 0.8→0.45). Open-ended prompts still degrade; the honest
 fixes are tool-grounding (weather/Wikipedia return real facts) or the Cerebras
 key for a larger Brain.
 
+## Map-reduce campaign — cycle 1 (timing knobs)
+
+Harness: `src/tunables.ts` (runtime knobs, region-grouped) + per-turn stage
+marks pushed to `TURN_LOG` (endpoint wait / ASR / LLM-first-token / sentence /
+TTS-first-audio). Bench drives a fixed fake-mic clip; medians over K turns.
+
+**Noise calibration** (baseline run twice, n=4, same clip): 1538 vs 1614 ms →
+~76 ms band on turn latency. Deltas under ~150 ms are not signal.
+
+**MAP** (n=4 each, 2.2 s clip that ends in a period):
+
+| cond | turn lat | Δ vs base | endpoint | note |
+| --- | --- | --- | --- | --- |
+| baseline | ~1576 ms | — | ~490 ms | — |
+| E1 endpointPunctMs 380→280 | 1419 | −157 | 443 | ~noise |
+| E2 endpointSilenceMs 620→480 | 1342 | −234 | 455 | borderline |
+| K1 tickMs 150→100 | 1465 | −111 | 451 | noise |
+| A1 asrPassIntervalMs 150→90 | 1212 | −364 | 452 | best on MAP |
+
+**HOLDOUT** (unseen clip, K=6, fused A1+E2): **reversed** — fused median
+2573 ms (n=2 valid) vs baseline 2094 ms; endpoint wait *rose* to ~630–744 ms.
+
+**Verdict — negative result (kept as a design law):** timing-knob tuning is
+not where turn latency lives. The endpoint wait is floored by *committed-text
+settle*, not the timer (cutting the punct/silence windows barely moved it), and
+it's utterance-dependent (clean-punct clip ~450 ms, run-on clip ~750 ms). The
+MAP win for A1 came mostly from the clip ending in a period; it did not
+generalize. **No knob change shipped** — defaults retained.
+
+**Diagnosed budget:** endpoint-settle (~450–750 ms) + LLM first-token
+(~400–600 ms) + sentence/TTS (~200–400 ms). Cycle 2 must attack these
+structurally, not with knobs:
+1. **Speculative LLM prefill during the pause** — start Gemma prefill on the
+   stable committed prefix before the endpoint fires, so first-token is
+   pre-paid. Biggest lever; needs false-start guarding.
+2. **Faster commit** — endpoint on a stability signal over tentative text
+   rather than waiting for LocalAgreement to promote it to committed.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
