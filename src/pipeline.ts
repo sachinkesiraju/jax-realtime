@@ -69,8 +69,12 @@ export type DownloadProgress = {
 
 export type ProgressFn = (progress: DownloadProgress) => void;
 
+// base.en over tiny.en: tiny is the most hallucination-prone Whisper size (it
+// invents "thank you" / repeats on near-silence and garbles fast speech), and
+// base is markedly more accurate for ~+70 MB. On WebGPU a pass is still well
+// under real-time, so captions keep up.
 const WHISPER_CONFIG: WhisperConfig = WHISPER_MODELS.find(
-  (m) => m.id === "tiny.en",
+  (m) => m.id === "base.en",
 )!;
 const ASR_MAX_NEW_TOKENS = 96;
 

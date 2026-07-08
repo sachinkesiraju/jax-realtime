@@ -41,7 +41,11 @@ const GUARD_WINDOW = 480; // 30 ms at 16 kHz
 const GUARD_RMS_FLOOR = 0.02; // absolute floor for a voiced window
 const GUARD_RMS_CEIL = 0.055; // never demand more than soft speech delivers
 const MIN_VOICED_MS = 250; // real speech easily exceeds this; blips don't
-const MIN_PEAK_ABS = 0.04; // near-silence hallucination cutoff
+// Peak amplitude a turn must reach to be real. Raised from 0.04 after idle
+// hallucinations on long sessions: HVAC/fan swells peak ~0.03-0.06 and were
+// clearing the old bar, while real speech peaks 0.2-0.7, so 0.09 rejects
+// ambient with enormous margin on genuine speech.
+const MIN_PEAK_ABS = 0.09;
 
 /**
  * Voiced duration + peak of a PCM buffer (see phantom-turn guard). The voiced

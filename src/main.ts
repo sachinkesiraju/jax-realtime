@@ -90,7 +90,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~610&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~680&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
@@ -538,6 +538,10 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
       },
       onUserTurn(text) {
         el.captions.hidden = true;
+        // A tool card belongs to the exchange that produced it; once a new user
+        // turn starts, that answer is stale — clear it so it doesn't linger.
+        el.canvasPanel.hidden = true;
+        el.canvasPanel.replaceChildren();
         addBubble("user").textContent = text;
       },
       onAssistantStart() {
