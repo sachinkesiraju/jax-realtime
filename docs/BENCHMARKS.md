@@ -364,14 +364,17 @@ bound (ring-capped at 500); calc/convert/clock chips mislabeled "web_search";
 [validator] the convert regex table's ungrouped alternations (`/\bmeters?|m\b/`
 matches "war**m**") — replaced wholesale, see below.
 
-**Design fix (owner call): no more pairwise unit table.** Conversion factors
-are definitional constants (a mile IS 1609.344 m — same class as the WMO code
-table), but the pairwise regex table was the wrong shape: 8 hand-picked pairs,
-O(n²) growth, one latent regex bug. Replaced with a unit LEXICON (alias →
-dimension + SI factor, ~20 units incl. inches/yards/ounces/gallons) and ONE
-generic rule: number + nearest unit after it + any other same-dimension unit.
-Verified: all old cases, new coverage (cm→inches, gallons→liters, °F→°C),
-no false trigger on "I ran 5 miles and it was warm" / "I'm 5 minutes late".
+**Design ruling (owner call): the unit-conversion tool is DELETED.** It went
+pairwise-regex-table → generic lexicon in one day, but the owner's challenge
+held up: conversion factors are stored knowledge — a hand-maintained
+mini-almanac with no principled stopping point (currencies? time zones?), and
+the query class was on the QA set because the eval author put it there
+(eval-driven feature invention — a campaign-2 methodology flaw, recorded).
+The line now drawn: instant tools must be CAPABILITIES (calculator = pure
+arithmetic, clock = device state), never knowledge. Conversion queries fall
+through to Gemma, which will sometimes be wrong — an honest demo of why
+delegation matters rather than a curated illusion. QA scores restated:
+MAP 9/12, holdout 6/8 (conversion items ceded).
 
 **Perf:** the brief's Whisper-fusion premise was STALE — the decoder step is
 already a single fused jit (measured 9.7 ms/token; ASR pass cost is encoder +

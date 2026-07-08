@@ -4,7 +4,7 @@
 // Everything here is CORS-open and keyless so it works out of the box:
 //   - weather → open-meteo (geocode + forecast)
 //   - lookup  → Wikipedia REST summary
-//   - calc / convert / clock → instant, fully offline (TUNABLES.toolRouting
+//   - calc / clock → instant, fully offline (TUNABLES.toolRouting
 //     "broad"; the GPT-Live-style posture of delegating what the tiny local
 //     model can't answer reliably)
 // Each result carries both a spoken line and a plain-data UiCard to render.
@@ -25,7 +25,7 @@ export type UiCard =
 
 export type ToolResult = { speech: string; card: UiCard };
 
-export type ToolKind = "weather" | "lookup" | "calc" | "convert" | "clock";
+export type ToolKind = "weather" | "lookup" | "calc" | "clock";
 
 export interface ToolCall {
   kind: ToolKind;
@@ -238,82 +238,11 @@ function detectCalc(text: string): ToolCall | null {
 }
 
 // Unit conversions: factor to the target unit (linear), plus temperature.
-// Unit lexicon: alias → [dimension, factor to that dimension's SI base,
-// canonical spoken name]. The factors are definitional constants (a mile IS
-// 1609.344 m — same class of data as the WMO weather-code table); the point is
-// that conversion is ONE generic rule over the lexicon, not hand-picked pair
-// cases. Any two units of the same dimension convert via x·f(src)/f(dst).
-// Ambiguous bare aliases ("m" collides with "I'm", "in" is a preposition,
-// bare "g") are deliberately absent — spoken queries use the full word.
-type UnitEntry = [dim: string, toSI: number, name: string];
-const UNIT_LEXICON: Record<string, UnitEntry> = {
-  // length → meters
-  mile: ["len", 1609.344, "miles"], miles: ["len", 1609.344, "miles"],
-  kilometer: ["len", 1000, "kilometers"], kilometers: ["len", 1000, "kilometers"], km: ["len", 1000, "kilometers"],
-  meter: ["len", 1, "meters"], meters: ["len", 1, "meters"],
-  centimeter: ["len", 0.01, "centimeters"], centimeters: ["len", 0.01, "centimeters"], cm: ["len", 0.01, "centimeters"],
-  foot: ["len", 0.3048, "feet"], feet: ["len", 0.3048, "feet"], ft: ["len", 0.3048, "feet"],
-  inch: ["len", 0.0254, "inches"], inches: ["len", 0.0254, "inches"],
-  yard: ["len", 0.9144, "yards"], yards: ["len", 0.9144, "yards"],
-  // mass → kilograms
-  kilogram: ["mass", 1, "kilograms"], kilograms: ["mass", 1, "kilograms"], kg: ["mass", 1, "kilograms"],
-  kilo: ["mass", 1, "kilograms"], kilos: ["mass", 1, "kilograms"],
-  gram: ["mass", 0.001, "grams"], grams: ["mass", 0.001, "grams"],
-  pound: ["mass", 0.453592, "pounds"], pounds: ["mass", 0.453592, "pounds"], lb: ["mass", 0.453592, "pounds"], lbs: ["mass", 0.453592, "pounds"],
-  ounce: ["mass", 0.0283495, "ounces"], ounces: ["mass", 0.0283495, "ounces"],
-  // volume → liters
-  liter: ["vol", 1, "liters"], liters: ["vol", 1, "liters"], litre: ["vol", 1, "liters"], litres: ["vol", 1, "liters"],
-  milliliter: ["vol", 0.001, "milliliters"], milliliters: ["vol", 0.001, "milliliters"], ml: ["vol", 0.001, "milliliters"],
-  gallon: ["vol", 3.78541, "gallons"], gallons: ["vol", 3.78541, "gallons"],
-  // temperature is affine, not linear — handled by TEMP below.
-  celsius: ["temp", 0, "Celsius"], fahrenheit: ["temp", 1, "Fahrenheit"],
-};
-const TEMP: ((x: number) => number)[][] = [
-  [(x) => x, (x) => (x * 9) / 5 + 32], // from C: [to C, to F]
-  [(x) => ((x - 32) * 5) / 9, (x) => x], // from F
-];
-
-/**
- * Generic conversion: a number, the nearest known unit after it (source), and
- * any other same-dimension unit in the utterance (target). Covers "how many
- * kilometers is 26 miles", "convert 30 kg to pounds", "12 feet in meters", …
- */
-function detectConvert(text: string): ToolCall | null {
-  const t = text.toLowerCase().replace(/[?.!]+$/, "");
-  const numMatch = t.match(new RegExp(NUM));
-  if (!numMatch) return null;
-  const x = num(numMatch[1]);
-  const numEnd = t.indexOf(numMatch[1]) + numMatch[1].length;
-
-  // All lexicon hits with positions, as whole words.
-  const hits: { at: number; entry: UnitEntry }[] = [];
-  for (const wordMatch of t.matchAll(/[\p{L}°]+/gu)) {
-    const entry = UNIT_LEXICON[wordMatch[0]];
-    if (entry) hits.push({ at: wordMatch.index, entry });
-  }
-  const src = hits.find((h) => h.at >= numEnd); // nearest unit after the number
-  if (!src) return null;
-  const dst = hits.find(
-    (h) => h.entry[0] === src.entry[0] && h.entry[2] !== src.entry[2],
-  );
-  if (!dst) return null;
-
-  const y =
-    src.entry[0] === "temp"
-      ? TEMP[src.entry[1]][dst.entry[1]](x)
-      : (x * src.entry[1]) / dst.entry[1];
-  if (!Number.isFinite(y)) return null;
-  const speech = `${fmt(x)} ${src.entry[2]} is about ${fmt(y)} ${dst.entry[2]}.`;
-  return {
-    kind: "convert",
-    query: `${fmt(x)} ${src.entry[2]} → ${dst.entry[2]}`,
-    holding: "",
-    run: async () => ({
-      speech,
-      card: { kind: "factcard", title: `${fmt(y)} ${dst.entry[2]}`, extract: speech, source: "converter" },
-    }),
-  };
-}
+// NOTE (owner call): a unit-conversion tool lived here briefly and was deleted.
+// Conversion factors are stored knowledge — a hand-maintained mini-almanac with
+// no principled stopping point (currencies? time zones?) — which is the
+// hardcoding pattern this project rejects. Calculator (pure arithmetic) and
+// clock (device state) are capabilities, not knowledge, so they stay.
 
 const CLOCK_RE =
   /\b(what day is (it|today)|what('s| is) (the date|today's date)|what time is it|what('s| is) the time)\b/i;
@@ -367,7 +296,7 @@ export function detectTool(text: string): ToolCall | null {
   // Instant deterministic tools first — their patterns are precise (numbers,
   // explicit clock phrases) so they can't shadow conversation.
   if (broad) {
-    const instant = detectCalc(text) ?? detectConvert(text) ?? detectClock(text);
+    const instant = detectCalc(text) ?? detectClock(text);
     if (instant) return instant;
   }
 

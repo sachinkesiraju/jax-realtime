@@ -248,8 +248,8 @@ function tick(text: string) {
 function addToolChip(kind: ToolKind, query: string): HTMLDivElement {
   const chip = document.createElement("div");
   chip.className = "tool-chip";
-  // Label the chip by the actual tool: the instant offline tools (calc/convert/
-  // clock) aren't web searches, so don't mislabel them as one.
+  // Label the chip by the actual tool: the instant offline tools (calc/clock)
+  // aren't web searches, so don't mislabel them as one.
   const verb =
     kind === "lookup" ? "web_search" : kind === "weather" ? "weather" : kind;
   const dot = document.createElement("span");
