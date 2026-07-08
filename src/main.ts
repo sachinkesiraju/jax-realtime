@@ -350,6 +350,11 @@ async function handleLoad() {
     // "ready" doesn't stall on the D-FINE download/compile. Must start AFTER
     // loadPipeline: it runs initDevice(), and constructing the ONNX detector
     // before the WebGPU backend is initialized breaks detection silently.
+    // The Eye is on by default, so load + warm D-FINE as part of the loading
+    // screen (it starts here — after loadPipeline's initDevice, or the ONNX
+    // model races the WebGPU backend). Kicked off now so it downloads while the
+    // backchannels synthesize, then awaited before "ready" so the Eye actually
+    // detects the instant the standby screen appears, not seconds later.
     detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
       async (d) => {
         await d.warmup();
@@ -359,6 +364,16 @@ async function handleLoad() {
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    // Await the detector's download + JIT warmup (no camera permission needed,
+    // safe to block on) so it's fully compiled by the time we're ready — the
+    // Eye then detects instantly instead of stalling seconds into the standby
+    // screen. Best-effort: a detector failure must not block the app.
+    setStatus("warming up the eye", "busy");
+    try {
+      detector = await detectorPromise;
+    } catch {
+      detectorPromise = null;
+    }
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
     el.eyeToggle.disabled = false;
@@ -371,9 +386,9 @@ async function handleLoad() {
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
-    // Eye ("webcam") is on by default — enable it after load. toggleVision
-    // fails gracefully (unchecks itself) if there's no camera or permission is
-    // denied, so this never blocks the rest of the app.
+    // Turn the Eye on now (not awaited): the detector is already warm, so once
+    // the camera stream starts it detects on the very first frame. Camera
+    // permission (first visit only) happens here without blocking "ready".
     el.eyeToggle.checked = true;
     void toggleVision(true);
   } catch (error) {
