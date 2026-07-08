@@ -29,6 +29,13 @@ export const TUNABLES = {
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
+
+  // region: onset (campaign A — perceived latency)
+  /** Instant pre-rendered onset played at endpoint to mask the first-token +
+   *  first-frame gap. "off" | "ack" (So,/Right,/Okay,) | "think" (Hmm,/Let's
+   *  see,/One sec,). Shipped default "ack" — cycle-3 map-reduce winner: cuts
+   *  time-to-first-sound from ~1.8s to ~0.45s, holdout-validated. */
+  onsetFiller: "ack" as "off" | "ack" | "think",
 };
 
 export type Tunables = typeof TUNABLES;
@@ -49,6 +56,10 @@ export type TurnRecord = {
   firstSentence: number;
   /** First TTS audio chunk scheduled. */
   firstAudio: number;
+  /** Onset filler playback start (0 if none). Campaign A. */
+  onsetAudio: number;
+  /** Onset filler duration ms (0 if none). Campaign A. */
+  onsetDurMs: number;
   transcript: string;
   reply: string;
   interrupted: boolean;

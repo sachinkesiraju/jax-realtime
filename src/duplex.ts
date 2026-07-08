@@ -143,6 +143,8 @@ export class DuplexSession {
   private proactiveSpeaking = false;
   private currentTtsText: string | null = null;
   private bargeAt = 0;
+  // Campaign A: handle to the in-flight onset filler so barge-in can cut it.
+  private onsetHandle: { stop: () => void; durationMs: number } | null = null;
 
   // TTS analyser for the duplex orb core.
   private ttsAnalyser: AnalyserNode | null = null;
@@ -241,6 +243,8 @@ export class DuplexSession {
       this.tick = null;
     }
     // Abort any in-flight assistant response and wait for teardown.
+    this.onsetHandle?.stop();
+    this.onsetHandle = null;
     this.assistant?.controller.abort();
     if (this.respondPromise) {
       try {
@@ -500,6 +504,18 @@ export class DuplexSession {
     this.assistant = state;
     this.currentTtsText = "";
     this.cb.onAssistantStart();
+
+    // Campaign A: play an instant pre-rendered onset filler to mask the
+    // first-token + first-frame gap while the real reply generates behind it.
+    if (TUNABLES.onsetFiller !== "off") {
+      const handle = this.pipeline.tts.playOnset(TUNABLES.onsetFiller);
+      if (handle) {
+        this.onsetHandle = handle;
+        this.turnMarks.onsetAudio = performance.now();
+        this.turnMarks.onsetDurMs = handle.durationMs;
+        this.cb.onEvent(`· onset (${TUNABLES.onsetFiller})`);
+      }
+    }
     this.cb.onStageActivity("llm", true);
 
     let firstAudioAt = 0;
@@ -519,6 +535,12 @@ export class DuplexSession {
           onAnalyser: (analyser) => {
             this.ttsAnalyser = analyser;
           },
+          // Clean hand-off: cut the onset filler the instant the real reply
+          // audio starts, so they never overlap into double-speak.
+          onFirstAudio: () => {
+            this.onsetHandle?.stop();
+            this.onsetHandle = null;
+          },
         },
       );
       if (stats.firstAudioMs > 0) firstAudioAt = speakStart + stats.firstAudioMs;
@@ -529,6 +551,8 @@ export class DuplexSession {
       this.cb.onStageActivity("tts", false);
       this.ttsAnalyser = null;
       this.currentTtsText = null;
+      // Onset (if any) is short and self-closing; just drop the handle.
+      this.onsetHandle = null;
     }
 
     const interrupted = controller.signal.aborted;
@@ -555,6 +579,8 @@ export class DuplexSession {
         firstDelta: this.turnMarks.firstDelta ?? 0,
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
+        onsetAudio: this.turnMarks.onsetAudio ?? 0,
+        onsetDurMs: this.turnMarks.onsetDurMs ?? 0,
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
         interrupted,
@@ -655,6 +681,8 @@ export class DuplexSession {
 
   private handleBargeIn(now: number): void {
     this.bargeAt = now;
+    this.onsetHandle?.stop();
+    this.onsetHandle = null;
     this.assistant?.controller.abort();
     this.cb.onEvent("barge-in · stopping");
     // The interrupting speech is already being captured & transcribed (echo

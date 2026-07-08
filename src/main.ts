@@ -339,6 +339,7 @@ async function handleLoad() {
     el.backendChip.textContent = pipeline.dualLane ? "WebGPU + Wasm" : "WebGPU";
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    await pipeline.tts.prepareOnsets(el.voiceSelect.value as TTSVoice);
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
     el.eyeToggle.disabled = false;
@@ -367,6 +368,9 @@ el.voiceSelect.addEventListener("change", () => {
   // Re-synthesize backchannel clips in the new voice (background, best-effort).
   void pipeline?.tts
     .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+    .catch(() => {});
+  void pipeline?.tts
+    .prepareOnsets(el.voiceSelect.value as TTSVoice)
     .catch(() => {});
 });
 

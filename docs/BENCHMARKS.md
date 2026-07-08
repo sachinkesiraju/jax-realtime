@@ -148,6 +148,70 @@ accelerators) that a single browser GPU context doesn't offer. Our realistic
 floor with a cascade on one WebGPU device is the ~1.3–1.7 s warm turn we already
 have; further wins require a cheaper model, not cleverer scheduling.
 
+## Map-reduce campaign — cycle 3 (perceived latency + endpointing)
+
+After two negative cycles established that turn latency is serialized by the
+single WebGPU device, cycle 3 split into two campaigns aimed at the two things
+that *can* still move: **hide** the gap we can't lower (A), and shave the one fat
+budget that isn't GPU-bound — the endpoint wait (B). New instrumentation:
+`onsetAudio`/`onsetDurMs` on `TurnRecord` → time-to-first-sound and the
+filler→reply gap; a synthetic mid-pause clip (0.5 s inserted silence) for the
+false-cut cost guard.
+
+### Campaign A — onset fillers (SHIPPED)
+Pre-render short lead-ins ("So,"/"Right,"/"Okay,") to PCM at load (zero runtime
+GPU, like the backchannels) and play one instantly at endpoint while the real
+reply generates behind it.
+
+**MAP (4 turns each, `dialogue.wav[0:2.6s]`), time-to-first-sound = first audible
+sound − endOfSpeech:**
+
+| cond | first-sound (med) | real reply (turnLat) | note |
+| --- | --- | --- | --- |
+| baseline (off) | ~1.3–1.8 s | ~1.3–1.8 s | silence until the reply |
+| onset "ack" | **~0.46 s** | ~1.3–1.8 s | reply unchanged |
+| onset "think" | ~0.45 s | ~1.7–2.5 s | same first-sound; phrase is a quality choice, not latency |
+
+**HOLDOUT (`dialogue.wav[2.6:5.2s]`, unseen):** first-sound ~0.45–0.75 s — the
+win holds. **Result: ~1.3 s / ~70 % cut in perceived latency**, real reply
+untouched. Shipped default `onsetFiller: "ack"`.
+
+Two defects the data caught and fixed before shipping:
+1. *Overlap* — onset ran into the reply (negative gap → double-speak). Fixed
+   with an `onFirstAudio` hand-off that cuts the onset the instant real audio
+   starts.
+2. *Bloated clip* — the TTS pads short prompts, so a raw onset was ~2.5 s of
+   near-silence around a tiny word (first-sound looked fast but the audible word
+   was delayed). Fixed by trimming silence + a 0.6 s hard cap → onset is a
+   punchy ~0.2 s clip that's heard immediately.
+
+### Campaign B — earlier endpointing (REJECTED)
+Two candidate modes vs the committed-text baseline: `tentativePunct` (fire on
+terminal punct in the *tentative* tail) and `tentativeStable` (fire when the full
+hypothesis is unchanged for 2 ticks + `endpointPunctMs` silence).
+
+| cond | endpoint (med) | false-cuts (pause clip, 3×) |
+| --- | --- | --- |
+| committed (baseline) | ~452–460 ms | 0 |
+| tentativePunct | ~456 ms | — |
+| tentativeStable | ~451–453 ms | 0 |
+
+**Verdict — no candidate beat baseline.** On clean utterances the committed
+path already fires at ~450 ms (the ASR commits the period fast enough), so the
+tentative modes have no headroom — endpoint moved <10 ms, deep inside noise.
+tentativeStable didn't false-cut on the 0.5 s-pause clip, but it also bought
+nothing, and pushing the silence floor down only trades UX safety for a
+non-existent gain. This re-confirms cycle 1's law: **endpoint is settle-bound and
+already near its safe floor.** Code removed (net diff is docs only for B); the
+negative result is recorded here so the family isn't retried.
+
+**FUSE:** A and B touch disjoint regions, but B has no winner — fusion is just A.
+
+**Net cycle 3: first shippable win of the whole latency effort** — perceived
+turn latency ~1.8 s → ~0.46 s via onset masking, holdout-validated, real reply
+unchanged. The actual GPU floor is untouched (as the diagnosis said it must be);
+what changed is that the user now hears the assistant ~1.3 s sooner.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
@@ -159,10 +223,11 @@ Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
    first-token isn't pre-paid and the endpoint is pushed later. Removed. The
    takeaway reorders this list: on one GPU you cannot buy latency by overlapping
    stages — only by cutting total GPU work (items 3–4).
-2. **TTS first-audio** — Pocket TTS `framesAfterEos`/`lsdDecodeSteps=1` already
-   minimal; ensure the first *sentence* is as short as safely possible (the
-   sentence splitter already flushes on first terminal punct). Consider emitting
-   TTS on the first *clause* (comma) for very long first sentences.
+2. **Perceived first-audio** — *shipped in cycle 3.* Real first-audio is
+   GPU-floored, so instead we mask it: an instant pre-rendered onset filler at
+   endpoint drops time-to-first-sound ~1.8 s → ~0.46 s. Real TTS first-audio
+   itself (`framesAfterEos`/`lsdDecodeSteps=1`) is already minimal; the first
+   clause already flushes on a comma.
 3. **Shorter replies** — cap first-sentence tokens; the SYSTEM_HINT already asks
    for 1–3 short sentences. A tighter "lead with one short sentence" nudge lowers
    time-to-first-audio variance.
