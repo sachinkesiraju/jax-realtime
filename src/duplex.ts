@@ -627,7 +627,20 @@ export class DuplexSession {
     // Two-tier path: a tool intent runs as a background task while the fast
     // model stays present. Only one background task at a time; if one is
     // already running, fall through to a normal reply.
-    const tool = this.backgroundTask ? null : detectTool(text);
+    let tool = this.backgroundTask ? null : detectTool(text);
+    // Eye-as-oracle for lookups: when the lookup subject names something the
+    // camera can currently see ("what is the person doing"), the turn is about
+    // the scene, not the web — drop the tool so the scene-grounded LLM answers.
+    // (Direct "tell me about the person" turns never reach here; matchesQuestion
+    // answers them from measurements above.)
+    if (
+      tool?.kind === "lookup" &&
+      this.vision?.active &&
+      this.vision.seesSubject(tool.query)
+    ) {
+      this.cb.onEvent("eye · lookup subject is in frame, answering from scene");
+      tool = null;
+    }
     if (tool) {
       this.startToolTask(tool);
       return;

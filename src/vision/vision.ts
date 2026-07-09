@@ -34,6 +34,12 @@ const STABILITY_FRAMES = 3;
 // Min score for a person box to COUNT toward the announced number (the overlay
 // still draws everything above the detector's own display threshold).
 const PERSON_COUNT_MIN_SCORE = 0.6;
+// "Tell me about / describe X" phrasing. When X names something the eye can
+// currently see, the eye — not a web lookup — is the authority on it, so the
+// turn is answered from measurements. Before this, "tell me about the person"
+// matched the lookup tool's trigger and web-searched "the person".
+const DESCRIBE_RE =
+  /\b(tell me (?:more )?about|describe|what about|who(?:'s| is| are))\b/i;
 
 export type SceneState = {
   personCount: number;
@@ -192,16 +198,27 @@ export class VisionSession {
     }
   }
 
-  /** Find the stable detection a colour/appearance question refers to. */
+  /** Find the stable detection a colour/appearance/describe question refers to. */
   private targetObject(text: string): Detection | null {
+    // Word-boundary matching (not substring) so a "tie" detection can't fire
+    // inside "patience"; "people" normalizes to the COCO label "person". COCO
+    // labels are plain words, so no regex escaping is needed.
+    const s = text.toLowerCase().replace(/\bpeople\b/g, "person");
     const stable = this.stableDetections();
     let best: Detection | null = null;
     for (const d of stable) {
-      if (text.includes(d.label) || text.includes(d.label.split(" ").pop()!)) {
+      const last = d.label.split(" ").pop()!;
+      const re = new RegExp(`\\b(?:${d.label}|${last})(?:e?s)?\\b`);
+      if (re.test(s)) {
         if (!best || d.box[2] * d.box[3] > best.box[2] * best.box[3]) best = d;
       }
     }
     return best;
+  }
+
+  /** True when the text names something the eye can currently see. */
+  seesSubject(text: string): boolean {
+    return this.targetObject(text) !== null;
   }
 
   /**
@@ -313,7 +330,10 @@ export class VisionSession {
       /\bhow many (people|persons|faces|chairs|things|objects)\b/.test(s) ||
       /\bwhat colou?r\b/.test(s) ||
       /\b(am i|are we)\b.*\bwearing\b/.test(s) ||
-      /\bwhat am i wearing\b/.test(s)
+      /\bwhat am i wearing\b/.test(s) ||
+      // "Tell me about the person / describe the couch" — describing something
+      // in frame is the eye's job, not Wikipedia's.
+      (DESCRIBE_RE.test(s) && this.targetObject(s) !== null)
     );
   }
 
@@ -324,9 +344,16 @@ export class VisionSession {
    * itself, rather than us templating a reply.
    */
   referencesVision(text: string): boolean {
-    return /\b(see|seeing|look|looking|camera|webcam|frame|view|room|background|surroundings|around me|behind me|in front of me|wearing|holding|doing|on my phone)\b/i.test(
-      text,
-    );
+    if (
+      /\b(see|seeing|look|looking|camera|webcam|frame|view|room|background|surroundings|around me|behind me|in front of me|wearing|holding|doing|on my phone)\b/i.test(
+        text,
+      )
+    ) {
+      return true;
+    }
+    // Naming something the eye can currently see ("is the couch big?") makes
+    // the turn visual even without a see/look verb.
+    return this.targetObject(text) !== null;
   }
 
   /** Answer a precise factual visual question directly from measurements. */
@@ -352,6 +379,13 @@ export class VisionSession {
       }
     }
 
+    // Describe something in frame ("tell me about the person", "describe the
+    // couch") — measurements only: count, rough distance, sampled colour.
+    if (DESCRIBE_RE.test(s)) {
+      const target = this.targetObject(s);
+      if (target) return this.describeTarget(target);
+    }
+
     // Count of people.
     if (/\bhow many\b/.test(s) && /\b(people|person|face|faces)\b/.test(s)) {
       const n = this.personCount;
@@ -364,6 +398,35 @@ export class VisionSession {
     const facts = this.sceneFacts();
     if (!facts) return "I can't make out anything specific in the frame right now.";
     return `I can see ${facts}.`;
+  }
+
+  /**
+   * Measurement-grounded description of one in-frame object: person count, a
+   * rough distance from the box's frame fraction, and the sampled colour —
+   * hedged, never invented. Left/right is deliberately omitted: the preview is
+   * mirrored (style.css scaleX(-1)) while boxes are in raw video coordinates,
+   * so a spoken "on the left" would contradict what the user sees on screen.
+   * The closing line states the detector's ceiling honestly instead of letting
+   * the reply trail off as if more detail were withheld.
+   */
+  private describeTarget(d: Detection): string {
+    const vw = this.video.videoWidth;
+    const vh = this.video.videoHeight;
+    const frac = vw && vh ? (d.box[2] * d.box[3]) / (vw * vh) : 0;
+    const distance =
+      frac > 0.3 ? "close to the camera" : frac > 0.08 ? "a bit further back" : "off in the background";
+    const ceiling = "That's about all the detail my eye picks out.";
+    if (d.label === "person") {
+      const n = this.personCount;
+      const dress = d.color ? `, wearing something ${d.color}` : "";
+      if (n > 1) {
+        return `I can see ${numWord(n)} people; the nearest is ${distance}${dress}. ${ceiling}`;
+      }
+      return `I can see one person ${distance}${dress}. ${ceiling}`;
+    }
+    const colour = d.color ? ` — it looks ${d.color}` : "";
+    const article = /^[aeiou]/.test(d.label) ? "an" : "a";
+    return `I can see ${article} ${d.label} ${distance}${colour}. ${ceiling}`;
   }
 
   // --- Detection loop -----------------------------------------------------
