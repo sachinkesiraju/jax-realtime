@@ -37,39 +37,36 @@ const START_LEVEL = 0.05; // speech onset / barge-in threshold
 // amplitude. Deterministic, no sampling artifacts. Sub-threshold "utterances"
 // are discarded before Whisper ever sees them; anything loud-but-short that
 // slips through still hits the empty-transcript discard after transcription.
-const GUARD_WINDOW = 480; // 30 ms at 16 kHz
+const GUARD_WINDOW = 160; // 10 ms at 16 kHz (fine enough to resolve a keystroke)
 const GUARD_RMS_FLOOR = 0.02; // absolute floor for a voiced window
 const GUARD_RMS_CEIL = 0.055; // never demand more than soft speech delivers
-// 150 ms, not 250: a one-syllable word ("what?") clears ~150 ms of voiced
-// audio, and the peak floor + adaptive noise floor are what actually reject
-// ambient (a swell fails the peak test regardless of length), so the duration
-// bar can be short enough to admit snappy replies.
-const MIN_VOICED_MS = 150;
-// Peak amplitude a turn must reach to be real. Raised from 0.04 after idle
-// hallucinations on long sessions: HVAC/fan swells peak ~0.03-0.06 and were
-// clearing the old bar, while real speech peaks 0.2-0.7, so 0.09 rejects
-// ambient with enormous margin on genuine speech.
+// The core discriminator is SUSTAIN, not loudness or total energy. A spoken
+// word carries a continuous voiced run (the vowel) of ~100 ms+; a keystroke is
+// a ~5-30 ms transient, and typing is a train of such transients separated by
+// gaps — so its LONGEST run of consecutive voiced windows stays short even
+// though individual clicks are loud and the total voiced time can add up.
+// Requiring a minimum contiguous run rejects keyboard noise (which was being
+// transcribed into invented conversations) while still admitting a snappy
+// one-word reply. 80 ms sits in the wide gap between typing (~10-40 ms runs)
+// and the shortest real word (~120-300 ms).
+const MIN_VOICED_RUN_MS = 80;
+// Peak amplitude a turn must reach to be real (ambient/HVAC swells peak
+// ~0.03-0.06; real speech 0.2-0.7). A loud-but-transient click clears this, so
+// peak alone can't gate it — the run length does.
 const MIN_PEAK_ABS = 0.09;
-// A peak this high is unambiguously speech (ambient/HVAC swells top out ~0.06),
-// so an utterance reaching it is real even if it's too short to clear the
-// voiced-duration bar — this is what lets one-word replies ("what?", "no")
-// through the phantom guard.
-const STRONG_PEAK_ABS = 0.2;
 
 /**
- * Voiced duration + peak of a PCM buffer (see phantom-turn guard). The voiced
- * threshold is ADAPTIVE: real mics with auto-gain boost quiet rooms until the
- * ambient tone itself sits near/above any fixed floor, so a fixed threshold
- * counts room tone as speech and the phantom turns come back. Speech clears
- * the room tone by a large ratio regardless of gain, so the threshold is ~3×
- * the buffer's 20th-percentile window RMS (an ambient estimate — the buffer
- * starts at listening-start, so it holds pre-speech ambient), clamped between
- * the absolute floor and a soft-speech ceiling. The 2× ratio is measured, not
- * guessed: through the real capture path, room tone reads ~0.014 RMS while
- * soft speech windows read 0.02-0.077 — 3× starved soft speech (~300 ms
- * qualifying), 2× passes ~900 ms of it while tone and blips still fail.
+ * Peak amplitude and the LONGEST contiguous voiced run of a PCM buffer (see
+ * phantom-turn guard). The voiced threshold is ADAPTIVE: real mics with
+ * auto-gain boost quiet rooms until the ambient tone sits near any fixed floor,
+ * so a fixed threshold counts room tone as speech. Speech clears the room tone
+ * by a large ratio regardless of gain, so the threshold is 2× the buffer's
+ * 20th-percentile window RMS (an ambient estimate — the buffer starts at
+ * listening-start, so it holds pre-speech ambient), clamped to a floor/ceiling.
+ * The longest run of consecutive above-threshold windows is what separates
+ * sustained speech from staccato keyboard transients.
  */
-function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } {
+function voicedStats(samples: Float32Array): { maxRunMs: number; peak: number } {
   const windowRms: number[] = [];
   let peak = 0;
   for (let start = 0; start + GUARD_WINDOW <= samples.length; start += GUARD_WINDOW) {
@@ -88,8 +85,18 @@ function voicedStats(samples: Float32Array): { voicedMs: number; peak: number } 
     GUARD_RMS_CEIL,
     Math.max(GUARD_RMS_FLOOR, ambient * 2),
   );
-  const voiced = windowRms.filter((r) => r > threshold).length;
-  return { voicedMs: voiced * 30, peak };
+  const windowMs = (GUARD_WINDOW / 16_000) * 1000;
+  let run = 0;
+  let maxRun = 0;
+  for (const rms of windowRms) {
+    if (rms > threshold) {
+      run++;
+      if (run > maxRun) maxRun = run;
+    } else {
+      run = 0;
+    }
+  }
+  return { maxRunMs: maxRun * windowMs, peak };
 }
 const MAX_UTTERANCE_MS = 28_000;
 // Hard cap on how long the engine may stay in "responding". A real reply
@@ -507,15 +514,15 @@ export class DuplexSession {
     // proved itself to the barge detector.
     if (!this.bargeContinuation) {
       const stats = voicedStats(this.capture.samples());
-      // Reject only genuine noise. A too-quiet peak is always ambient. A short
-      // utterance is normally suspect (a blip), BUT a short-and-LOUD one is a
-      // real snappy word — "what?", "no", "stop", "yes" — and must get through,
-      // or the assistant ignores one-word replies. So the duration bar is
-      // waived when the peak is unambiguously speech-level.
-      const clearlyVoiced = stats.peak >= STRONG_PEAK_ABS;
+      // Reject anything that isn't a sustained voiced sound. Too quiet → always
+      // ambient. Too short a contiguous voiced RUN → a transient: a keystroke,
+      // a click, or a train of them from typing (each loud, but none sustained)
+      // — exactly the noise that was getting transcribed into invented convos.
+      // A real word, even a one-syllable "what?", carries a run well past the
+      // bar, so genuine speech (including snappy replies) still passes.
       const tooQuiet = stats.peak < MIN_PEAK_ABS;
-      const tooShort = stats.voicedMs < MIN_VOICED_MS && !clearlyVoiced;
-      if (tooQuiet || tooShort) {
+      const notSustained = stats.maxRunMs < MIN_VOICED_RUN_MS;
+      if (tooQuiet || notSustained) {
         this.cb.onEvent("noise · discarded");
         this.startFreshListening();
         return;
