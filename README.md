@@ -108,7 +108,7 @@ The pipeline stages, from microphone to speaker:
 | --- | --- |
 | `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
 | `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. |
-| `src/llm/gemma.ts` | Gemma 3 forward pass with KV cache, the fused single-dispatch decode step, and int8-embedding dequant-on-load. |
+| `src/llm/gemma.ts` | Gemma 3 with a KV cache for fast decoding. Each token is generated in a single fused GPU dispatch, and the int8 embedding table is unpacked to fp16 as the weights load. |
 | `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. |
 | `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
 | `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |
