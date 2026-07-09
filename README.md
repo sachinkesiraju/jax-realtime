@@ -87,10 +87,19 @@ talk — hands-free: turn ends are detected by silence, your words stream into t
 transcript live, the assistant answers out loud and resumes listening. Press the
 orb again to end.
 
-> The Gemma download prefers a locally-hosted int8-embedding build at
-> `public/weights/gemma-it-q8e.safetensors` (gitignored; regenerate with
-> `scratchpad`-style quantization or host it yourself). Without it, the loader
-> automatically falls back to the fp16 file on Hugging Face.
+> **Smaller Gemma download (optional).** The app prefers a locally-hosted
+> int8-embedding Gemma build at `public/weights/gemma-it-q8e.safetensors`, which
+> cuts its download from 536 MB to 369 MB (dequantized to fp16 at load — runtime
+> is unchanged). The file is too large for git, so download it from the
+> [`weights-v1` release](https://github.com/sachinkesiraju/jax-realtime/releases/tag/weights-v1)
+> into `public/weights/`:
+>
+> ```sh
+> gh release download weights-v1 --pattern gemma-it-q8e.safetensors --dir public/weights
+> ```
+>
+> Without it, the loader automatically falls back to the full fp16 Gemma file on
+> Hugging Face — so this step is purely a download-size optimization.
 
 The orb reacts in real time: it breathes when idle, swells with your voice while
 listening, shimmers while the model thinks, and pulses with the synthesized
