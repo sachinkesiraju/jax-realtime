@@ -116,8 +116,11 @@ pipeline rail and footer.
 - `src/mic.ts` — 16 kHz PCM capture via AudioWorklet. `src/orb.ts` — the
   audio-reactive orb. `src/main.ts` — UI and wiring.
 
-Model inference code is adapted from the demos in the
-[jax-js repository](https://github.com/ekzhang/jax-js/tree/main/website/src/routes)
-by Eric Zhang (MIT licensed).
-
 A project by [Sachin Kesiraju](https://sachinkesiraju.com).
+
+## License
+
+MIT. Model inference code is adapted from the
+[jax-js repository](https://github.com/ekzhang/jax-js/tree/main/website/src/routes)
+by Eric Zhang (MIT licensed); model weights remain under their respective
+licenses.
