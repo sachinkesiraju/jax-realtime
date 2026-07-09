@@ -111,3 +111,22 @@ browser's greedy token ids against HuggingFace `transformers` (now **bit-exact**
 
 Validated in-browser: greedy decoding is token-for-token identical to HF; decode
 ~60 ms/token, turn latency ~1.2–2.8 s — comparable to the Gemma brain.
+
+## Shrinking the download (int8 quantization campaign)
+
+A follow-up map-reduce campaign (16 candidates × 30 eval items, deterministic
+fidelity metrics vs the fp16 baseline) found the shipping scheme:
+
+**`all_int8_perrow`** — per-row symmetric int8 on every 2-D weight (all
+attention/MLP projections + the tied embedding), norms fp16. **723.6 → 363.2 MB
+(50.2%)**, perplexity ratio 1.0067 (+0.7%), teacher-forced argmax agreement
+0.955, worst per-row cosine 0.9967. It is exactly the scheme `dequantizeI8` in
+`src/llm/smollm.ts` already implements, so it shipped with zero loader changes —
+the app fetches the int8 file by default and falls back to fp16.
+
+Notes: free-run greedy agreement reads low (~0.6) for every int8 scheme, but
+that's greedy-cascade divergence from sub-1% logit perturbations, not quality
+loss — perplexity and teacher-forced agreement are the trustworthy signals.
+Sensitivity: embed_tokens and v_proj are the most damaging classes; keeping them
+fp16 (420 MB) lifts agreement to 0.977 if extra margin is ever wanted. Naive
+int4 group-128 is genuinely lossy (ppl ~1.40) and rejected.

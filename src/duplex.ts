@@ -123,8 +123,15 @@ const BARGE_ENERGY_RATIO = 1.8; // user must clear the echo floor by this much
 const BARGE_ENERGY_MIN = 0.05; // absolute floor (level units, min·4 RMS)
 const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
-const BACKCHANNEL_PAUSE_MIN = 450;
-const BACKCHANNEL_PAUSE_MAX = 800;
+// Backchannel pause window. It sits BELOW the earliest endpoint threshold
+// (endpointPunctMs = 380 ms) on purpose: the endpoint checks run first in the
+// tick with early returns, so any window at/above 380 ms is shadowed — a
+// punct-terminal turn endpoints at 380 ms and a plain turn at 620 ms before a
+// [450,800) backchannel could ever fire. Placing it at [250,380) means a genuine
+// mid-utterance pause is acknowledged before either endpoint fires, adding zero
+// turn latency (the block never returns early / touches the endpoint logic).
+const BACKCHANNEL_PAUSE_MIN = 250;
+const BACKCHANNEL_PAUSE_MAX = 380;
 
 const TERMINAL_PUNCT = /[.!?…]\s*$/;
 const TIMER_UNIT = /(\d+)\s*(seconds?|secs?|minutes?|mins?)/i;
@@ -487,9 +494,13 @@ export class DuplexSession {
       return;
     }
 
-    // 3. Backchannel (mid-utterance pause; does not end the turn).
+    // 3. Backchannel (mid-utterance pause; does not end the turn). Only when the
+    //    committed text does NOT look turn-final — a terminal-punct tail means
+    //    the user is finishing, not pausing mid-thought, and that turn is about
+    //    to endpoint anyway.
     if (
       !this.backchannelUsed &&
+      !endsTerminal &&
       speechMs >= BACKCHANNEL_MIN_MS &&
       trailingSilence >= BACKCHANNEL_PAUSE_MIN &&
       trailingSilence < BACKCHANNEL_PAUSE_MAX &&
@@ -601,9 +612,7 @@ export class DuplexSession {
     let content = text;
     if (this.vision?.active && this.vision.referencesVision(text)) {
       const facts = this.vision.sceneFacts();
-      content = facts
-        ? `(Right now through the camera you can see ${facts}. You can't tell colours of clothing or fine detail beyond that.) ${text}`
-        : text;
+      content = facts ? `[scene: ${facts}] ${text}` : text;
       this.cb.onEvent("eye · grounding from the camera");
     }
     this.history.push({ role: "user", content, t: this.elapsed() });

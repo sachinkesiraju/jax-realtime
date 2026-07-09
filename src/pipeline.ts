@@ -494,6 +494,21 @@ export interface ChatModel {
   ): AsyncGenerator<string, GenerateStats, void>;
 }
 
+/**
+ * Cap chat history to the last `TUNABLES.llmMaxHistoryTurns` messages (whole
+ * user/assistant pairs). Shared by both local brains so every backend windows
+ * identically instead of iterating the full transcript each turn.
+ */
+function windowHistory(history: ChatMessage[]): ChatMessage[] {
+  const n = TUNABLES.llmMaxHistoryTurns;
+  if (n <= 0 || history.length <= n) return history;
+  // Keep the last N messages, but never start on an orphaned assistant reply
+  // — drop it so the window always begins on a user turn (whole pairs).
+  let sliced = history.slice(history.length - n);
+  if (sliced[0]?.role === "assistant") sliced = sliced.slice(1);
+  return sliced;
+}
+
 export class LocalChatModel implements ChatModel {
   /** Persistent KV-cache reused across turns when TUNABLES.llmKvReuse is on. */
   private kvState: GemmaState | null = null;
@@ -818,16 +833,6 @@ export class LocalChatModel implements ChatModel {
     };
   }
 
-  private windowHistory(history: ChatMessage[]): ChatMessage[] {
-    const n = TUNABLES.llmMaxHistoryTurns;
-    if (n <= 0 || history.length <= n) return history;
-    // Keep the last N messages, but never start on an orphaned assistant reply
-    // — drop it so the window always begins on a user turn (whole pairs).
-    let sliced = history.slice(history.length - n);
-    if (sliced[0]?.role === "assistant") sliced = sliced.slice(1);
-    return sliced;
-  }
-
   /**
    * Sample the next token from on-device logits, honoring TUNABLES.llmSampler.
    * Both paths consume `logits`; "topk" reads back only 64 candidates instead
@@ -948,7 +953,7 @@ export class LocalChatModel implements ChatModel {
     // the local prompt is just the raw conversation (the SYSTEM_HINT is used
     // only by the larger Cerebras model). A [scene: …] tag, when present, is
     // already baked into the message content by the duplex layer.
-    history = this.windowHistory(history);
+    history = windowHistory(history);
     let text = "";
     for (const message of history) {
       const content = message.content.trim();
@@ -1077,6 +1082,9 @@ export class LocalChatModel implements ChatModel {
 const SMOLLM_BASE =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
 const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
+// Per-row symmetric int8 build (363 MB vs 724 MB fp16), dequantized to fp16 at
+// load so runtime is unchanged. Campaign-validated near-lossless (ppl +0.7%).
+const SMOLLM_Q8_URL = `${SMOLLM_BASE}/smollm2-360m-it-q8r.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
 const SMOLLM_REPEAT_PENALTY = 1.3;
 const EMPTY_SET: ReadonlySet<number> = new Set<number>();
@@ -1124,11 +1132,23 @@ export class SmolLmChatModel implements ChatModel {
     );
     const specialIds = new Set(Object.values(spec.special));
 
-    const data = await fetchWithProgress(
-      "SmolLM2 360M weights",
-      SMOLLM_WEIGHTS_URL,
-      onProgress,
-    );
+    let data: Uint8Array<ArrayBuffer>;
+    try {
+      data = await fetchWithProgress(
+        "SmolLM2 360M weights (int8)",
+        SMOLLM_Q8_URL,
+        onProgress,
+      );
+    } catch (err) {
+      // int8 download unreachable — fall back to the full fp16 file so the app
+      // still loads.
+      console.warn("int8 SmolLM download failed, falling back to fp16", err);
+      data = await fetchWithProgress(
+        "SmolLM2 360M weights",
+        SMOLLM_WEIGHTS_URL,
+        onProgress,
+      );
+    }
     const weights = safetensors.parse(data);
     const model = await smolLmFromSafetensors(weights, np.float16);
     return new SmolLmChatModel(model, tokenizer, specialIds);
@@ -1159,7 +1179,7 @@ export class SmolLmChatModel implements ChatModel {
       tokens.push(SMOLLM_IM_START, ...enc(`${role}\n${content}`), SMOLLM_IM_END, ...nl);
     };
     turn("system", SMOLLM_SYSTEM);
-    for (const message of history) {
+    for (const message of windowHistory(history)) {
       const content = message.content.trim();
       if (content === "") continue;
       turn(message.role === "assistant" ? "assistant" : "user", content);

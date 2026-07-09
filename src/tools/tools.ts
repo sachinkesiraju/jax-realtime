@@ -76,6 +76,14 @@ const PRONOUNS = new Set([
   "it", "its", "this", "that", "these", "those",
 ]);
 
+// Deictic time adverbs and place prepositions — closed grammatical classes (like
+// PRONOUNS), stripped from the LEADING edge of an extracted place phrase so
+// "forecast for tomorrow" yields no place (→ the LLM answers) and "tomorrow in
+// Paris" → "Paris". Trailing time words are left to geocodePlace's token-drop
+// backoff, so only the leading edge is handled here.
+const TIME_DEICTICS = new Set(["today", "tomorrow", "tonight", "yesterday", "now"]);
+const PLACE_PREPS = new Set(["in", "at", "for", "around", "near", "on", "by"]);
+
 /** A query is worth a real lookup only if it names something substantive. */
 function validQuery(q: string): boolean {
   const s = q.trim().toLowerCase().replace(/[?.!,]+$/, "");
@@ -112,7 +120,20 @@ function extractTail(text: string, trigger: RegExp): string {
  */
 function extractPlace(text: string): string {
   const m = text.match(/\b(?:in|at|for|around|near)\s+([\p{L}][\p{L}\s.'-]*)/iu);
-  return m ? m[1].replace(/[.?!,;].*$/s, "").trim() : "";
+  if (!m) return "";
+  const phrase = m[1].replace(/[.?!,;].*$/s, "").trim();
+  // Strip leading deictic time words / prepositions (closed classes) so a bare
+  // "for tomorrow" resolves to "" (→ tool doesn't fire) and "tomorrow in Paris"
+  // → "Paris". The geocoder still owns the trailing tail (see geocodePlace).
+  const words = phrase.split(/\s+/).filter(Boolean);
+  while (
+    words.length &&
+    (TIME_DEICTICS.has(words[0].toLowerCase()) ||
+      PLACE_PREPS.has(words[0].toLowerCase()))
+  ) {
+    words.shift();
+  }
+  return words.join(" ");
 }
 
 // Compact WMO weather-code → (text, emoji) map for the current-conditions card.
@@ -165,10 +186,17 @@ async function geocodePlace(
 async function runWeather(query: string): Promise<ToolResult> {
   const place = await geocodePlace(query);
   if (!place) {
-    const speech = `I couldn't find a place called ${query}.`;
+    // Never SPEAK the raw query — ASR often garbles a place name, and reading it
+    // back is worse than asking. The card keeps it so the user sees what we heard.
+    const speech = "Hmm, I couldn't find that place — which city did you mean?";
     return {
       speech,
-      card: { kind: "factcard", title: query, extract: speech, source: "open-meteo" },
+      card: {
+        kind: "factcard",
+        title: query,
+        extract: `I couldn't find a place called ${query}.`,
+        source: "open-meteo",
+      },
     };
   }
   const label = [place.name, place.admin1, place.country_code]
@@ -216,10 +244,17 @@ async function runLookup(query: string): Promise<ToolResult> {
     )}`,
   );
   if (!res.ok) {
-    const speech = `I couldn't find anything about ${query}.`;
+    // Query-free spoken line (the raw query is often ASR-garbled); the card still
+    // shows it so the user can see what was heard and rephrase.
+    const speech = "I couldn't find that one — could you say it a different way?";
     return {
       speech,
-      card: { kind: "factcard", title: query, extract: speech, source: "Wikipedia" },
+      card: {
+        kind: "factcard",
+        title: query,
+        extract: `I couldn't find anything about ${query}.`,
+        source: "Wikipedia",
+      },
     };
   }
   const data = await res.json();
@@ -246,11 +281,15 @@ const fmt = (x: number) =>
 /** Spoken-arithmetic parser: "17 times 23", "15 percent of 80", "144 / 12". */
 function detectCalc(text: string): ToolCall | null {
   const t = text.toLowerCase().replace(/[?.!]+$/, "");
+  // Word operators bind loosely (`\s*`); bare SYMBOL operators (- + / * x) must be
+  // whitespace-separated on BOTH sides (`\s+`) so ranges and dimensions parse as
+  // text, not arithmetic: "3 - 4" is subtraction, but "3-4 people", "3/4",
+  // "1920x1080" are not. (A leading "-" in NUM still lets "3 - -4" mean 3 − (−4).)
   const patterns: [RegExp, (a: number, b: number) => number, string][] = [
-    [new RegExp(`${NUM}\\s*(?:times|multiplied by|x|\\*)\\s*${NUM}`), (a, b) => a * b, "times"],
-    [new RegExp(`${NUM}\\s*(?:divided by|over|/)\\s*${NUM}`), (a, b) => a / b, "divided by"],
-    [new RegExp(`${NUM}\\s*(?:plus|\\+)\\s*${NUM}`), (a, b) => a + b, "plus"],
-    [new RegExp(`${NUM}\\s*(?:minus|-)\\s*${NUM}`), (a, b) => a - b, "minus"],
+    [new RegExp(`${NUM}(?:\\s*(?:times|multiplied by)\\s*|\\s+(?:x|\\*)\\s+)${NUM}`), (a, b) => a * b, "times"],
+    [new RegExp(`${NUM}(?:\\s*(?:divided by|over)\\s*|\\s+/\\s+)${NUM}`), (a, b) => a / b, "divided by"],
+    [new RegExp(`${NUM}(?:\\s*plus\\s*|\\s+\\+\\s+)${NUM}`), (a, b) => a + b, "plus"],
+    [new RegExp(`${NUM}(?:\\s*minus\\s*|\\s+-\\s+)${NUM}`), (a, b) => a - b, "minus"],
     [new RegExp(`${NUM}\\s*(?:percent|%)\\s*of\\s*${NUM}`), (a, b) => (a / 100) * b, "percent of"],
   ];
   for (const [re, op, word] of patterns) {
