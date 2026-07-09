@@ -121,7 +121,7 @@ pipeline rail and footer.
 
 ## License
 
-MIT. Model inference code is adapted from the
+[MIT](LICENSE). Model inference code is adapted from the
 [jax-js repository](https://github.com/ekzhang/jax-js/tree/main/website/src/routes)
 by Eric Zhang (MIT licensed); model weights remain under their respective
 licenses.
