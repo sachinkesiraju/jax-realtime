@@ -88,11 +88,20 @@ function extractTail(text: string, trigger: RegExp): string {
 
 /** Location after an explicit "in/at/for" — weather needs a real place. */
 function extractPlace(text: string): string {
-  const m = text
-    .trim()
-    .replace(/[?.!]+$/, "")
-    .match(/\b(?:in|at|for|around|near)\s+([\p{L}][\p{L}\s.'-]*)$/iu);
-  return m ? m[1].trim() : "";
+  // Not anchored to end-of-string: conversational turns trail the place with
+  // another clause ("weather in New York City. Can you help me?"). Grab the run
+  // after the preposition, cut it at the first sentence boundary, then strip a
+  // trailing filler/clause so "Tokyo right now" or "Paris, please" geocode clean.
+  const m = text.match(/\b(?:in|at|for|around|near)\s+([\p{L}][\p{L}\s.'-]*)/iu);
+  if (!m) return "";
+  let place = m[1].split(/[.?!,;]\s+/)[0].trim();
+  place = place
+    .replace(
+      /\s+(right now|now|today|tonight|tomorrow|currently|please|for me|this (?:week|weekend|morning|afternoon|evening)|can you.*|could you.*|thanks?.*)$/i,
+      "",
+    )
+    .trim();
+  return place;
 }
 
 // Compact WMO weather-code → (text, emoji) map for the current-conditions card.

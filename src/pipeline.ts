@@ -1078,6 +1078,8 @@ const SMOLLM_BASE =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
 const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
+const SMOLLM_REPEAT_PENALTY = 1.3;
+const EMPTY_SET: ReadonlySet<number> = new Set<number>();
 const SMOLLM_IM_START = 1; // <|im_start|>
 const SMOLLM_IM_END = 2; // <|im_end|> — ends the assistant turn
 const SMOLLM_EOS = 0; // <|endoftext|>
@@ -1166,9 +1168,30 @@ export class SmolLmChatModel implements ChatModel {
     return tokens;
   }
 
+  // HF-style repetition penalty over the top-k candidates: divide (or, for
+  // negative logits, multiply) the value of any candidate whose token id is in
+  // `penalize`. Seeded with the previous assistant turn + this turn's output, it
+  // breaks the verbatim-repeat loops a 360M model falls into ("give me a
+  // different joke" → the same joke).
+  private penalize(
+    values: number[],
+    indices: ArrayLike<number>,
+    penalize: ReadonlySet<number>,
+  ): number[] {
+    if (penalize.size === 0) return values;
+    return values.map((v, j) =>
+      penalize.has(indices[j])
+        ? v > 0
+          ? v / SMOLLM_REPEAT_PENALTY
+          : v * SMOLLM_REPEAT_PENALTY
+        : v,
+    );
+  }
+
   private async sampleFromCombined(
     combined: np.Array,
     temperature: number,
+    penalize: ReadonlySet<number> = EMPTY_SET,
   ): Promise<number> {
     const opts = { temperature, topK: SMOLLM_TOPK, topP: 0.95 };
     const packed = (await combined.data()) as ArrayLike<number>; // consumes
@@ -1178,17 +1201,22 @@ export class SmolLmChatModel implements ChatModel {
       values[i] = packed[i];
       indices[i] = packed[SMOLLM_TOPK + i];
     }
-    return sampleTopKPairs(values, indices, opts);
+    return sampleTopKPairs(this.penalize(values, indices, penalize), indices, opts);
   }
 
   private async sampleFromLogits(
     logits: np.Array,
     temperature: number,
+    penalize: ReadonlySet<number> = EMPTY_SET,
   ): Promise<number> {
     const [vals, idx] = lax.topK(logits, SMOLLM_TOPK); // consumes logits
-    const v = (await vals.data()) as ArrayLike<number>;
+    const v = Array.from((await vals.data()) as ArrayLike<number>);
     const ix = (await idx.data()) as ArrayLike<number>;
-    return sampleTopKPairs(v, ix, { temperature, topK: SMOLLM_TOPK, topP: 0.95 });
+    return sampleTopKPairs(this.penalize(v, ix, penalize), ix, {
+      temperature,
+      topK: SMOLLM_TOPK,
+      topP: 0.95,
+    });
   }
 
   private decodeVisible(tokens: number[]): string {
@@ -1202,6 +1230,15 @@ export class SmolLmChatModel implements ChatModel {
     const promptTokens = this.encodePrompt(history);
     const generatedTokens: number[] = [];
     const temperature = 0.7;
+    // Seed the repetition penalty with the previous assistant turn's tokens so a
+    // "say it differently" follow-up can't echo the same reply verbatim; each
+    // freshly generated token is added below.
+    const lastReply = [...history]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    const penalize = new Set<number>(
+      lastReply ? this.tokenizer.encode(lastReply.content) : [],
+    );
     const startTime = performance.now();
     let firstTokenMs = 0;
     let emitted = "";
@@ -1220,12 +1257,13 @@ export class SmolLmChatModel implements ChatModel {
         const sampleable = pending!;
         pending = null;
         const nextToken = pendingIsCombined
-          ? await this.sampleFromCombined(sampleable, temperature)
-          : await this.sampleFromLogits(sampleable, temperature);
+          ? await this.sampleFromCombined(sampleable, temperature, penalize)
+          : await this.sampleFromLogits(sampleable, temperature, penalize);
         if (i === 0) firstTokenMs = performance.now() - startTime;
         if (stopTokens.includes(nextToken)) break;
 
         generatedTokens.push(nextToken);
+        penalize.add(nextToken);
         const full = this.decodeVisible(generatedTokens);
         const delta = full.startsWith(emitted)
           ? full.slice(emitted.length)
