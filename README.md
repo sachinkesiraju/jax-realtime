@@ -116,8 +116,6 @@ pipeline rail and footer.
 - `src/mic.ts` — 16 kHz PCM capture via AudioWorklet. `src/orb.ts` — the
   audio-reactive orb. `src/main.ts` — UI and wiring.
 
-A project by [Sachin Kesiraju](https://sachinkesiraju.com).
-
 ## License
 
 MIT. Model inference code is adapted from the
