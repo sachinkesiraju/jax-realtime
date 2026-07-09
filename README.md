@@ -57,8 +57,8 @@ assistant stops.
 
 The turn-latency floor is set by the single GPU, so the work went into cutting
 GPU cost per token/frame rather than overlapping stages (which a single device
-can't do — see `docs/BENCHMARKS.md` for the full map-reduce campaign log,
-including the negative results):
+can't do — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
+map-reduce campaign log, including the negative results):
 
 - **Fused decode** — the Gemma decode step is fused from ~21 per-layer jit
   dispatches into one, and Pocket TTS from ~11 into two, cutting the
