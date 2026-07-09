@@ -5,7 +5,7 @@ on WebGPU, built with [jax-js](https://github.com/ekzhang/jax-js). Every stage �
 speech → ASR → LLM → TTS → speech, plus optional vision — runs locally in the
 tab; nothing is sent to a server.
 
-![jax-realtime — the idle orb, ready to talk](docs/assets/orb.png)
+<img src="docs/assets/orb.png" alt="jax-realtime — the idle orb, ready to talk" width="50%" />
 
 It's inspired by the Thinking Machines
 [interaction model](https://thinkingmachines.ai/blog/interaction-models/) and
