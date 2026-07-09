@@ -85,10 +85,14 @@ const GEMMA_END_OF_TURN = 106;
 
 const TTS_WEIGHTS_URL =
   "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
-// Locally-hosted Gemma build with the tied embedding table quantized to int8
-// (dequantized to fp16 at load). Served from public/; absent in fresh clones,
-// in which case the loader falls back to the fp16 HF file above.
-const GEMMA_Q8_URL = "/weights/gemma-it-q8e.safetensors";
+// Gemma build with the tied embedding table quantized to int8 (dequantized to
+// fp16 at load, so runtime is unchanged). This is the default download: 369 MB
+// vs. 536 MB for the fp16 file. GEMMA_Q8_LOCAL is checked first so a build that
+// vendors the file under public/weights/ serves it without a network hop; the
+// HF-hosted copy is the fresh-clone default; the fp16 file is the last resort.
+const GEMMA_Q8_LOCAL = "/weights/gemma-it-q8e.safetensors";
+const GEMMA_Q8_URL =
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/gemma-it-q8e.safetensors";
 const TTS_HF_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
 
@@ -500,23 +504,35 @@ export class LocalChatModel implements ChatModel {
       onProgress,
     );
     const tokenizer = tokenizers.SentencePiece.fromBinary(tokData);
-    // Prefer the locally-hosted int8-embedding build (536 → 369 MB download;
-    // dequantized to fp16 at load, so runtime is unchanged). Fall back to the
-    // fp16 HF file when it isn't hosted. The HEAD probe guards against the dev
-    // server's SPA fallback answering 200 with index.html for a missing file.
-    let weightsUrl = `${GEMMA_BASE}/model-it-fp16.safetensors`;
-    let weightsLabel = "Gemma 3 270M weights";
+    // Default to the int8-embedding build (536 → 369 MB download; dequantized
+    // to fp16 at load, so runtime is unchanged). Prefer a locally-vendored copy
+    // under public/weights/, else the HF-hosted default, else the fp16 file.
+    // The local HEAD probe guards against the dev server's SPA fallback
+    // answering 200 with index.html for a missing file (hence the size gate).
+    let weightsUrl = GEMMA_Q8_URL;
+    let weightsLabel = "Gemma 3 270M weights (int8 embed)";
     try {
-      const head = await fetch(GEMMA_Q8_URL, { method: "HEAD" });
+      const head = await fetch(GEMMA_Q8_LOCAL, { method: "HEAD" });
       const size = Number(head.headers.get("content-length") ?? 0);
       if (head.ok && size > 100_000_000) {
-        weightsUrl = GEMMA_Q8_URL;
-        weightsLabel = "Gemma 3 270M weights (int8 embed)";
+        weightsUrl = GEMMA_Q8_LOCAL;
       }
     } catch {
-      // No local quantized build; use the fp16 original.
+      // No locally-vendored build; use the HF-hosted int8 default.
     }
-    const data = await fetchWithProgress(weightsLabel, weightsUrl, onProgress);
+    let data: Uint8Array<ArrayBuffer>;
+    try {
+      data = await fetchWithProgress(weightsLabel, weightsUrl, onProgress);
+    } catch (err) {
+      // int8 download unreachable — fall back to the full fp16 file so the app
+      // still loads.
+      console.warn("int8 Gemma download failed, falling back to fp16", err);
+      data = await fetchWithProgress(
+        "Gemma 3 270M weights",
+        `${GEMMA_BASE}/model-it-fp16.safetensors`,
+        onProgress,
+      );
+    }
     const weights = safetensors.parse(data);
     const model = await gemmaFromSafetensors(weights, np.float16);
     return new LocalChatModel(model, tokenizer);

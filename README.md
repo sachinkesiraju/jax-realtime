@@ -57,8 +57,8 @@ assistant stops.
 
 The turn-latency floor is set by the single GPU, so the work went into cutting
 GPU cost per token/frame rather than overlapping stages (which a single device
-can't do — see `docs/BENCHMARKS.md` for the full map-reduce campaign log,
-including the negative results):
+can't do — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
+map-reduce campaign log, including the negative results):
 
 - **Fused decode** — the Gemma decode step is fused from ~21 per-layer jit
   dispatches into one, and Pocket TTS from ~11 into two, cutting the
@@ -87,10 +87,13 @@ talk — hands-free: turn ends are detected by silence, your words stream into t
 transcript live, the assistant answers out loud and resumes listening. Press the
 orb again to end.
 
-> The Gemma download prefers a locally-hosted int8-embedding build at
-> `public/weights/gemma-it-q8e.safetensors` (gitignored; regenerate with
-> `scratchpad`-style quantization or host it yourself). Without it, the loader
-> automatically falls back to the fp16 file on Hugging Face.
+> **Smaller Gemma download.** By default the app fetches an int8-embedding Gemma
+> build (369 MB instead of 536 MB; the tied embedding table is dequantized to
+> fp16 at load, so runtime is unchanged) from
+> [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights). If that
+> download is unreachable it falls back to the full fp16 Gemma file
+> automatically — no setup either way. To serve it yourself, drop the file at
+> `public/weights/gemma-it-q8e.safetensors` and the loader uses that copy first.
 
 The orb reacts in real time: it breathes when idle, swells with your voice while
 listening, shimmers while the model thinks, and pulses with the synthesized
@@ -99,25 +102,16 @@ pipeline rail and footer.
 
 ## How it works
 
-- `src/asr/` — Whisper encoder/decoder, log-mel features, greedy timestamp
-  decoding; `streaming.ts` is the LocalAgreement-2 streaming transcriber
-  (committed + tentative text, self-echo filter, `bestText()` for the
-  low-latency turn end).
-- `src/llm/gemma.ts` — Gemma 3 forward pass with KV cache, plus the fused
-  single-dispatch decode step and int8-embedding dequant-on-load.
-- `src/tts/` — Pocket TTS flow-matching LM + Mimi streaming decoder (with the
-  fused per-frame decode) and a streaming `AudioContext` player.
-- `src/pipeline.ts` — loads weights from Hugging Face (cached via OPFS),
-  orchestrates the stages, and holds the model/sampler perf paths.
-- `src/duplex.ts` — the full-duplex micro-turn engine (barge-in, phantom guard,
-  backchannels, endpointing, timers, vision interjections, two-tier tools,
-  session watchdog).
-- `src/vision/` — D-FINE detector on `@jax-js/onnx`, webcam VisionSession, COCO
-  labels, box-dedupe and person-count smoothing.
-- `src/tools/tools.ts` — keyless intent detection + weather / Wikipedia / calc /
-  clock.
-- `src/mic.ts` — 16 kHz PCM capture via AudioWorklet. `src/orb.ts` — the
-  audio-reactive orb. `src/main.ts` — UI and wiring.
+The pipeline stages, from microphone to speaker:
+
+| Path | What's there |
+| --- | --- |
+| `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
+| `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. |
+| `src/llm/gemma.ts` | Gemma 3 with a KV cache for fast decoding. Each token is generated in a single fused GPU dispatch, and the int8 embedding table is unpacked to fp16 as the weights load. |
+| `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. |
+| `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
+| `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |
 
 ## License
 
