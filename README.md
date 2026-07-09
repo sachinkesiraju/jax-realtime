@@ -1,9 +1,12 @@
 # jax-realtime
 
 A real-time, full-duplex voice assistant that runs **entirely in your browser**
-on WebGPU, built with [jax-js](https://github.com/ekzhang/jax-js). Every stage —
-speech → ASR → LLM → TTS → speech, plus optional vision — runs locally in the
-tab; nothing is sent to a server.
+on WebGPU, built with [jax-js](https://github.com/ekzhang/jax-js).
+
+Every stage — speech → ASR → LLM → TTS → speech, plus optional vision — runs
+locally in the tab; nothing is sent to a server.
+
+<img src="docs/assets/orb.png" alt="jax-realtime — the idle orb, ready to talk" width="75%" />
 
 It's inspired by the Thinking Machines
 [interaction model](https://thinkingmachines.ai/blog/interaction-models/) and
@@ -118,7 +121,7 @@ pipeline rail and footer.
 
 ## License
 
-MIT. Model inference code is adapted from the
+[MIT](LICENSE). Model inference code is adapted from the
 [jax-js repository](https://github.com/ekzhang/jax-js/tree/main/website/src/routes)
 by Eric Zhang (MIT licensed); model weights remain under their respective
 licenses.
