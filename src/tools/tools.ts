@@ -64,11 +64,27 @@ const CONVERSATIONAL = new Set([
   "wrong",
 ]);
 
+// A pronoun as the subject means the query is conversational or refers to
+// context ("tell me about them", "what are you saying") — never a Wikipedia
+// entity. Falls through to the LLM, which has the conversation + scene context.
+const PRONOUNS = new Set([
+  "i", "me", "my", "mine", "myself",
+  "you", "your", "yours", "yourself",
+  "we", "us", "our", "ours",
+  "they", "them", "their", "theirs",
+  "he", "him", "his", "she", "her", "hers",
+  "it", "its", "this", "that", "these", "those",
+]);
+
 /** A query is worth a real lookup only if it names something substantive. */
 function validQuery(q: string): boolean {
   const s = q.trim().toLowerCase().replace(/[?.!,]+$/, "");
   const words = s.split(/\s+/).filter(Boolean);
-  return s.length >= 3 && words.length <= 6 && !CONVERSATIONAL.has(s);
+  if (s.length < 3 || words.length === 0 || words.length > 6) return false;
+  if (CONVERSATIONAL.has(s)) return false;
+  // Reject pronoun-led queries: "them", "you saying", "that thing".
+  if (PRONOUNS.has(words[0])) return false;
+  return true;
 }
 
 /**
@@ -86,22 +102,17 @@ function extractTail(text: string, trigger: RegExp): string {
   return afterTrigger.replace(/^(the|a|an|me|is|are|was|about)\s+/i, "").trim();
 }
 
-/** Location after an explicit "in/at/for" — weather needs a real place. */
+/**
+ * The phrase after an "in/at/near" preposition — the place, plus whatever
+ * conversational tail followed it ("San Francisco instead", "Paris right now").
+ * We deliberately DON'T try to strip the tail with a word list; the geocoder is
+ * the authority on what's a real place, so `geocodePlace` resolves the longest
+ * leading run it recognizes. We only cut at clause punctuation (a structural
+ * boundary, not a keyword) to bound the search.
+ */
 function extractPlace(text: string): string {
-  // Not anchored to end-of-string: conversational turns trail the place with
-  // another clause ("weather in New York City. Can you help me?"). Grab the run
-  // after the preposition, cut it at the first sentence boundary, then strip a
-  // trailing filler/clause so "Tokyo right now" or "Paris, please" geocode clean.
   const m = text.match(/\b(?:in|at|for|around|near)\s+([\p{L}][\p{L}\s.'-]*)/iu);
-  if (!m) return "";
-  let place = m[1].split(/[.?!,;]\s+/)[0].trim();
-  place = place
-    .replace(
-      /\s+(right now|now|today|tonight|tomorrow|currently|please|for me|this (?:week|weekend|morning|afternoon|evening)|can you.*|could you.*|thanks?.*)$/i,
-      "",
-    )
-    .trim();
-  return place;
+  return m ? m[1].replace(/[.?!,;].*$/s, "").trim() : "";
 }
 
 // Compact WMO weather-code → (text, emoji) map for the current-conditions card.
@@ -133,12 +144,26 @@ function wmoDescribe(code: number): [string, string] {
   return WMO[code] ?? ["unknown conditions", "🌡️"];
 }
 
+// Resolve a place by asking the geocoder — the authority on place names —
+// rather than hand-cleaning the query. Try the whole phrase, then drop trailing
+// tokens until it matches, so "San Francisco instead" / "Paris right now" find
+// "San Francisco" / "Paris" without any junk-word list.
+async function geocodePlace(
+  query: string,
+): Promise<{ name: string; admin1?: string; country_code?: string; latitude: number; longitude: number } | null> {
+  const tokens = query.split(/\s+/).filter(Boolean);
+  for (let end = tokens.length; end >= 1; end--) {
+    const name = tokens.slice(0, end).join(" ");
+    const geo = await fetch(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1`,
+    ).then((r) => r.json());
+    if (geo?.results?.[0]) return geo.results[0];
+  }
+  return null;
+}
+
 async function runWeather(query: string): Promise<ToolResult> {
-  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
-    query,
-  )}&count=1`;
-  const geo = await fetch(geoUrl).then((r) => r.json());
-  const place = geo?.results?.[0];
+  const place = await geocodePlace(query);
   if (!place) {
     const speech = `I couldn't find a place called ${query}.`;
     return {
@@ -315,14 +340,9 @@ export function detectTool(text: string): ToolCall | null {
   if (WEATHER_RE.test(text)) {
     // Only when the user named a place; "what's the weather" with no location
     // is better answered (or deflected) by the LLM than by a failed geocode.
-    let query = extractPlace(text);
-    if (broad) {
-      // Query cleanup: strip trailing time words so "in Paris right now"
-      // geocodes as "Paris".
-      query = query
-        .replace(/\b(right now|now|today|currently|at the moment|please)\b/gi, "")
-        .trim();
-    }
+    // The place may carry a conversational tail ("San Francisco instead") —
+    // geocodePlace resolves it, so no query cleanup here.
+    const query = extractPlace(text);
     if (validQuery(query)) {
       return {
         kind: "weather",
