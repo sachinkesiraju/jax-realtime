@@ -45,6 +45,14 @@ import {
   runGemmaStepFused,
   runGemmaStepFusedTopK,
 } from "./llm/gemma";
+import {
+  createSmolLmState,
+  fromSafetensors as smolLmFromSafetensors,
+  runSmolLmPrefill,
+  runSmolLmStepFusedTopK,
+  SMOLLM_TOPK,
+  type SmolLmModel,
+} from "./llm/smollm";
 import { type AudioPlayer, createStreamingPlayer } from "./tts/audio";
 import { playTTS } from "./tts/inference";
 import {
@@ -1062,6 +1070,204 @@ export class LocalChatModel implements ChatModel {
   }
 }
 
+// SmolLM2-360M-Instruct brain. A blind-judged model shootout put it ~+0.9 (of 5)
+// over Gemma 3 270M at essentially the same size, winning every dimension across
+// three runs (see docs/BRAIN.md). Weights (fp16) + a precomputed tiktoken-style
+// tokenizer artifact are hosted on Hugging Face (CORS-open).
+const SMOLLM_BASE =
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
+const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
+const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
+const SMOLLM_IM_START = 1; // <|im_start|>
+const SMOLLM_IM_END = 2; // <|im_end|> — ends the assistant turn
+const SMOLLM_EOS = 0; // <|endoftext|>
+// SmolLM2 honors a system role (Gemma 3 270M didn't). A spoken-format prompt.
+const SMOLLM_SYSTEM =
+  "You are a warm, helpful voice assistant. Answer directly in a natural, " +
+  "spoken style — a sentence or two, no lists, bullet points, or markdown. A " +
+  "[scene: …] tag tells you what the camera sees; never read a bracketed tag " +
+  "aloud.";
+
+type SmolLmTokenizerData = {
+  encoder: Record<string, number>;
+  special: Record<string, number>;
+  pattern: string;
+};
+
+/**
+ * SmolLM2 brain implementing the same ChatModel interface as LocalChatModel, so
+ * the duplex engine is agnostic to which model backs it. Uses the fused
+ * single-dispatch decode + GPU top-k path for parity with the Gemma perf work.
+ */
+export class SmolLmChatModel implements ChatModel {
+  private constructor(
+    private model: SmolLmModel,
+    private tokenizer: tokenizers.BpeEncoding,
+    private specialIds: Set<number>,
+  ) {}
+
+  static async load(onProgress: ProgressFn): Promise<SmolLmChatModel> {
+    const tokData = await fetchWithProgress(
+      "SmolLM tokenizer",
+      SMOLLM_TOKENIZER_URL,
+      onProgress,
+    );
+    const spec = JSON.parse(
+      new TextDecoder().decode(tokData),
+    ) as SmolLmTokenizerData;
+    const tokenizer = new tokenizers.BpeEncoding(
+      new Map(Object.entries(spec.encoder)),
+      spec.special,
+      new RegExp(spec.pattern, "gu"),
+    );
+    const specialIds = new Set(Object.values(spec.special));
+
+    const data = await fetchWithProgress(
+      "SmolLM2 360M weights",
+      SMOLLM_WEIGHTS_URL,
+      onProgress,
+    );
+    const weights = safetensors.parse(data);
+    const model = await smolLmFromSafetensors(weights, np.float16);
+    return new SmolLmChatModel(model, tokenizer, specialIds);
+  }
+
+  async warmup(): Promise<void> {
+    try {
+      const stream = this.generateStream([{ role: "user", content: "Hi" }], 2);
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      for await (const _ of stream) {
+        /* drain */
+      }
+    } catch {
+      // Best-effort; a failure just means the first real turn pays JIT cost.
+    }
+  }
+
+  // ChatML prompt tokens, assembled manually. We can't use
+  // tokenizer.encodeWithSpecialTokens: @jax-js/loaders' BpeEncoding.encode
+  // mis-advances past special tokens (uses RegExpExecArray.length === 1 instead
+  // of the matched string length), re-tokenizing them as ordinary text. Instead
+  // we encode special-token-free segments and splice the known ids in.
+  private encodePrompt(history: ChatMessage[]): number[] {
+    const enc = (s: string) => this.tokenizer.encode(s);
+    const nl = enc("\n");
+    const tokens: number[] = [];
+    const turn = (role: string, content: string) => {
+      tokens.push(SMOLLM_IM_START, ...enc(`${role}\n${content}`), SMOLLM_IM_END, ...nl);
+    };
+    turn("system", SMOLLM_SYSTEM);
+    for (const message of history) {
+      const content = message.content.trim();
+      if (content === "") continue;
+      turn(message.role === "assistant" ? "assistant" : "user", content);
+    }
+    tokens.push(SMOLLM_IM_START, ...enc("assistant\n"));
+    return tokens;
+  }
+
+  private async sampleFromCombined(
+    combined: np.Array,
+    temperature: number,
+  ): Promise<number> {
+    const opts = { temperature, topK: SMOLLM_TOPK, topP: 0.95 };
+    const packed = (await combined.data()) as ArrayLike<number>; // consumes
+    const values = new Array(SMOLLM_TOPK);
+    const indices = new Array(SMOLLM_TOPK);
+    for (let i = 0; i < SMOLLM_TOPK; i++) {
+      values[i] = packed[i];
+      indices[i] = packed[SMOLLM_TOPK + i];
+    }
+    return sampleTopKPairs(values, indices, opts);
+  }
+
+  private async sampleFromLogits(
+    logits: np.Array,
+    temperature: number,
+  ): Promise<number> {
+    const [vals, idx] = lax.topK(logits, SMOLLM_TOPK); // consumes logits
+    const v = (await vals.data()) as ArrayLike<number>;
+    const ix = (await idx.data()) as ArrayLike<number>;
+    return sampleTopKPairs(v, ix, { temperature, topK: SMOLLM_TOPK, topP: 0.95 });
+  }
+
+  private decodeVisible(tokens: number[]): string {
+    return this.tokenizer.decode(tokens.filter((t) => !this.specialIds.has(t)));
+  }
+
+  async *generateStream(
+    history: ChatMessage[],
+    maxNewTokens = TUNABLES.llmMaxNewTokens,
+  ): AsyncGenerator<string, GenerateStats, void> {
+    const promptTokens = this.encodePrompt(history);
+    const generatedTokens: number[] = [];
+    const temperature = 0.7;
+    const startTime = performance.now();
+    let firstTokenMs = 0;
+    let emitted = "";
+
+    const state = createSmolLmState({ dtype: np.float16 });
+    let pending: np.Array | null = runSmolLmPrefill(
+      tree.ref(this.model),
+      np.array(promptTokens, { dtype: np.uint32 }),
+      state,
+    );
+    let pendingIsCombined = false;
+
+    try {
+      const stopTokens = [SMOLLM_IM_END, SMOLLM_EOS];
+      for (let i = 0; i < maxNewTokens; i++) {
+        const sampleable = pending!;
+        pending = null;
+        const nextToken = pendingIsCombined
+          ? await this.sampleFromCombined(sampleable, temperature)
+          : await this.sampleFromLogits(sampleable, temperature);
+        if (i === 0) firstTokenMs = performance.now() - startTime;
+        if (stopTokens.includes(nextToken)) break;
+
+        generatedTokens.push(nextToken);
+        const full = this.decodeVisible(generatedTokens);
+        const delta = full.startsWith(emitted)
+          ? full.slice(emitted.length)
+          : full;
+        emitted = full;
+        if (delta) yield delta;
+
+        if (i === maxNewTokens - 1) break;
+        pending = runSmolLmStepFusedTopK(tree.ref(this.model), nextToken, state);
+        pendingIsCombined = true;
+      }
+
+      return {
+        promptTokens: promptTokens.length,
+        newTokens: generatedTokens.length,
+        firstTokenMs,
+        totalMs: performance.now() - startTime,
+      };
+    } finally {
+      pending?.dispose();
+      tree.dispose(state);
+    }
+  }
+
+  async generate(
+    history: ChatMessage[],
+    onText: (partial: string) => void,
+    maxNewTokens = TUNABLES.llmMaxNewTokens,
+  ): Promise<{ text: string; stats: GenerateStats }> {
+    let text = "";
+    const stream = this.generateStream(history, maxNewTokens);
+    let result = await stream.next();
+    while (!result.done) {
+      text += result.value;
+      onText(text);
+      result = await stream.next();
+    }
+    return { text: text.trim(), stats: result.value };
+  }
+
+}
+
 /** LLM stage backed by the Cerebras cloud API (as in the original blog post). */
 export class CerebrasChatModel implements ChatModel {
   constructor(
@@ -1462,7 +1668,7 @@ function withFirstAudio(inner: AudioPlayer, onFirst: () => void): AudioPlayer {
 
 export type VoicePipeline = {
   asr: SpeechRecognizer;
-  llm: LocalChatModel;
+  llm: ChatModel;
   tts: SpeechSynthesizer;
   /** Compute device the ASR lane runs on ("wasm" when available, else "webgpu"). */
   asrDevice: Device;
@@ -1510,7 +1716,7 @@ export async function loadPipeline(
       device: setup.asrDevice,
       dtype: setup.asrDtype,
     }),
-    LocalChatModel.load(onProgress),
+    SmolLmChatModel.load(onProgress),
     SpeechSynthesizer.load(onProgress),
   ]);
   // Compile the ASR + LLM kernels now (esp. slow to JIT on wasm) so the first

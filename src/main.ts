@@ -51,7 +51,7 @@ app.innerHTML = `
       <span class="rail-arrow">+</span>
       <div class="stage" id="stage-llm">
         <span class="stage-role"><span class="stage-dot" id="dot-llm"></span>Brain <span class="stage-lane">webgpu</span></span>
-        <span class="stage-model" id="llm-label"><a href="https://huggingface.co/ekzhang/jax-js-models" target="_blank">Gemma 3 270M</a></span>
+        <span class="stage-model" id="llm-label"><a href="https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct" target="_blank">SmolLM2 360M</a></span>
         <span class="stage-metric" id="metric-llm">&ndash;</span>
       </div>
       <span class="rail-arrow">+</span>
