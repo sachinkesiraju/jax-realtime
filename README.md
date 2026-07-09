@@ -87,19 +87,13 @@ talk — hands-free: turn ends are detected by silence, your words stream into t
 transcript live, the assistant answers out loud and resumes listening. Press the
 orb again to end.
 
-> **Smaller Gemma download (optional).** The app prefers a locally-hosted
-> int8-embedding Gemma build at `public/weights/gemma-it-q8e.safetensors`, which
-> cuts its download from 536 MB to 369 MB (dequantized to fp16 at load — runtime
-> is unchanged). The file is too large for git, so download it from the
-> [`weights-v1` release](https://github.com/sachinkesiraju/jax-realtime/releases/tag/weights-v1)
-> into `public/weights/`:
->
-> ```sh
-> gh release download weights-v1 --pattern gemma-it-q8e.safetensors --dir public/weights
-> ```
->
-> Without it, the loader automatically falls back to the full fp16 Gemma file on
-> Hugging Face — so this step is purely a download-size optimization.
+> **Smaller Gemma download.** By default the app fetches an int8-embedding Gemma
+> build (369 MB instead of 536 MB; the tied embedding table is dequantized to
+> fp16 at load, so runtime is unchanged) from
+> [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights). If that
+> download is unreachable it falls back to the full fp16 Gemma file
+> automatically — no setup either way. To serve it yourself, drop the file at
+> `public/weights/gemma-it-q8e.safetensors` and the loader uses that copy first.
 
 The orb reacts in real time: it breathes when idle, swells with your voice while
 listening, shimmers while the model thinks, and pulses with the synthesized
@@ -108,25 +102,25 @@ pipeline rail and footer.
 
 ## How it works
 
-- `src/asr/` — Whisper encoder/decoder, log-mel features, greedy timestamp
-  decoding; `streaming.ts` is the LocalAgreement-2 streaming transcriber
-  (committed + tentative text, self-echo filter, `bestText()` for the
-  low-latency turn end).
-- `src/llm/gemma.ts` — Gemma 3 forward pass with KV cache, plus the fused
-  single-dispatch decode step and int8-embedding dequant-on-load.
-- `src/tts/` — Pocket TTS flow-matching LM + Mimi streaming decoder (with the
-  fused per-frame decode) and a streaming `AudioContext` player.
-- `src/pipeline.ts` — loads weights from Hugging Face (cached via OPFS),
-  orchestrates the stages, and holds the model/sampler perf paths.
-- `src/duplex.ts` — the full-duplex micro-turn engine (barge-in, phantom guard,
-  backchannels, endpointing, timers, vision interjections, two-tier tools,
-  session watchdog).
-- `src/vision/` — D-FINE detector on `@jax-js/onnx`, webcam VisionSession, COCO
-  labels, box-dedupe and person-count smoothing.
-- `src/tools/tools.ts` — keyless intent detection + weather / Wikipedia / calc /
-  clock.
-- `src/mic.ts` — 16 kHz PCM capture via AudioWorklet. `src/orb.ts` — the
-  audio-reactive orb. `src/main.ts` — UI and wiring.
+The pipeline stages, from microphone to speaker:
+
+| Path | What's there |
+| --- | --- |
+| `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
+| `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` is the LocalAgreement-2 streaming transcriber (committed + tentative text, self-echo filter, `bestText()` for the low-latency turn end). |
+| `src/llm/gemma.ts` | Gemma 3 forward pass with KV cache, the fused single-dispatch decode step, and int8-embedding dequant-on-load. |
+| `src/tts/` | Pocket TTS flow-matching LM + Mimi streaming decoder (with the fused per-frame decode) and a streaming `AudioContext` player. |
+| `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
+| `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |
+
+And the parts that tie them together:
+
+| Path | What's there |
+| --- | --- |
+| `src/duplex.ts` | The full-duplex micro-turn engine: barge-in, phantom guard, backchannels, endpointing, timers, vision interjections, two-tier tools, session watchdog. |
+| `src/pipeline.ts` | Loads weights from Hugging Face (cached via OPFS), orchestrates the stages, holds the model/sampler perf paths. |
+| `src/orb.ts` | The audio-reactive orb. |
+| `src/main.ts` | UI and wiring. |
 
 ## License
 
