@@ -113,15 +113,6 @@ The pipeline stages, from microphone to speaker:
 | `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
 | `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |
 
-And the parts that tie them together:
-
-| Path | What's there |
-| --- | --- |
-| `src/duplex.ts` | The full-duplex micro-turn engine: barge-in, phantom guard, backchannels, endpointing, timers, vision interjections, two-tier tools, session watchdog. |
-| `src/pipeline.ts` | Loads weights from Hugging Face (cached via OPFS), orchestrates the stages, holds the model/sampler perf paths. |
-| `src/orb.ts` | The audio-reactive orb. |
-| `src/main.ts` | UI and wiring. |
-
 ## License
 
 [MIT](LICENSE). Model inference code is adapted from the
