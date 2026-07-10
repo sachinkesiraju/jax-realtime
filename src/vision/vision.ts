@@ -314,7 +314,7 @@ export class VisionSession {
   }
 
   /**
-   * A precise factual question we answer directly from measurements (the 270M
+   * A precise factual question we answer directly from measurements (the small
    * model deflects on these, and exactness matters): count, colour, or a
    * straight "what do you see". Broader/interpretive visual turns are handled by
    * `referencesVision` + the LLM instead.

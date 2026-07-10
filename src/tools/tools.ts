@@ -343,7 +343,7 @@ function detectClock(text: string): ToolCall | null {
 }
 
 // Broad lookup routing: wh-questions route to Wikipedia (which answers factual
-// questions far more reliably than a 270M model). Small-talk stays protected by
+// questions far more reliably than a sub-1B local model). Small-talk stays protected by
 // validQuery + the stoplist, exactly as in conservative mode.
 const BROAD_LOOKUP_RE = /\b(?:what|who|where)(?:'s| is| are| was| were)\b/i;
 const MEANING_RE = /\bwhat does\s+(.+?)\s+mean\b/i;
@@ -406,7 +406,7 @@ export function detectTool(text: string): ToolCall | null {
   }
 
   // Broad mode: wh-questions become Wikipedia lookups — factual questions are
-  // the 270M model's weakest axis, and delegation answers them reliably. The
+  // the small local model's weakest axis, and delegation answers them reliably. The
   // stoplist/validQuery guard keeps small talk ("what's up") with the LLM.
   if (broad && (BROAD_LOOKUP_RE.test(text) || HOWFAR_RE.test(text) || MEANING_RE.test(text))) {
     const query = broadLookupQuery(text);

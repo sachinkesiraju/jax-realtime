@@ -46,8 +46,8 @@ assistant stops.
   "what do you see?" / "how many people?" from the measurements. Proactive
   interjections (stepped away, phone spotted, slouching) are best-effort rule
   heuristics. The webcam shows as a corner PiP with detection boxes.
-- **Two-tier tools** — factual asks are delegated so the 270M model isn't left
-  guessing: weather ("what's the weather in Tokyo" → [open-meteo](https://open-meteo.com/),
+- **Two-tier tools** — factual asks are delegated so the small on-device model
+  isn't left guessing: weather ("what's the weather in Tokyo" → [open-meteo](https://open-meteo.com/),
   in °F/mph), facts ("who is Ada Lovelace" → Wikipedia), plus instant offline
   **calculator** and **clock/date**. Web lookups speak a holding line and fetch
   in the background, then answer on the next silence and render a card; the
@@ -107,7 +107,7 @@ The pipeline stages, from microphone to speaker:
 | --- | --- |
 | `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
 | `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. |
-| `src/llm/smollm.ts` | SmolLM2-360M (Llama architecture) forward pass with a KV cache — the brain. Each token is generated in a single fused GPU dispatch. Chosen over Gemma 3 270M via a blind-judged model shootout (~+0.9 of 5, same size class — see [docs/BRAIN.md](docs/BRAIN.md)). `gemma.ts` is the earlier Gemma 3 port, kept for reference. |
+| `src/llm/smollm.ts` | SmolLM2-360M (Llama architecture) forward pass with a KV cache — the brain. Each token is generated in a single fused GPU dispatch, and the prompt prefill is bucket-padded so jit traces are reused across turns. Chosen via a blind-judged model shootout (see [docs/BRAIN.md](docs/BRAIN.md)). |
 | `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. |
 | `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
 | `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |

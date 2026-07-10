@@ -606,7 +606,7 @@ export class DuplexSession {
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
     // questions (count, colour, "what do you see") are answered directly from
-    // those measurements — the 270M model deflects on them. Broader /
+    // those measurements — the small local model deflects on them. Broader /
     // interpretive visual questions ("what am I doing", "does my room look
     // tidy") are handed to the LLM with the measured scene as grounding, so the
     // model reasons rather than us templating a reply.

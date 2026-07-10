@@ -305,7 +305,7 @@ function renderCard(card: UiCard) {
 }
 
 function currentModel(): ChatModel {
-  // Everything runs locally on jax-js; the Brain is always the local Gemma.
+  // Everything runs locally on jax-js; the Brain is always the local SmolLM.
   return pipeline!.llm;
 }
 
