@@ -47,11 +47,13 @@ import {
 } from "./llm/gemma";
 import {
   createSmolLmState,
+  ensureSmolLmStateCapacity,
   fromSafetensors as smolLmFromSafetensors,
   runSmolLmPrefill,
   runSmolLmStepFusedTopK,
   SMOLLM_TOPK,
   type SmolLmModel,
+  type SmolLmState,
 } from "./llm/smollm";
 import { type AudioPlayer, createStreamingPlayer } from "./tts/audio";
 import { playTTS } from "./tts/inference";
@@ -1110,6 +1112,16 @@ type SmolLmTokenizerData = {
  * single-dispatch decode + GPU top-k path for parity with the Gemma perf work.
  */
 export class SmolLmChatModel implements ChatModel {
+  /**
+   * Persistent KV-cache reused across turns when TUNABLES.llmKvReuse is on
+   * (same flag as LocalChatModel). Detached (nulled) while a turn is running so
+   * a mid-turn throw can never leave a half-updated cache installed; it is only
+   * re-installed by `commitState` after the turn ends cleanly.
+   */
+  private kvState: SmolLmState | null = null;
+  /** Token IDs currently resident in `kvState` (prompt + fed generations). */
+  private kvTokens: number[] = [];
+
   private constructor(
     private model: SmolLmModel,
     private tokenizer: tokenizers.BpeEncoding,
@@ -1243,6 +1255,170 @@ export class SmolLmChatModel implements ChatModel {
     return this.tokenizer.decode(tokens.filter((t) => !this.specialIds.has(t)));
   }
 
+  /**
+   * Prepare decode state for a turn (SmolLM port of LocalChatModel.prepareState).
+   * Without KV reuse: a fresh full prefill (shipped behavior), disposed after
+   * the stream. With reuse: roll the persistent cache back to the longest
+   * shared token-id prefix and feed only the suffix. The suffix is fed
+   * token-by-token through the SAME fused topk decode jit the generation loop
+   * uses (already traced/warm, one dispatch per token) — runSmolLmPrefill
+   * cannot start at an offset: it rebuilds every layer cache from scratch with
+   * RoPE offset 0 and a self-only causal mask, so extending it would mean a
+   * prefix-aware attention mask + cache concat for marginal gain on the short
+   * (~new-user-utterance-sized) suffixes this path sees.
+   *
+   * Safety: the persistent state is DETACHED from `this` here. If anything
+   * throws mid-turn the caller disposes it and the next turn rebuilds; only a
+   * cleanly-finished turn re-installs it via commitState. (This deliberately
+   * avoids the known Gemma-path bug where a mid-loop throw commits a
+   * partially-fed cache — see docs/BENCHMARKS.md.)
+   */
+  private prepareState(promptTokens: number[]): {
+    state: SmolLmState;
+    fedTokens: number[];
+    pending: np.Array;
+    // Whether `pending` is the packed [topk values, topk indices] array from
+    // the fused step (suffix feed) or full-vocab logits (full prefill).
+    pendingIsCombined: boolean;
+    persistent: boolean;
+  } {
+    const MAX_CACHED = 2048;
+
+    if (TUNABLES.llmKvReuse) {
+      const prev = this.kvState;
+      // Detach immediately: from here on, `this` never references a state that
+      // an exception could leave half-updated.
+      this.kvState = null;
+      const cachedTokens = this.kvTokens;
+      this.kvTokens = [];
+      const p = prev ? commonPrefixLen(cachedTokens, promptTokens) : 0;
+      // One line per turn so the bench can verify reuse actually fires.
+      console.debug(
+        `[smollm kv] prefixLen=${p} promptLen=${promptTokens.length} cached=${cachedTokens.length}`,
+      );
+      if (
+        prev &&
+        p > 0 &&
+        p < promptTokens.length &&
+        promptTokens.length <= MAX_CACHED
+      ) {
+        // Roll the cache back to the shared prefix and re-feed the diverging
+        // suffix. Stale KV slots beyond `p` are overwritten before they can be
+        // attended to (each fused step writes slot `position` and its
+        // validMask admits only slots <= position), so the result is exact.
+        try {
+          ensureSmolLmStateCapacity(prev, promptTokens.length);
+          prev.position = p;
+          const fedTokens = promptTokens.slice(0, p);
+          let pending: np.Array | null = null;
+          for (let j = p; j < promptTokens.length; j++) {
+            pending?.dispose();
+            pending = runSmolLmStepFusedTopK(
+              tree.ref(this.model),
+              promptTokens[j],
+              prev,
+            );
+            fedTokens.push(promptTokens[j]);
+          }
+          return {
+            state: prev,
+            fedTokens,
+            pending: pending!,
+            pendingIsCombined: true,
+            persistent: true,
+          };
+        } catch (err) {
+          // A throw mid-suffix-feed leaves `prev` inconsistent; drop it so the
+          // rebuild below (next turn) starts clean.
+          tree.dispose(prev);
+          throw err;
+        }
+      }
+      if (prev) tree.dispose(prev);
+      const state = createSmolLmState({ dtype: np.float16 });
+      const pending = runSmolLmPrefill(
+        tree.ref(this.model),
+        np.array(promptTokens, { dtype: np.uint32 }),
+        state,
+      );
+      return {
+        state,
+        fedTokens: promptTokens.slice(),
+        pending,
+        pendingIsCombined: false,
+        persistent: true,
+      };
+    }
+
+    const state = createSmolLmState({ dtype: np.float16 });
+    const pending = runSmolLmPrefill(
+      tree.ref(this.model),
+      np.array(promptTokens, { dtype: np.uint32 }),
+      state,
+    );
+    return {
+      state,
+      fedTokens: promptTokens.slice(),
+      pending,
+      pendingIsCombined: false,
+      persistent: false,
+    };
+  }
+
+  /** Persist (or drop, if over the cap) the reused KV state after a turn. */
+  private commitState(state: SmolLmState, fedTokens: number[]): void {
+    const MAX_CACHED = 2048;
+    if (fedTokens.length > MAX_CACHED) {
+      tree.dispose(state);
+      this.kvState = null;
+      this.kvTokens = [];
+      return;
+    }
+    this.kvState = state;
+    this.kvTokens = fedTokens;
+  }
+
+  /**
+   * Measure a full prefill of a synthetic ~voice-turn prompt (median over
+   * `runs` fresh states), callable from the browser console to quantify the
+   * KV-reuse payoff (compare against the per-turn suffix feed). The first run
+   * includes jit trace/compile for this prompt length — the prefill jit
+   * specializes on T — so it is reported separately from the median.
+   */
+  async benchPrefill(nTokens = 250, runs = 5): Promise<Record<string, unknown>> {
+    // Real ChatML head + filler user text repeated to the target length, so the
+    // measured shape matches a real turn's prompt rather than random ids.
+    const tokens = this.encodePrompt([{ role: "user", content: "Hi" }]);
+    const filler = this.tokenizer.encode(
+      " tell me a little more about the ocean and the weather today",
+    );
+    while (tokens.length < nTokens) tokens.push(...filler);
+    tokens.length = nTokens;
+
+    const times: number[] = [];
+    for (let r = 0; r < runs; r++) {
+      const state = createSmolLmState({ dtype: np.float16 });
+      const t0 = performance.now();
+      const logits = runSmolLmPrefill(
+        tree.ref(this.model),
+        np.array(tokens, { dtype: np.uint32 }),
+        state,
+      );
+      await blockUntilReady(logits.ref);
+      times.push(performance.now() - t0);
+      logits.dispose();
+      tree.dispose(state);
+    }
+    const sorted = [...times].sort((a, b) => a - b);
+    return {
+      nTokens,
+      runs,
+      firstMs: +times[0].toFixed(1),
+      medianMs: +sorted[Math.floor(sorted.length / 2)].toFixed(1),
+      allMs: times.map((t) => +t.toFixed(1)),
+    };
+  }
+
   async *generateStream(
     history: ChatMessage[],
     maxNewTokens = TUNABLES.llmMaxNewTokens,
@@ -1263,13 +1439,17 @@ export class SmolLmChatModel implements ChatModel {
     let firstTokenMs = 0;
     let emitted = "";
 
-    const state = createSmolLmState({ dtype: np.float16 });
-    let pending: np.Array | null = runSmolLmPrefill(
-      tree.ref(this.model),
-      np.array(promptTokens, { dtype: np.uint32 }),
-      state,
-    );
-    let pendingIsCombined = false;
+    // With KV reuse (TUNABLES.llmKvReuse) this only feeds the suffix past the
+    // cached prefix; otherwise it's the shipped full prefill on a fresh state.
+    const prepared = this.prepareState(promptTokens);
+    const { state, fedTokens, persistent } = prepared;
+    let pending: np.Array | null = prepared.pending;
+    let pendingIsCombined = prepared.pendingIsCombined;
+    // Commit-on-throw safety: only a cleanly-ended turn (return OR an early
+    // generator.return from barge-in, where every fed token's step has fully
+    // run) may persist the cache. A throw can leave `state` half-updated
+    // relative to `fedTokens`, so it must be dropped, never installed.
+    let failed = false;
 
     try {
       const stopTokens = [SMOLLM_IM_END, SMOLLM_EOS];
@@ -1294,6 +1474,7 @@ export class SmolLmChatModel implements ChatModel {
         if (i === maxNewTokens - 1) break;
         pending = runSmolLmStepFusedTopK(tree.ref(this.model), nextToken, state);
         pendingIsCombined = true;
+        fedTokens.push(nextToken);
       }
 
       return {
@@ -1302,9 +1483,17 @@ export class SmolLmChatModel implements ChatModel {
         firstTokenMs,
         totalMs: performance.now() - startTime,
       };
+    } catch (err) {
+      failed = true;
+      throw err;
     } finally {
       pending?.dispose();
-      tree.dispose(state);
+      // Without reuse the state is released here (shipped behavior). With
+      // reuse it is persisted for the next turn — unless the turn threw, in
+      // which case it is dropped so the next turn rebuilds from scratch.
+      if (!persistent) tree.dispose(state);
+      else if (failed) tree.dispose(state);
+      else this.commitState(state, fedTokens);
     }
   }
 
