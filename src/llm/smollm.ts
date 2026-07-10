@@ -1,19 +1,17 @@
-// SmolLM2-360M-Instruct forward pass on jax-js — a Llama-architecture sibling of
-// gemma.ts. A blind-judged model shootout put SmolLM2-360M ~+0.9 (of 5) over the
-// Gemma 3 270M brain at essentially the same size, winning every dimension
-// (helpfulness, coherence, spoken-naturalness, smarts) across three runs.
+// SmolLM2-360M-Instruct forward pass on jax-js — the brain, chosen via a
+// blind-judged model shootout in which it won every dimension (helpfulness,
+// coherence, spoken-naturalness, smarts) across three runs against same-size
+// and larger alternatives.
 //
-// Structural differences from Gemma 3 (all simplifications):
+// It's a plain Llama architecture:
 //   * pre-norm only: 2 norms/layer (input, post-attention), applied to each
-//     sublayer INPUT; the raw sublayer output is added to the residual (Gemma
-//     also norms the sublayer output).
-//   * RMSNorm scale is the raw weight, NOT Gemma's zero-centered (1 + weight).
-//   * no query/key norm.
-//   * embeddings are not scaled by sqrt(hidden) (Gemma scales them).
+//     sublayer INPUT; the raw sublayer output is added to the residual.
+//   * RMSNorm scale is the raw weight (output = norm(x) * weight).
+//   * no query/key norm; embeddings are not scaled by sqrt(hidden).
 //   * a single RoPE theta for every layer (no local/global interleave), and
 //     full causal attention on every layer (no sliding window).
-//   * SiLU MLP (Gemma uses gelu-tanh); attention scale is 1/sqrt(head_dim).
-//   * tied embeddings (lm_head == embed_tokens), like Gemma.
+//   * SiLU MLP; attention scale is 1/sqrt(head_dim).
+//   * tied embeddings (lm_head == embed_tokens).
 import { blockUntilReady, jit, lax, nn, numpy as np, tree } from "@jax-js/jax";
 import { safetensors, WeightMapper } from "@jax-js/loaders";
 
@@ -110,7 +108,7 @@ const runEmbedding = jit(function runEmbedding(
   tokenIds: np.Array,
 ): np.Array {
   // Trained for bf16 activations; keep the residual stream in fp32 so fp16
-  // residuals don't overflow in this browser implementation (as in gemma.ts).
+  // residuals don't overflow in this browser implementation.
   // SmolLM2/Llama does NOT scale embeddings by sqrt(hidden).
   return weight.slice(tokenIds).astype(np.float32);
 });
@@ -125,7 +123,7 @@ const runSmolLmRMSNorm = jit(
     x = x.astype(np.float32);
     const rms = x.ref.mul(x.ref).mean(-1, { keepdims: true });
     x = x.div(np.sqrt(rms.add(eps)));
-    // Llama RMSNorm: output = norm(x) * weight (NOT Gemma's 1 + weight).
+    // Llama RMSNorm: output = norm(x) * weight (no zero-centered offset).
     return x.mul(weight.astype(np.float32)).astype(dtype);
   },
   { staticArgnums: [2] },
@@ -436,9 +434,10 @@ export function runSmolLmStep(
 
 // ---------------------------------------------------------------------------
 // Fused single-dispatch decode step — inlines the whole step into one jitted
-// function so it traces to a single dispatch group, exactly as gemma.ts does
-// (see that file's long note on why these are plain, non-jitted inline copies
-// and why passing `position` as a traced np.Array keeps one shared trace).
+// function so it traces to a single dispatch group. The helpers below are
+// plain, non-jitted inline copies of the jitted originals (nested-jit
+// boundaries would split the dispatch group), and `position` is passed as a
+// traced np.Array so one trace is shared across every token/step.
 
 function embedInline(weight: np.Array, tokenIds: np.Array): np.Array {
   return weight.slice(tokenIds).astype(np.float32);
@@ -702,7 +701,7 @@ function tensorToArray(
 }
 
 // Per-row symmetric int8 dequant (companion `<name>.scale` F32, one scale per
-// row) — same scheme as gemma.ts, so the tied embedding table can ship int8.
+// row), so the weights — including the tied embedding table — can ship int8.
 function dequantizeI8(
   tensor: safetensors.Tensor,
   scaleTensor: safetensors.Tensor,

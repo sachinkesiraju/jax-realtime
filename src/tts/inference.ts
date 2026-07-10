@@ -60,7 +60,7 @@ export async function playTTS(
       [key, stepKey] = random.split(key);
       // Fuse the steady-state flow-LM decode into one dispatch when enabled.
       // Step 0 is the prefill (conditioning embeds concatenated), which stays on
-      // the unfused path — mirroring Gemma's fuse-decode-only split.
+      // the unfused path — the same fuse-decode-only split as the LLM.
       const fuseFlow = TUNABLES.ttsFusedStep && step > 0;
       const {
         latent,

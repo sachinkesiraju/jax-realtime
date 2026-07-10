@@ -5,7 +5,7 @@ Thinking Machines' interaction models (https://thinkingmachines.ai/blog/interact
 — continuous micro-turn processing, no hard turn boundaries, barge-in
 interruption, backchanneling, time awareness, proactive interjections, vision,
 concurrent tool use, and simultaneous speech — all in-browser with jax-js. We
-keep the cascaded pipeline (Whisper → Gemma → Pocket TTS) but restructure the
+keep the cascaded pipeline (Whisper → local LLM → Pocket TTS) but restructure the
 harness into a 150–200 ms tick loop.
 
 ---

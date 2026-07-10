@@ -1,4 +1,4 @@
-// Speech-to-speech pipeline: Whisper ASR -> Gemma LLM -> Kyutai Pocket TTS.
+// Speech-to-speech pipeline: Whisper ASR -> SmolLM2 LLM -> Kyutai Pocket TTS.
 // All three stages run locally in the browser on WebGPU via jax-js, mirroring
 // the architecture of the HF/Cerebras real-time voice AI demo.
 
@@ -33,18 +33,6 @@ import {
   type WhisperState,
 } from "./asr/model";
 import { WhisperTokenizer } from "./asr/tokenizer";
-import {
-  createGemmaState,
-  ensureGemmaStateCapacity,
-  fromSafetensors as gemmaFromSafetensors,
-  type GemmaModel,
-  type GemmaState,
-  GEMMA_TOPK,
-  runGemmaPrefill,
-  runGemmaStep,
-  runGemmaStepFused,
-  runGemmaStepFusedTopK,
-} from "./llm/gemma";
 import {
   createSmolLmState,
   fromSafetensors as smolLmFromSafetensors,
@@ -87,21 +75,8 @@ const WHISPER_CONFIG: WhisperConfig = WHISPER_MODELS.find(
 )!;
 const ASR_MAX_NEW_TOKENS = 96;
 
-const GEMMA_BASE =
-  "https://huggingface.co/ekzhang/jax-js-models/resolve/main/gemma-3-270m";
-const GEMMA_START_OF_TURN = 105;
-const GEMMA_END_OF_TURN = 106;
-
 const TTS_WEIGHTS_URL =
   "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
-// Gemma build with the tied embedding table quantized to int8 (dequantized to
-// fp16 at load, so runtime is unchanged). This is the default download: 369 MB
-// vs. 536 MB for the fp16 file. GEMMA_Q8_LOCAL is checked first so a build that
-// vendors the file under public/weights/ serves it without a network hop; the
-// HF-hosted copy is the fresh-clone default; the fp16 file is the last resort.
-const GEMMA_Q8_LOCAL = "/weights/gemma-it-q8e.safetensors";
-const GEMMA_Q8_URL =
-  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/gemma-it-q8e.safetensors";
 const TTS_HF_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
 
@@ -117,9 +92,10 @@ export const TTS_VOICES = [
 ] as const;
 export type TTSVoice = (typeof TTS_VOICES)[number];
 
-// Gemma 3 270M has no system role; fold instructions into the first user turn.
-// Keep this SHORT and POSITIVE: a 270M model can't follow long instructions
-// or negation (naming a phrase to avoid just primes it to say that phrase).
+// System instructions for the cloud (Cerebras) brain; the local SmolLM brain
+// carries its own SMOLLM_SYSTEM. Keep this SHORT and POSITIVE: small models
+// can't follow long instructions or negation (naming a phrase to avoid just
+// primes them to say that phrase).
 const SYSTEM_HINT =
   "You are a warm, helpful voice assistant. Answer the user's question or " +
   "message directly in one or two short spoken sentences. A [scene: …] tag " +
@@ -207,8 +183,8 @@ export class SpeechRecognizer {
   /**
    * DEV diagnostic: per-token Whisper decoder-step cost. The decoder step is
    * ALREADY a single fused jit (see asr/model.ts `decoderStepJit`: embedding →
-   * all layers → norm → logits in one dispatch), so unlike Gemma there is no
-   * per-layer "unfused" path to A/B against — this just reports the ms/token of
+   * all layers → norm → logits in one dispatch), so there is no per-layer
+   * "unfused" path to A/B against — this just reports the ms/token of
    * the shipped fused step (including the realistic full-vocab readback the gate
    * needs), so the orchestrator can confirm the ASR pass cost. Not used by the
    * app.
@@ -364,14 +340,6 @@ export class SpeechRecognizer {
   }
 }
 
-/** Length of the longest shared prefix of two token-id sequences. */
-function commonPrefixLen(a: readonly number[], b: readonly number[]): number {
-  const n = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < n && a[i] === b[i]) i++;
-  return i;
-}
-
 type Candidate = { id: number; logit: number };
 
 /** Insert `{id, logit}` into a descending-sorted top-`k` candidate list. */
@@ -436,18 +404,6 @@ function sampleFromCandidates(
   return candidates[kept - 1].id;
 }
 
-function sampleLogits(
-  logits: Float32Array,
-  opts: { temperature: number; topK: number; topP: number },
-): number {
-  const k = Math.max(1, Math.min(opts.topK, logits.length));
-  const candidates: Candidate[] = [];
-  for (let id = 0; id < logits.length; id++) {
-    insertCandidate(candidates, id, logits[id], k);
-  }
-  return sampleFromCandidates(candidates, opts);
-}
-
 /**
  * Equivalent to `sampleLogits`, but over the top-k `(value, index)` pairs read
  * back from a device-side `lax.topK(logits, k)` instead of the full vocab. The
@@ -510,576 +466,10 @@ function windowHistory(history: ChatMessage[]): ChatMessage[] {
   return sliced;
 }
 
-export class LocalChatModel implements ChatModel {
-  /** Persistent KV-cache reused across turns when TUNABLES.llmKvReuse is on. */
-  private kvState: GemmaState | null = null;
-  /** Token IDs currently resident in `kvState` (prompt + fed generations). */
-  private kvTokens: number[] = [];
-
-  private constructor(
-    private model: GemmaModel,
-    private tokenizer: tokenizers.SentencePiece,
-  ) {}
-
-  static async load(onProgress: ProgressFn): Promise<LocalChatModel> {
-    const tokData = await fetchWithProgress(
-      "Gemma tokenizer",
-      `${GEMMA_BASE}/tokenizer.model`,
-      onProgress,
-    );
-    const tokenizer = tokenizers.SentencePiece.fromBinary(tokData);
-    // Default to the int8-embedding build (536 → 369 MB download; dequantized
-    // to fp16 at load, so runtime is unchanged). Prefer a locally-vendored copy
-    // under public/weights/, else the HF-hosted default, else the fp16 file.
-    // The local HEAD probe guards against the dev server's SPA fallback
-    // answering 200 with index.html for a missing file (hence the size gate).
-    let weightsUrl = GEMMA_Q8_URL;
-    let weightsLabel = "Gemma 3 270M weights (int8 embed)";
-    try {
-      const head = await fetch(GEMMA_Q8_LOCAL, { method: "HEAD" });
-      const size = Number(head.headers.get("content-length") ?? 0);
-      if (head.ok && size > 100_000_000) {
-        weightsUrl = GEMMA_Q8_LOCAL;
-      }
-    } catch {
-      // No locally-vendored build; use the HF-hosted int8 default.
-    }
-    let data: Uint8Array<ArrayBuffer>;
-    try {
-      data = await fetchWithProgress(weightsLabel, weightsUrl, onProgress);
-    } catch (err) {
-      // int8 download unreachable — fall back to the full fp16 file so the app
-      // still loads.
-      console.warn("int8 Gemma download failed, falling back to fp16", err);
-      data = await fetchWithProgress(
-        "Gemma 3 270M weights",
-        `${GEMMA_BASE}/model-it-fp16.safetensors`,
-        onProgress,
-      );
-    }
-    const weights = safetensors.parse(data);
-    const model = await gemmaFromSafetensors(weights, np.float16);
-    return new LocalChatModel(model, tokenizer);
-  }
-
-  /**
-   * Generate a couple of throwaway tokens so the Gemma prefill + decode kernels
-   * JIT-compile at load time instead of on the user's first turn (that cold
-   * pass added ~1.7 s to turn 1).
-   */
-  async warmup(): Promise<void> {
-    try {
-      const stream = this.generateStream([{ role: "user", content: "Hi" }], 2);
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      for await (const _ of stream) {
-        // drain
-      }
-    } catch {
-      // Best-effort; a failure just means the first real turn pays the cost.
-    }
-  }
-
-  /**
-   * DEV diagnostic (cycle-4 map-reduce): per-token decode cost split. Measures
-   * the shipped path (full-vocab readback + JS scan per token) against a
-   * no-readback path, the JS scan alone, and a GPU `lax.topK(64)` path, plus
-   * the synchronous dispatch cost of each `runGemmaStep` call (re-trace check).
-   * Throwaway measurement code — not used by the app.
-   */
-  private benchPrompt(): number[] {
-    return [
-      this.tokenizer.bosToken,
-      ...this.tokenizer.encode(
-        "<start_of_turn>user\nTell me about the ocean.<end_of_turn>\n<start_of_turn>model\n",
-      ),
-    ];
-  }
-
-  async benchDecode(
-    n = 24,
-    opts?: { fused?: boolean; sampler?: "js" | "topk"; topkInFused?: boolean },
-  ): Promise<Record<string, unknown>> {
-    // When a specific configuration is requested, measure just that config's
-    // ms/token and per-call sync dispatch cost (used by the map-reduce run).
-    if (opts) return this.benchConfig(n, opts);
-    const prompt = this.benchPrompt();
-    const FIXED_TOKEN = 108;
-    const mkState = () => {
-      const state = createGemmaState({ dtype: np.float16 });
-      const ids = np.array(prompt, { dtype: np.uint32 });
-      return { state, logits: runGemmaPrefill(tree.ref(this.model), ids, state) };
-    };
-    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
-
-    // A. Shipped path: await data() (full 262k fp32 readback) + JS scan + step.
-    let s = mkState();
-    let logits = s.logits;
-    const dispatchMs: number[] = [];
-    let tokSample = 0;
-    const tA = performance.now();
-    for (let i = 0; i < n; i++) {
-      const data = (await logits.data()) as Float32Array;
-      tokSample = sampleLogits(data, { temperature: 0.7, topK: 64, topP: 0.95 });
-      const d0 = performance.now();
-      logits = runGemmaStep(tree.ref(this.model), tokSample, s.state);
-      dispatchMs.push(performance.now() - d0);
-    }
-    await blockUntilReady(logits.ref);
-    const fullMsPerTok = (performance.now() - tA) / n;
-
-    // E. Readback alone on a settled queue (map + 1MB transfer, no GPU wait).
-    const tE = performance.now();
-    const settled = (await logits.data()) as Float32Array; // consumes logits
-    const readbackMs = performance.now() - tE;
-    tree.dispose(s.state);
-
-    // C. JS scan alone on the CPU-side array.
-    const tC = performance.now();
-    for (let i = 0; i < n; i++) {
-      sampleLogits(settled, { temperature: 0.7, topK: 64, topP: 0.95 });
-    }
-    const scanMsPerTok = (performance.now() - tC) / n;
-
-    // B. No-readback path: steps enqueued back-to-back with a fixed token; one
-    // sync at the end. Isolates GPU compute + dispatch from readback/sync.
-    s = mkState();
-    logits = s.logits;
-    const tB = performance.now();
-    for (let i = 0; i < n; i++) {
-      logits.dispose();
-      logits = runGemmaStep(tree.ref(this.model), FIXED_TOKEN, s.state);
-    }
-    await blockUntilReady(logits.ref);
-    const noReadbackMsPerTok = (performance.now() - tB) / n;
-    logits.dispose();
-    tree.dispose(s.state);
-
-    // D. Candidate topk-gpu path: lax.topK(64) on device, read back 64 pairs.
-    s = mkState();
-    logits = s.logits;
-    const tD = performance.now();
-    for (let i = 0; i < n; i++) {
-      const [vals, idx] = lax.topK(logits, 64); // consumes logits
-      await vals.data();
-      await idx.data();
-      logits = runGemmaStep(tree.ref(this.model), FIXED_TOKEN, s.state);
-    }
-    await blockUntilReady(logits.ref);
-    const topkMsPerTok = (performance.now() - tD) / n;
-    logits.dispose();
-    tree.dispose(s.state);
-
-    return {
-      nTokens: n,
-      fullMsPerTok: +fullMsPerTok.toFixed(2),
-      noReadbackMsPerTok: +noReadbackMsPerTok.toFixed(2),
-      readbackPlusSyncMsPerTok: +(fullMsPerTok - noReadbackMsPerTok).toFixed(2),
-      readbackAloneMs: +readbackMs.toFixed(2),
-      scanMsPerTok: +scanMsPerTok.toFixed(2),
-      topkMsPerTok: +topkMsPerTok.toFixed(2),
-      dispatchSyncMs: {
-        first5: dispatchMs.slice(0, 5).map((x) => +x.toFixed(2)),
-        mean: +mean(dispatchMs).toFixed(2),
-        max: +Math.max(...dispatchMs).toFixed(2),
-      },
-    };
-  }
-
-  /**
-   * Measure ms/token for one decode configuration (fused step on/off, GPU
-   * top-k sampler on/off) with real sampled feedback tokens, plus the mean/max
-   * synchronous dispatch cost of each step call. Same measurement style as
-   * `benchDecode` above; used by the map-reduce harness to compare configs.
-   */
-  private async benchConfig(
-    n: number,
-    {
-      fused = false,
-      sampler = "js" as "js" | "topk",
-      topkInFused = false,
-    },
-  ): Promise<Record<string, unknown>> {
-    const prompt = this.benchPrompt();
-    const stepFn = fused ? runGemmaStepFused : runGemmaStep;
-    const opts = { temperature: 0.7, topK: GEMMA_TOPK, topP: 0.95 };
-    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
-
-    const state = createGemmaState({ dtype: np.float16 });
-    // `out` is the current sampleable: full-vocab logits, or the packed top-k
-    // array once the folded step is producing them (isCombined tracks which).
-    let out = runGemmaPrefill(
-      tree.ref(this.model),
-      np.array(prompt, { dtype: np.uint32 }),
-      state,
-    );
-    let isCombined = false;
-
-    const sampleCombined = (packed: ArrayLike<number>): number => {
-      const values = new Array(GEMMA_TOPK);
-      const indices = new Array(GEMMA_TOPK);
-      for (let j = 0; j < GEMMA_TOPK; j++) {
-        values[j] = packed[j];
-        indices[j] = packed[GEMMA_TOPK + j];
-      }
-      return sampleTopKPairs(values, indices, opts);
-    };
-
-    const dispatchMs: number[] = [];
-    const t0 = performance.now();
-    for (let i = 0; i < n; i++) {
-      let tok: number;
-      if (isCombined) {
-        tok = sampleCombined((await out.data()) as ArrayLike<number>);
-      } else if (sampler === "topk") {
-        const [vals, idx] = lax.topK(out, 64); // consumes out
-        const v = (await vals.data()) as ArrayLike<number>;
-        const ix = (await idx.data()) as ArrayLike<number>;
-        tok = sampleTopKPairs(v, ix, opts);
-      } else {
-        tok = sampleLogits((await out.data()) as Float32Array, opts);
-      }
-      const d0 = performance.now();
-      if (topkInFused) {
-        out = runGemmaStepFusedTopK(tree.ref(this.model), tok, state);
-        isCombined = true;
-      } else {
-        out = stepFn(tree.ref(this.model), tok, state);
-        isCombined = false;
-      }
-      dispatchMs.push(performance.now() - d0);
-    }
-    await blockUntilReady(out.ref);
-    const msPerTok = (performance.now() - t0) / n;
-    out.dispose();
-    tree.dispose(state);
-
-    return {
-      config: { fused, sampler, topkInFused },
-      nTokens: n,
-      msPerTok: +msPerTok.toFixed(2),
-      dispatchSyncMs: {
-        first5: dispatchMs.slice(0, 5).map((x) => +x.toFixed(2)),
-        mean: +mean(dispatchMs).toFixed(2),
-        max: +Math.max(...dispatchMs).toFixed(2),
-      },
-    };
-  }
-
-  /**
-   * Greedy (temperature 0) generation of `nTokens` from a fixed prompt under
-   * each of the four {fused, sampler} configurations, returning the four
-   * token-id arrays. The orchestrator asserts they are identical, proving the
-   * fused step and the GPU top-k sampler preserve the shipped path's output.
-   */
-  async benchEquivalence(nTokens = 32): Promise<Record<string, number[]>> {
-    const prompt = this.benchPrompt();
-    const greedy = { temperature: 0, topK: 64, topP: 0.95 };
-
-    const run = async (
-      fused: boolean,
-      sampler: "js" | "topk",
-      topkInFused = false,
-    ): Promise<number[]> => {
-      const stepFn = fused ? runGemmaStepFused : runGemmaStep;
-      const state = createGemmaState({ dtype: np.float16 });
-      let cur = runGemmaPrefill(
-        tree.ref(this.model),
-        np.array(prompt, { dtype: np.uint32 }),
-        state,
-      );
-      let isCombined = false;
-      const out: number[] = [];
-      try {
-        for (let i = 0; i < nTokens; i++) {
-          let tok: number;
-          if (isCombined) {
-            const packed = (await cur.data()) as ArrayLike<number>;
-            const values = new Array(GEMMA_TOPK);
-            const indices = new Array(GEMMA_TOPK);
-            for (let j = 0; j < GEMMA_TOPK; j++) {
-              values[j] = packed[j];
-              indices[j] = packed[GEMMA_TOPK + j];
-            }
-            tok = sampleTopKPairs(values, indices, greedy);
-          } else if (sampler === "topk") {
-            const [vals, idx] = lax.topK(cur, 64); // consumes cur
-            const v = (await vals.data()) as ArrayLike<number>;
-            const ix = (await idx.data()) as ArrayLike<number>;
-            tok = sampleTopKPairs(v, ix, greedy);
-          } else {
-            tok = sampleLogits((await cur.data()) as Float32Array, greedy);
-          }
-          out.push(tok);
-          if (topkInFused) {
-            cur = runGemmaStepFusedTopK(tree.ref(this.model), tok, state);
-            isCombined = true;
-          } else {
-            cur = stepFn(tree.ref(this.model), tok, state);
-            isCombined = false;
-          }
-        }
-      } finally {
-        cur.dispose();
-        tree.dispose(state);
-      }
-      return out;
-    };
-
-    return {
-      jsUnfused: await run(false, "js"),
-      jsFused: await run(true, "js"),
-      topkUnfused: await run(false, "topk"),
-      topkFused: await run(true, "topk"),
-      topkInFused: await run(true, "topk", true),
-    };
-  }
-
-  /**
-   * Sample the next token from on-device logits, honoring TUNABLES.llmSampler.
-   * Both paths consume `logits`; "topk" reads back only 64 candidates instead
-   * of the full 262k-vocab, with an identical selection (see sampleTopKPairs).
-   */
-  private async sampleNext(
-    logits: np.Array,
-    temperature: number,
-  ): Promise<number> {
-    const opts = { temperature, topK: 64, topP: 0.95 };
-    if (TUNABLES.llmSampler === "topk") {
-      const [vals, idx] = lax.topK(logits, 64); // consumes logits
-      const v = (await vals.data()) as ArrayLike<number>;
-      const ix = (await idx.data()) as ArrayLike<number>;
-      return sampleTopKPairs(v, ix, opts);
-    }
-    return sampleLogits((await logits.data()) as Float32Array, opts);
-  }
-
-  /**
-   * Sample from the packed top-k array emitted by the topk-in-fused decode step
-   * (see runGemmaDecodeStepFusedTopK): one readback of [values ..k.., indices
-   * ..k..] fp32, split back into pairs and fed through the same selection as
-   * `sampleTopKPairs` — identical semantics, one `.data()` instead of two.
-   */
-  private async sampleNextFromCombined(
-    combined: np.Array,
-    temperature: number,
-  ): Promise<number> {
-    const opts = { temperature, topK: GEMMA_TOPK, topP: 0.95 };
-    const packed = (await combined.data()) as ArrayLike<number>; // consumes
-    const values = new Array(GEMMA_TOPK);
-    const indices = new Array(GEMMA_TOPK);
-    for (let i = 0; i < GEMMA_TOPK; i++) {
-      values[i] = packed[i];
-      indices[i] = packed[GEMMA_TOPK + i];
-    }
-    return sampleTopKPairs(values, indices, opts);
-  }
-
-  /**
-   * Prepare decode state for a turn. Without KV reuse: a fresh full prefill
-   * (shipped behavior), disposed after the stream. With reuse: re-use the
-   * persistent cache, prefilling only the suffix of `promptTokens` past the
-   * longest shared prefix; if there is no usable prefix (or the prompt exceeds
-   * the cap) the persistent cache is rebuilt.
-   */
-  private prepareState(promptTokens: number[]): {
-    state: GemmaState;
-    fedTokens: number[];
-    logits: np.Array;
-    persistent: boolean;
-  } {
-    const MAX_CACHED = 2048;
-
-    if (TUNABLES.llmKvReuse) {
-      const prev = this.kvState;
-      const p = prev ? commonPrefixLen(this.kvTokens, promptTokens) : 0;
-      if (
-        prev &&
-        p > 0 &&
-        p < promptTokens.length &&
-        promptTokens.length <= MAX_CACHED
-      ) {
-        // Roll the cache back to the shared prefix and re-feed the diverging
-        // suffix. Stale KV slots beyond `p` are overwritten before they can be
-        // attended to (each step writes its own slot and attends only slots
-        // <= its position), so the result is exact.
-        ensureGemmaStateCapacity(prev, promptTokens.length);
-        prev.position = p;
-        const fedTokens = promptTokens.slice(0, p);
-        let logits: np.Array | null = null;
-        for (let j = p; j < promptTokens.length; j++) {
-          logits?.dispose();
-          logits = runGemmaStep(tree.ref(this.model), promptTokens[j], prev);
-          fedTokens.push(promptTokens[j]);
-        }
-        return { state: prev, fedTokens, logits: logits!, persistent: true };
-      }
-      if (prev) tree.dispose(prev);
-      this.kvState = null;
-      this.kvTokens = [];
-      const state = createGemmaState({ dtype: np.float16 });
-      const logits = runGemmaPrefill(
-        tree.ref(this.model),
-        np.array(promptTokens, { dtype: np.uint32 }),
-        state,
-      );
-      return { state, fedTokens: promptTokens.slice(), logits, persistent: true };
-    }
-
-    const state = createGemmaState({ dtype: np.float16 });
-    const logits = runGemmaPrefill(
-      tree.ref(this.model),
-      np.array(promptTokens, { dtype: np.uint32 }),
-      state,
-    );
-    return { state, fedTokens: promptTokens.slice(), logits, persistent: false };
-  }
-
-  /** Persist (or drop, if over the cap) the reused KV state after a turn. */
-  private commitState(state: GemmaState, fedTokens: number[]): void {
-    const MAX_CACHED = 2048;
-    if (fedTokens.length > MAX_CACHED) {
-      tree.dispose(state);
-      this.kvState = null;
-      this.kvTokens = [];
-      return;
-    }
-    this.kvState = state;
-    this.kvTokens = fedTokens;
-  }
-
-  private formatPrompt(history: ChatMessage[]): string {
-    // Gemma 3 270M follows the plain chat template far better than an
-    // instruction preamble — folding a system prompt or per-turn [t+Ns] tag in
-    // here made the tiny model echo the instructions instead of answering. So
-    // the local prompt is just the raw conversation (the SYSTEM_HINT is used
-    // only by the larger Cerebras model). A [scene: …] tag, when present, is
-    // already baked into the message content by the duplex layer.
-    history = windowHistory(history);
-    let text = "";
-    for (const message of history) {
-      const content = message.content.trim();
-      if (content === "") continue;
-      const role = message.role === "assistant" ? "model" : "user";
-      text += `<start_of_turn>${role}\n${content}<end_of_turn>\n`;
-    }
-    text += "<start_of_turn>model\n";
-    return text;
-  }
-
-  /**
-   * Yield decoded text deltas as tokens are sampled, returning final stats.
-   * Consuming a suffix of this generator (e.g. stopping early on barge-in)
-   * runs the `finally` block and releases the KV-cache state.
-   */
-  async *generateStream(
-    history: ChatMessage[],
-    // Kept short so spoken replies stay to a couple of sentences — without a
-    // length instruction (which the 270M model echoes) this cap is what keeps
-    // it from monologuing.
-    maxNewTokens = TUNABLES.llmMaxNewTokens,
-  ): AsyncGenerator<string, GenerateStats, void> {
-    const promptTokens = [
-      this.tokenizer.bosToken,
-      ...this.tokenizer.encode(this.formatPrompt(history)),
-    ];
-    const generatedTokens: number[] = [];
-    // Fused single-dispatch decode vs the shipped per-layer path; same signature
-    // and side effects, so it swaps in transparently.
-    const stepFn = TUNABLES.llmFusedStep ? runGemmaStepFused : runGemmaStep;
-    // When on, the fused step folds topK into its jit and returns the packed
-    // top-k array instead of full logits (only meaningful with the fused step).
-    const topkInFused = TUNABLES.llmFusedStep && TUNABLES.llmTopkInFused;
-    const startTime = performance.now();
-    let firstTokenMs = 0;
-    let emitted = "";
-
-    const prepared = this.prepareState(promptTokens);
-    const { state, fedTokens, persistent } = prepared;
-    // `pending` is the next thing to sample from: the prefill's full-vocab
-    // logits for token 0, then either full logits or a packed top-k array from
-    // each step (pendingIsCombined tracks which, so the right sampler is used).
-    let pending: np.Array | null = prepared.logits;
-    let pendingIsCombined = false;
-
-    try {
-      const stopTokens = [this.tokenizer.eosToken, GEMMA_END_OF_TURN];
-
-      for (let i = 0; i < maxNewTokens; i++) {
-        const sampleable = pending!;
-        pending = null;
-        // The plain chat template (no instruction preamble) responds best at a
-        // natural sampling temperature, matching the jax-js chat demo.
-        const nextToken = pendingIsCombined
-          ? await this.sampleNextFromCombined(sampleable, 0.7)
-          : await this.sampleNext(sampleable, 0.7);
-        if (i === 0) firstTokenMs = performance.now() - startTime;
-        if (stopTokens.includes(nextToken)) break;
-
-        generatedTokens.push(nextToken);
-        const full = this.decodeVisible(generatedTokens);
-        const delta = full.startsWith(emitted) ? full.slice(emitted.length) : full;
-        emitted = full;
-        if (delta) yield delta;
-
-        if (i === maxNewTokens - 1) break;
-        if (topkInFused) {
-          pending = runGemmaStepFusedTopK(tree.ref(this.model), nextToken, state);
-          pendingIsCombined = true;
-        } else {
-          pending = stepFn(tree.ref(this.model), nextToken, state);
-          pendingIsCombined = false;
-        }
-        fedTokens.push(nextToken);
-      }
-
-      return {
-        promptTokens: promptTokens.length,
-        newTokens: generatedTokens.length,
-        firstTokenMs,
-        totalMs: performance.now() - startTime,
-      };
-    } finally {
-      pending?.dispose();
-      // With KV reuse the state is persisted for the next turn; otherwise it is
-      // released here (shipped behavior).
-      if (persistent) this.commitState(state, fedTokens);
-      else tree.dispose(state);
-    }
-  }
-
-  async generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-    maxNewTokens = TUNABLES.llmMaxNewTokens,
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    let text = "";
-    const stream = this.generateStream(history, maxNewTokens);
-    let result = await stream.next();
-    while (!result.done) {
-      text += result.value;
-      onText(text);
-      result = await stream.next();
-    }
-    return { text: text.trim(), stats: result.value };
-  }
-
-  private decodeVisible(tokens: number[]): string {
-    const visible = tokens.filter(
-      (t) =>
-        t !== 0 &&
-        t !== this.tokenizer.bosToken &&
-        t !== this.tokenizer.eosToken &&
-        t !== GEMMA_START_OF_TURN &&
-        t !== GEMMA_END_OF_TURN,
-    );
-    return this.tokenizer.decode(visible);
-  }
-}
-
-// SmolLM2-360M-Instruct brain. A blind-judged model shootout put it ~+0.9 (of 5)
-// over Gemma 3 270M at essentially the same size, winning every dimension across
-// three runs (see docs/BRAIN.md). Weights (fp16) + a precomputed tiktoken-style
-// tokenizer artifact are hosted on Hugging Face (CORS-open).
+// SmolLM2-360M-Instruct brain, chosen via a blind-judged model shootout over
+// same-size and larger alternatives (winning every dimension across three
+// runs). Weights + a precomputed tiktoken-style tokenizer artifact are hosted
+// on Hugging Face (CORS-open).
 const SMOLLM_BASE =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
 const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
@@ -1092,7 +482,7 @@ const EMPTY_SET: ReadonlySet<number> = new Set<number>();
 const SMOLLM_IM_START = 1; // <|im_start|>
 const SMOLLM_IM_END = 2; // <|im_end|> — ends the assistant turn
 const SMOLLM_EOS = 0; // <|endoftext|>
-// SmolLM2 honors a system role (Gemma 3 270M didn't). A spoken-format prompt.
+// SmolLM2 honors a real ChatML system role. A spoken-format prompt.
 const SMOLLM_SYSTEM =
   "You are a warm, helpful voice assistant. Answer directly in a natural, " +
   "spoken style — a sentence or two, no lists, bullet points, or markdown. A " +
@@ -1106,9 +496,9 @@ type SmolLmTokenizerData = {
 };
 
 /**
- * SmolLM2 brain implementing the same ChatModel interface as LocalChatModel, so
- * the duplex engine is agnostic to which model backs it. Uses the fused
- * single-dispatch decode + GPU top-k path for parity with the Gemma perf work.
+ * SmolLM2 brain implementing the ChatModel interface, so the duplex engine is
+ * agnostic to which model backs it. Each decode step is a fused single-dispatch
+ * jit with the top-k reduction folded in (one small readback per token).
  */
 export class SmolLmChatModel implements ChatModel {
   private constructor(
@@ -1284,16 +674,17 @@ export class SmolLmChatModel implements ChatModel {
     );
   }
 
-  // NOTE (cycle 6): cross-turn KV-cache reuse for SmolLM was built here
-  // (prefix-match + token-by-token suffix feed through the fused decode step,
-  // mirroring the Gemma llmKvReuse port) and REJECTED at MAP: every fused step
+  // NOTE (cycle 6): cross-turn KV-cache reuse was built here (prefix-match +
+  // token-by-token suffix feed through the fused decode step) and REJECTED at
+  // MAP: every fused step
   // is a full GPU submit→execute→sync roundtrip (~40-60 ms), so re-feeding a
   // reply-sized suffix (30-100 tokens) costs seconds — measured llmFirst
   // medians went 674-1002 ms → 4786 ms, with a 16 s spike when a KV-capacity
   // grow re-traced the fused jit on the critical path. The family is removed,
-  // not flag-gated (the repo's rule for proven dead-ends): it cannot pay until
-  // a batched offset-prefill (prefix-aware attention mask in smollm.ts) exists,
-  // and bucketed prefill (llmPrefillBucket) already cut the cost it targeted.
+  // removed rather than flag-gated (the repo's rule for proven dead-ends): it
+  // cannot pay until a batched offset-prefill (prefix-aware attention mask in
+  // smollm.ts) exists, and bucketed prefill (llmPrefillBucket) already cut the
+  // cost it targeted.
 
   /**
    * Measure a full prefill of a synthetic ~voice-turn prompt (median over
