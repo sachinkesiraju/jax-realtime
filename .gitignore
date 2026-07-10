@@ -11,3 +11,9 @@ dist/
 *.log
 .DS_Store
 public/weights/
+
+# Bench artifacts
+bench/.profile/
+bench/results/
+.worktrees/
+.netlify/

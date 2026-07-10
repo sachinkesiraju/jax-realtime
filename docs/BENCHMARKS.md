@@ -403,6 +403,79 @@ frame count both paths (same EOS decision, same 3200 ms audio) = equivalent
 output. E2E verified (62 audio chunks, coherent reply). Shipped on
 (ttsFusedStep). Prefill step 0 stays unfused (fuse-decode-only, like Gemma).
 
+## Map-reduce campaign — cycle 6 (turn-latency: prefill re-trace + onset redo)
+
+Target: the user-felt "delay in speaking after the message is sent" —
+`firstAudio − endOfSpeech` — which regressed with the SmolLM2-360M brain swap.
+New infra: a repeatable Node harness (`bench/run.mjs`, puppeteer-core driving
+real Chrome with `--use-fake-device-for-media-stream` +
+`--use-file-for-fake-audio-capture`; `--no-sandbox` is required or the fake
+device silently reads nothing) that loads the app, disables the Eye, applies
+per-condition TUNABLES overrides, and samples `window.__turnLog`. Clips are
+`say`-synthesized WAVs with 14 s silence pads (one loop = one turn);
+`bench/probe.mjs` runs console-level micro-benches.
+
+**DIAGNOSE (measured, not assumed):** stage medians put the fat in
+`llmFirst` (endpoint→first LLM delta): 639–1208 ms and *growing per turn*,
+vs endpoint ~450–600 (settle floor, cycle-1 law), sentence ~250–330, TTS
+~90–380 ms. `benchPrefill(250)` found the smoking gun: **334 ms warm vs
+1004 ms on first encounter of a length** — jax-js trace caches key on shapes,
+and every turn has a new prompt length, so all 32 SmolLM prefill layer jits
+re-trace + recompile EVERY turn. The prefill cost was compile time, not GPU
+math (250-token × 360M prefill is ~50 ms of FLOPs).
+
+**MAP** (n=6 turns/cond, warm medians of turns 2–6, same clip, paired
+overrides `llmMaxHistoryTurns:4, llmMaxNewTokens:48` to bound history-growth
+noise; baseline noise band ±150 ms):
+
+| cond | turnLat | llmFirst | onset (first sound) |
+| --- | --- | --- | --- |
+| baseline ×2 | 1815 / 1965 | 674 / 1002 | — |
+| **kv-reuse (SmolLM port)** | **5810 — REJECTED** | 4786 (+16 s re-trace spike) | — |
+| **bucket64 prefill** | **1366** | **347, flat per-turn** | — |
+| onset filler (same-clock) | 1707 (≈noise) | 495 | **659** |
+
+- **KV reuse rejected, family removed** (the cycle-2 rule: proven dead-ends
+  are deleted, not flag-gated). The port was mechanically correct
+  (prefix-match + throw-safe commit), but its suffix feed pays one fused-step
+  GPU sync roundtrip per token — a reply-sized suffix (30–100 tokens) costs
+  seconds, and `ensureSmolLmStateCapacity` growth re-traced the fused jit ON
+  the critical path (the 16 s spike). **Law: on jax-js, token-by-token
+  feeding can never beat a batched prefill for suffixes longer than ~5
+  tokens; KV reuse pays only with a batched offset-prefill (prefix-aware
+  attention mask), which doesn't exist yet.**
+- **bucket64 shipped** (`llmPrefillBucket: 64`): pad the prompt to the next
+  64-token multiple (pad id = eos) so prefill trace shapes repeat. Exact by
+  construction — pads sit at the end, logits read at the last REAL token,
+  pad KV slots are overwritten before ever becoming attendable — and
+  equivalence-gated on-device: argmax identical, max |Δ| 3.6e-5
+  (`benchPrefillEquivalence`).
+- **Onset filler** (cycle-3 Campaign A redo, this time obeying the law): the
+  pre-rendered "So,"/"Right,"/"Okay, so" PCM is scheduled as the first chunk
+  of the SAME streaming player the reply uses — one stream, one clock;
+  overlap is structurally impossible, worst case is dead air. First sound at
+  ~510–805 ms with real-reply latency unchanged. `onsetFiller` stays
+  **default off**: the cycle-3 law demands an ears gate, and only the bench
+  half has passed. Flip it on and listen before shipping it.
+
+**FUSE + HOLDOUT** (bucket64 + onset, unseen clip, n=6):
+
+| cond | turnLat | llmFirst | onset |
+| --- | --- | --- | --- |
+| baseline (holdout clip) | 1713 | 817 (growing, max 1231) | — |
+| **fused (holdout clip)** | **1191 (−30 %)** | **250, flat** | 510 |
+
+No reversal. `llmFirst` stops growing with session length entirely — the
+per-turn re-trace is gone (each new 64-bucket boundary pays one warm-up
+re-trace, then every turn in that bucket is warm).
+
+Residual (recorded): the shipped-defaults confirmation run (no bench caps)
+was blocked by a post-sleep CoreAudio wedge on the bench machine
+(`AudioQueueStart failed -66681` — even `afplay` fails; `sudo killall
+coreaudiod` fixes it). Holdout numbers stand; re-run
+`node bench/run.mjs --clip bench/clips/map_a.wav --turns 6 --label defaults`
+after the audio daemon restart for the record.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
@@ -423,9 +496,10 @@ Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
 3. **Shorter replies** — cap first-sentence tokens; the SYSTEM_HINT already asks
    for 1–3 short sentences. A tighter "lead with one short sentence" nudge lowers
    time-to-first-audio variance.
-4. **LLM prefill speed** — Gemma prefill is the dominant first-token cost; batch
-   the prompt prefill (already single-shot) and keep prompts short (trim history
-   / summarize old turns) so prefill stays cheap as the session grows.
+4. ~~**LLM prefill speed**~~ — *fixed in cycle 6*: the dominant cost was
+   per-prompt-length jit re-tracing, not FLOPs; `llmPrefillBucket: 64` makes
+   trace shapes repeat and holds llmFirst flat (~250-350 ms) as the session
+   grows. KV reuse remains a dead-end until a batched offset-prefill exists.
 5. **ASR commit latency** (for caption freshness / earlier turn-end confidence),
    not turn latency: shorten `minPassIntervalMs`, cap the streaming window to the
    last ~8 s so passes stay fast, tune LocalAgreement so committed text stabilizes

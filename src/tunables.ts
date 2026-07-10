@@ -67,11 +67,15 @@ export const TUNABLES = {
    */
   llmTopkInFused: true,
   /**
-   * Reuse the KV cache across conversation turns. When on, a new turn whose
-   * tokenized prompt shares a prefix with the cached sequence only prefills the
-   * differing suffix instead of the whole prompt. Default false rebuilds the
-   * cache every turn (shipped behavior). Prefix comparison is on token IDs, so
-   * any divergence (e.g. retokenized history) safely falls back to a rebuild.
+   * Reuse the KV cache across conversation turns (Gemma/LocalChatModel ONLY).
+   * When on, a new turn whose tokenized prompt shares a prefix with the cached
+   * sequence only prefills the differing suffix instead of the whole prompt.
+   * Default false rebuilds the cache every turn (shipped behavior). Prefix
+   * comparison is on token IDs, so any divergence (e.g. retokenized history)
+   * safely falls back to a rebuild. A SmolLM port was built and REJECTED in
+   * cycle 6: its token-by-token suffix feed pays a GPU sync roundtrip per
+   * token, regressing llmFirst ~0.7 s → ~4.8 s (see docs/BENCHMARKS.md); the
+   * SmolLM path was removed, so this flag is a no-op on the SmolLM brain.
    */
   llmKvReuse: false,
   /**
@@ -86,9 +90,14 @@ export const TUNABLES = {
    * pad tokens. Exact by construction: pads sit at the end, logits are read
    * at the last REAL token, and pad KV slots are overwritten before they can
    * ever be attended (see runSmolLmPrefill / runBucketedPrefill comments).
-   * Proposed value 64; ships 0 for the A/B bench to flip.
+   * Shipped 64 (cycle 6): MAP llmFirst median 674–1002 → 347 ms and turn
+   * latency 1815–1965 → 1366 ms; holdout (unseen clip) confirmed with no
+   * reversal (turn 1713 → 1191 ms fused, llmFirst flat ~250 ms instead of
+   * growing past 1 s). Equivalence-gated on-device: bucketed vs unbucketed
+   * logits argmax identical, max |Δ| 3.6e-5 (fp16 reduction-order noise) —
+   * benchPrefillEquivalence(250, 64).
    */
-  llmPrefillBucket: 0,
+  llmPrefillBucket: 64,
   /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
    * (whole user/assistant pairs). 0 = unlimited. Shipped at 16 (8 exchanges):
@@ -149,7 +158,11 @@ export const TUNABLES = {
    * is structurally impossible (the player's nextStartTime clock serializes
    * every chunk; worst case is dead air between filler and reply, never a
    * collision). Default false: ships only if the bench AND a human listen
-   * pass.
+   * pass. Bench half passed (cycle 6): first sound at ~510–805 ms after end
+   * of user speech vs ~1.2–1.8 s for the real reply, with real-reply latency
+   * unchanged within noise. The EARS half of the gate is still open — flip
+   * this on and listen for whether "So, … <pause> …reply" beats silence
+   * before it defaults on.
    */
   onsetFiller: false,
 
