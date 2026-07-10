@@ -65,7 +65,7 @@ try {
   });
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // Load models (OPFS-cached after the first run; first run downloads ~680MB).
+  // Load models (OPFS-cached after the first run; first run downloads ~790MB).
   await page.waitForSelector("#load-btn:not([disabled])", { timeout: 30_000 });
   console.log("[bench] loading models…");
   await page.click("#load-btn");

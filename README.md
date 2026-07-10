@@ -81,8 +81,9 @@ npm run dev
 ```
 
 Open http://localhost:5173 in a WebGPU-capable browser (Chrome/Edge on desktop,
-Safari 26+). Click **Load models** (~750 MB on first run, cached in OPFS
-afterwards), grant camera access for the Eye, then press the orb once and just
+Safari 26+). Click **Load models** (~790 MB on first run — SmolLM 363 +
+Pocket TTS 236 + Whisper 144 + D-FINE 42, cached in OPFS afterwards), grant
+camera access for the Eye, then press the orb once and just
 talk — hands-free: turn ends are detected by silence, your words stream into the
 transcript live, the assistant answers out loud and resumes listening. Press the
 orb again to end.

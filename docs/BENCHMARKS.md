@@ -288,6 +288,11 @@ than a partial state whose first reply may stall on a download.
 The quantized file is served from `public/weights/` (gitignored); fresh clones
 fall back to the fp16 HF file automatically.
 
+*(Historical — these totals are for the Gemma-era pipeline. The shipped
+pipeline today is SmolLM2-360M int8 363 + Pocket TTS 236 + Whisper base.en
+144 + D-FINE 42 ≈ **790 MB**, still fetched in parallel and OPFS-cached; the
+same per-row int8 scheme carried over to the SmolLM weights.)*
+
 ## Map-reduce campaign — cycle 5 (GPT-Live-inspired: patience + delegation)
 
 Source: OpenAI's GPT-Live launch (July 2026). Its two transferable ideas for a
