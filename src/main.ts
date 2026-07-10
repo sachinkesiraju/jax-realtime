@@ -364,6 +364,10 @@ async function handleLoad() {
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    // Onset fillers ride the same load-time pre-render pass (see
+    // TUNABLES.onsetFiller — cached PCM is the only way the filler can play
+    // instantly while the GPU is busy with the reply's LLM prefill).
+    await pipeline.tts.prepareOnsets(el.voiceSelect.value as TTSVoice);
     // Await the detector's download + JIT warmup (no camera permission needed,
     // safe to block on) so it's fully compiled by the time we're ready — the
     // Eye then detects instantly instead of stalling seconds into the standby
@@ -399,9 +403,14 @@ async function handleLoad() {
 }
 
 el.voiceSelect.addEventListener("change", () => {
-  // Re-synthesize backchannel clips in the new voice (background, best-effort).
+  // Re-synthesize backchannel + onset clips in the new voice (background,
+  // best-effort). Sequential, not parallel: both paths synthesize on the one
+  // WebGPU device, and speakStream simply skips the onset while onsetVoice
+  // still names the old voice (voice-mismatch guard), so there's no window
+  // where a stale-voice filler could play.
   void pipeline?.tts
     .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+    .then(() => pipeline?.tts.prepareOnsets(el.voiceSelect.value as TTSVoice))
     .catch(() => {});
 });
 

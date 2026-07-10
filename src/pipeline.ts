@@ -1588,7 +1588,12 @@ export class CerebrasChatModel implements ChatModel {
 }
 
 export type SpeakStats = {
+  /** First SYNTHESIZED chunk scheduled (the onset filler never counts here —
+   *  the bench's firstAudio stat must keep meaning real reply audio, or an
+   *  onsetFiller run would silently inflate its own latency numbers). */
   firstAudioMs: number;
+  /** Pre-rendered onset filler chunk scheduled (0 = none played). */
+  onsetAudioMs: number;
   totalMs: number;
   aborted: boolean;
 };
@@ -1596,15 +1601,33 @@ export type SpeakStats = {
 export type SpeakOptions = {
   signal?: AbortSignal;
   onAnalyser?: (analyser: AnalyserNode) => void;
+  /** Fired when an onset filler is scheduled, with its phrase text, so the
+   *  duplex layer can fold the words into the ASR self-echo filter (the
+   *  filler is audible speech the mic may pick up, even though it is never
+   *  part of the reply text/history). */
+  onOnset?: (text: string) => void;
 };
 
 const TTS_SAMPLE_RATE = 24_000; // Mimi codec output rate.
 const BACKCHANNEL_PHRASES = ["Mm-hmm.", "Right.", "Got it."] as const;
+// Onset fillers: spoken at reply start to mask real turn latency (see
+// TUNABLES.onsetFiller). Deliberately open-ended lead-ins (trailing comma /
+// "so") rather than complete words like the backchannels — they must sound
+// like the start of the sentence that follows, not a finished acknowledgment.
+const ONSET_PHRASES = ["So,", "Right,", "Okay, so"] as const;
 
 export class SpeechSynthesizer {
   private voiceEmbeds = new Map<TTSVoice, np.Array>();
   private backchannels: Float32Array[] = [];
   private backchannelVoice: TTSVoice | null = null;
+  // Onset fillers cached per-voice exactly like the backchannels: PCM only,
+  // pre-rendered at load so speakStream never touches the GPU for them (the
+  // GPU is busy with the LLM prefill at exactly the moment the onset plays).
+  private onsets: { text: string; pcm: Float32Array }[] = [];
+  private onsetVoice: TTSVoice | null = null;
+  // Rotate phrases so consecutive replies don't all open with the same word
+  // (a fixed "So," on every turn reads as a tic, not a natural lead-in).
+  private lastOnsetIdx = -1;
 
   private constructor(
     private model: PocketTTS,
@@ -1715,6 +1738,7 @@ export class SpeechSynthesizer {
     }
     return {
       firstAudioMs,
+      onsetAudioMs: 0, // onsets are for real replies only, never speak()
       totalMs: performance.now() - startTime,
       aborted: !!signal?.aborted,
     };
@@ -1727,10 +1751,11 @@ export class SpeechSynthesizer {
   async speakStream(
     voice: TTSVoice,
     sentences: AsyncIterable<string>,
-    { signal, onAnalyser }: SpeakOptions = {},
+    { signal, onAnalyser, onOnset }: SpeakOptions = {},
   ): Promise<SpeakStats> {
     const startTime = performance.now();
     let firstAudioMs = 0;
+    let onsetAudioMs = 0;
     const inner = createStreamingPlayer();
     onAnalyser?.(inner.analyser);
     const player = withFirstAudio(inner, () => {
@@ -1745,6 +1770,28 @@ export class SpeechSynthesizer {
     signal?.addEventListener("abort", onAbort);
 
     try {
+      // Onset filler (cycle-3 law: ONE gapless stream on ONE clock). The
+      // cached PCM is scheduled through THE SAME player as the reply, so the
+      // first synthesized chunk appends on the player's nextStartTime clock —
+      // dead air between filler and reply is possible (acceptable), audible
+      // overlap/clipping is structurally impossible (the failure mode of the
+      // reverted two-context attempt, docs/BENCHMARKS.md Campaign A). Played
+      // via `inner`, NOT the withFirstAudio wrapper: firstAudioMs must keep
+      // meaning the first SYNTHESIZED chunk for the bench. Registered abort
+      // listener above already covers it: inner.stop() cuts every live
+      // source, onset included, so a barge-in mid-filler goes silent too.
+      if (
+        TUNABLES.onsetFiller &&
+        this.onsetVoice === voice &&
+        this.onsets.length > 0 &&
+        !signal?.aborted
+      ) {
+        const pick = this.pickOnset();
+        await inner.playChunk(pick.pcm);
+        onsetAudioMs = performance.now() - startTime;
+        onOnset?.(pick.text);
+      }
+
       for await (const sentence of sentences) {
         if (signal?.aborted) break;
         const line = sentence.trim();
@@ -1761,6 +1808,7 @@ export class SpeechSynthesizer {
     }
     return {
       firstAudioMs,
+      onsetAudioMs,
       totalMs: performance.now() - startTime,
       aborted: !!signal?.aborted,
     };
@@ -1876,6 +1924,47 @@ export class SpeechSynthesizer {
     this.backchannelVoice = voice;
   }
 
+  /**
+   * Pre-synthesize the onset filler phrases once (off the audio graph) and
+   * cache their PCM, mirroring prepareBackchannels: speakStream can then
+   * schedule an onset with zero GPU work at the exact moment the GPU is busy
+   * with the LLM prefill. Prepared unconditionally (not gated on
+   * TUNABLES.onsetFiller) so the in-browser bench can flip the tunable
+   * between sessions without a reload — three sub-second phrases add only a
+   * couple seconds to the one-time load, same order as the backchannels.
+   */
+  async prepareOnsets(voice: TTSVoice): Promise<void> {
+    if (this.onsets.length && this.onsetVoice === voice) return;
+    const clips: { text: string; pcm: Float32Array }[] = [];
+    for (const phrase of ONSET_PHRASES) {
+      const collector = createStreamingPlayer({ collectPcm: true });
+      try {
+        await this.synthOne(voice, phrase, collector, null);
+        // Trim the silent tail Pocket TTS emits after short phrases (the
+        // framesAfterEos padding). The backchannels don't bother — they play
+        // in isolation — but here every trailing silent sample directly delays
+        // the reply's first synthesized chunk on the shared clock, turning
+        // "So, <reply>" into "So, ... <reply>".
+        clips.push({ text: phrase, pcm: trimTrailingSilence(collector.pcm()) });
+      } finally {
+        await collector.close();
+      }
+    }
+    this.onsets = clips;
+    this.onsetVoice = voice;
+    this.lastOnsetIdx = -1;
+  }
+
+  /** Pick a random onset, avoiding an immediate repeat of the last one. */
+  private pickOnset(): { text: string; pcm: Float32Array } {
+    let idx = Math.floor(Math.random() * this.onsets.length);
+    if (this.onsets.length > 1 && idx === this.lastOnsetIdx) {
+      idx = (idx + 1) % this.onsets.length;
+    }
+    this.lastOnsetIdx = idx;
+    return this.onsets[idx];
+  }
+
   /** Play a random cached backchannel instantly through a short-lived context. */
   playBackchannel(): void {
     if (!this.backchannels.length) return;
@@ -1891,6 +1980,30 @@ export class SpeechSynthesizer {
     source.onended = () => void ctx.close().catch(() => {});
     source.start();
   }
+}
+
+/**
+ * Drop trailing near-silence from a PCM clip: scan backwards in 10 ms windows
+ * and cut everything after the last window whose RMS clears ~1e-3 (well below
+ * audible speech, above float noise). Used on the pre-rendered onset fillers,
+ * where Pocket TTS's post-EOS padding frames would otherwise sit between the
+ * filler and the reply's first chunk on the shared player clock as dead air.
+ * Windowed RMS (not per-sample) so a single stray sample can't defeat the trim.
+ */
+function trimTrailingSilence(
+  pcm: Float32Array,
+  sampleRate = TTS_SAMPLE_RATE,
+): Float32Array {
+  const win = Math.max(1, Math.round(sampleRate * 0.01)); // 10 ms
+  let end = pcm.length;
+  while (end > 0) {
+    const start = Math.max(0, end - win);
+    let sumSq = 0;
+    for (let i = start; i < end; i++) sumSq += pcm[i] * pcm[i];
+    if (Math.sqrt(sumSq / (end - start)) >= 1e-3) break;
+    end = start;
+  }
+  return end === pcm.length ? pcm : pcm.slice(0, end);
 }
 
 /** Wrap a player so the first played chunk fires `onFirst()` (for timing). */
