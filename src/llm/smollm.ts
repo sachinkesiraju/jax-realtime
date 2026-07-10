@@ -358,11 +358,27 @@ export function ensureSmolLmStateCapacity(
   state.capacity = newCapacity;
 }
 
+// `realLength` supports bucket-padded prefills (TUNABLES.llmPrefillBucket):
+// tokenIds may be padded past the real prompt so the per-layer prefill jit's
+// trace (keyed on avals, i.e. on T) is reused across turns instead of
+// re-tracing all 32 layers for every new prompt length. Exactness: pad tokens
+// sit at the END, real-token queries are causal (attend only to j <= i, all
+// real), and the logits are gathered at realLength-1 (the last REAL token) —
+// so the returned distribution is identical to an unpadded prefill. The pad
+// rows do write garbage KV (wrong RoPE positions, pad-token content) into
+// slots [realLength, tokenIds.shape[0]), but those slots are never attended
+// later: state.position is set to realLength, every decode step's validMask
+// admits only slots < position+1, and each step overwrites slot == position
+// with real KV before position advances past it — garbage is always
+// overwritten before it becomes attendable.
 export function runSmolLmPrefill(
   model: SmolLmModel,
   tokenIds: np.Array,
   state: SmolLmState,
+  realLength: number = tokenIds.shape[0],
 ): np.Array {
+  // Capacity must cover the PADDED length — the pad rows' KV slots are
+  // written (then later overwritten) even though they are never attended.
   ensureSmolLmStateCapacity(state, tokenIds.shape[0]);
 
   let x = runEmbedding({ weight: model.embedTokens.weight.ref }, tokenIds);
@@ -378,11 +394,11 @@ export function runSmolLmPrefill(
   }
 
   x = runSmolLmRMSNorm(model.norm, x);
-  x = x.slice([-1]);
+  x = x.slice([realLength - 1, realLength]);
   const logits = runLinear(model.embedTokens, x).reshape([
     SMOLLM_CONFIG.vocabSize,
   ]);
-  state.position = tokenIds.shape[0];
+  state.position = realLength;
   return logits;
 }
 

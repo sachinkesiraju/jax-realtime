@@ -75,6 +75,21 @@ export const TUNABLES = {
    */
   llmKvReuse: false,
   /**
+   * Bucket size (tokens) for padding the SmolLM full prefill; 0 = off
+   * (shipped behavior). jax-js trace caches key on avals (shapes), and every
+   * conversation turn has a NEW prompt length T — so all 32 layer prefill
+   * jits re-trace + recompile EVERY turn (measured: a 250-token prefill is
+   * ~334 ms warm vs ~1004 ms on first encounter of a length; turn-latency
+   * benches show llmFirst growing 219→2129 ms as history grows). Padding the
+   * prompt up to the next multiple of the bucket makes trace shapes repeat
+   * across turns, so a warm bucket costs only the (small) extra FLOPs of the
+   * pad tokens. Exact by construction: pads sit at the end, logits are read
+   * at the last REAL token, and pad KV slots are overwritten before they can
+   * ever be attended (see runSmolLmPrefill / runBucketedPrefill comments).
+   * Proposed value 64; ships 0 for the A/B bench to flip.
+   */
+  llmPrefillBucket: 0,
+  /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
    * (whole user/assistant pairs). 0 = unlimited. Shipped at 16 (8 exchanges):
    * unbounded history let Gemma's prefill grow every turn until a long session

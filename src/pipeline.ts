@@ -1256,6 +1256,46 @@ export class SmolLmChatModel implements ChatModel {
   }
 
   /**
+   * Full prefill, optionally bucket-padded (TUNABLES.llmPrefillBucket > 0):
+   * pad the prompt UP to the next multiple of `bucket` so the prefill jits'
+   * trace shapes (keyed on T) repeat across turns instead of re-tracing all
+   * 32 layers for every new prompt length. Exactness argument (verified
+   * against runSmolLmStep/runSmolLmDecodeStepFused): pads sit at the END, so
+   * every real token's causal attention sees only real tokens; the logits are
+   * gathered at realLength-1 (a real token). Pad queries produce garbage
+   * outputs (discarded) and garbage KV in slots [realLength, paddedLen) — but
+   * runSmolLmPrefill sets state.position = realLength, every decode step's
+   * validMask admits only slots < position+1, and each step overwrites
+   * slot == position before position advances past it, so a garbage slot is
+   * always overwritten before it becomes attendable. Wrong RoPE angles on pad
+   * positions are irrelevant for the same reason. Pad id: <|im_end|> (any
+   * valid embedding row works; this is SmolLM2's eos/pad token).
+   *
+   * `promptTokens` is never mutated — callers keep it as the REAL token list
+   * (fedTokens/kvTokens must never contain padding).
+   */
+  private runBucketedPrefill(
+    promptTokens: number[],
+    state: SmolLmState,
+    bucket = TUNABLES.llmPrefillBucket,
+  ): np.Array {
+    const realLength = promptTokens.length;
+    let ids = promptTokens;
+    if (bucket > 0 && realLength % bucket !== 0) {
+      const paddedLen = Math.ceil(realLength / bucket) * bucket;
+      ids = promptTokens.concat(
+        new Array<number>(paddedLen - realLength).fill(SMOLLM_IM_END),
+      );
+    }
+    return runSmolLmPrefill(
+      tree.ref(this.model),
+      np.array(ids, { dtype: np.uint32 }),
+      state,
+      realLength,
+    );
+  }
+
+  /**
    * Prepare decode state for a turn (SmolLM port of LocalChatModel.prepareState).
    * Without KV reuse: a fresh full prefill (shipped behavior), disposed after
    * the stream. With reuse: roll the persistent cache back to the longest
@@ -1336,11 +1376,7 @@ export class SmolLmChatModel implements ChatModel {
       }
       if (prev) tree.dispose(prev);
       const state = createSmolLmState({ dtype: np.float16 });
-      const pending = runSmolLmPrefill(
-        tree.ref(this.model),
-        np.array(promptTokens, { dtype: np.uint32 }),
-        state,
-      );
+      const pending = this.runBucketedPrefill(promptTokens, state);
       return {
         state,
         fedTokens: promptTokens.slice(),
@@ -1351,11 +1387,7 @@ export class SmolLmChatModel implements ChatModel {
     }
 
     const state = createSmolLmState({ dtype: np.float16 });
-    const pending = runSmolLmPrefill(
-      tree.ref(this.model),
-      np.array(promptTokens, { dtype: np.uint32 }),
-      state,
-    );
+    const pending = this.runBucketedPrefill(promptTokens, state);
     return {
       state,
       fedTokens: promptTokens.slice(),
@@ -1384,8 +1416,18 @@ export class SmolLmChatModel implements ChatModel {
    * KV-reuse payoff (compare against the per-turn suffix feed). The first run
    * includes jit trace/compile for this prompt length — the prefill jit
    * specializes on T — so it is reported separately from the median.
+   *
+   * `bucket` (default: TUNABLES.llmPrefillBucket) exercises the bucket-padded
+   * path: compare firstMs at, e.g., nTokens=250 vs 251 with bucket=64 (same
+   * padded shape → the second length's first run is already warm) against
+   * bucket=0 (every new length pays the ~700 ms re-trace).
    */
-  async benchPrefill(nTokens = 250, runs = 5): Promise<Record<string, unknown>> {
+  async benchPrefill(
+    nTokens = 250,
+    runs = 5,
+    opts: { bucket?: number } = {},
+  ): Promise<Record<string, unknown>> {
+    const bucket = opts.bucket ?? TUNABLES.llmPrefillBucket;
     // Real ChatML head + filler user text repeated to the target length, so the
     // measured shape matches a real turn's prompt rather than random ids.
     const tokens = this.encodePrompt([{ role: "user", content: "Hi" }]);
@@ -1399,11 +1441,7 @@ export class SmolLmChatModel implements ChatModel {
     for (let r = 0; r < runs; r++) {
       const state = createSmolLmState({ dtype: np.float16 });
       const t0 = performance.now();
-      const logits = runSmolLmPrefill(
-        tree.ref(this.model),
-        np.array(tokens, { dtype: np.uint32 }),
-        state,
-      );
+      const logits = this.runBucketedPrefill(tokens, state, bucket);
       await blockUntilReady(logits.ref);
       times.push(performance.now() - t0);
       logits.dispose();
@@ -1413,6 +1451,7 @@ export class SmolLmChatModel implements ChatModel {
     return {
       nTokens,
       runs,
+      bucket,
       firstMs: +times[0].toFixed(1),
       medianMs: +sorted[Math.floor(sorted.length / 2)].toFixed(1),
       allMs: times.map((t) => +t.toFixed(1)),
