@@ -40,9 +40,10 @@ assistant stops.
   they reach Whisper, and a repetition-degeneracy gate drops decoder loops — so
   the assistant doesn't answer "thank you"s you never said. Snappy one-word
   replies ("what?", "no") still get through.
-- **Eye (vision)** — on by default, loaded lazily: the detector downloads and
-  warms only when the Eye is actually enabled (uncheck it before loading and
-  its 42 MB never fetch). D-FINE runs low-priority object detection (it
+- **Eye (vision)** — on by default; the webcam is already detecting on the
+  standby screen, before you press the orb. The detector loads only when the
+  Eye is actually enabled (uncheck it before loading — or deny the camera —
+  and its 42 MB never fetch). D-FINE runs low-priority object detection (it
   yields the GPU to audio), smooths the person count, and answers
   "what do you see?" / "how many people?" / "tell me about the person"
   directly from the measurements. Proactive interjections (stepped away,
