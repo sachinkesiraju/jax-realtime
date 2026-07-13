@@ -586,8 +586,15 @@ evidence).
 The one measured leak WAS fixed classically: the backchannel fired on typing
 noise because it ran before the endpoint-time guard — it now requires the
 same voiced-evidence test (`utteranceSoundsVoiced`, duplex.ts) before humming.
-(Post-fix confirmation run pending a CoreAudio restart on the bench machine —
-the fake mic dies whenever the host sleeps; `sudo killall coreaudiod`.)
+Confirmed post-fix: 60 s typing clip → 0 turns, **0 backchannels** (was 2),
+19 phantom discards (non-vacuous — the mic heard every click train), and a
+4-turn speech run stayed healthy (turnLat 1195–1535 ms, endpoint ~449 ms,
+zero behavioral change on real speech).
+
+Bench-host note (recurring): the Chrome fake-mic goes silent whenever this
+Mac sleeps — CoreAudio wedges (`AudioQueueStart -66681`, even `afplay`
+fails) and `sudo killall coreaudiod` revives it. A wedged run is detectable
+by zero turns AND zero discards on a clip that should produce either.
 
 ## Hill-climb levers (ordered by expected payoff)
 
