@@ -5,7 +5,6 @@
 // condition = one page session; conditions differ only by TUNABLES overrides,
 // so a single build serves every candidate.
 //
-//   bash bench/clips/generate.sh   # once — clips are generated, not committed
 //   node bench/run.mjs --clip bench/clips/map_a.wav --turns 5 \
 //     --label baseline --tunables '{"llmPrefillBucket":0}'
 //

@@ -17,4 +17,4 @@ bench/.profile/
 bench/results/
 .worktrees/
 .netlify/
-bench/clips/*.wav
+bench/clips/
