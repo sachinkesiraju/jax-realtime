@@ -40,12 +40,19 @@ assistant stops.
   they reach Whisper, and a repetition-degeneracy gate drops decoder loops — so
   the assistant doesn't answer "thank you"s you never said. Snappy one-word
   replies ("what?", "no") still get through.
-- **Eye (vision)** — on by default; the webcam is already detecting on the
-  standby screen, before you press the orb. D-FINE runs low-priority object
-  detection (it yields the GPU to audio), smooths the person count, and grounds
-  "what do you see?" / "how many people?" from the measurements. Proactive
-  interjections (stepped away, phone spotted, slouching) are best-effort rule
-  heuristics. The webcam shows as a corner PiP with detection boxes.
+- **Eye (vision)** — on by default, loaded lazily: the detector downloads and
+  warms only when the Eye is actually enabled (uncheck it before loading and
+  its 42 MB never fetch). D-FINE runs low-priority object detection (it
+  yields the GPU to audio), smooths the person count, and answers
+  "what do you see?" / "how many people?" / "tell me about the person"
+  directly from the measurements. Proactive interjections (stepped away,
+  phone spotted, slouching) are best-effort rule heuristics. The webcam shows
+  as a corner PiP with detection boxes.
+- **Voice-clean replies** — markdown/bracket tokens are unsampleable at the
+  logit level (a voice never needs "**" or "[placeholder]"), and garbled
+  input gets "sorry, I didn't catch that" instead of a confidently wrong
+  answer (a few-shot exemplar teaches the 360M brain what a bare instruction
+  couldn't).
 - **Two-tier tools** — factual asks are delegated so the small on-device model
   isn't left guessing: weather ("what's the weather in Tokyo" → [open-meteo](https://open-meteo.com/),
   in °F/mph), facts ("who is Ada Lovelace" → Wikipedia), plus instant offline
@@ -66,12 +73,17 @@ map-reduce campaign log, including the negative results):
 - **GPU top-k sampling** — the LLM samples from a device-side top-64 (one small
   readback) instead of transferring the full vocab logits every token,
   folded into the fused step's single dispatch.
+- **Bucket-padded prefill** — jax-js re-traces its jits for every new tensor
+  shape, and every conversation turn has a new prompt length; padding the
+  prompt to 64-token buckets makes traces repeat, holding LLM first-token
+  flat (~250–350 ms) instead of growing past 1 s as history accumulates
+  (−30% turn latency on the holdout bench, exactness verified on-device).
 - **Smaller download** — the LLM ships per-row int8 (363 MB instead of 724 MB
   fp16; perplexity +0.7%) and is dequantized to fp16 at load, and the model
   weights fetch in parallel.
 
-Runtime behaviour is tunable at `src/tunables.ts` (read live, so the in-browser
-bench can A/B without a rebuild).
+Runtime behaviour is tunable at `src/tunables.ts` (read live, so A/B
+experiments don't need a rebuild).
 
 ## Run it
 
@@ -82,11 +94,11 @@ npm run dev
 
 Open http://localhost:5173 in a WebGPU-capable browser (Chrome/Edge on desktop,
 Safari 26+). Click **Load models** (~790 MB on first run — SmolLM 363 +
-Pocket TTS 236 + Whisper 144 + D-FINE 42, cached in OPFS afterwards), grant
-camera access for the Eye, then press the orb once and just
-talk — hands-free: turn ends are detected by silence, your words stream into the
-transcript live, the assistant answers out loud and resumes listening. Press the
-orb again to end.
+Pocket TTS 236 + Whisper 144 + D-FINE 42, all cached in OPFS afterwards;
+skip the Eye and it's ~750 MB), grant camera access for the Eye, then press
+the orb once and just talk — hands-free: turn ends are detected by silence,
+your words stream into the transcript live, the assistant answers out loud
+and resumes listening. Press the orb again to end.
 
 > **Smaller brain download.** By default the app fetches a per-row int8 build of
 > SmolLM2-360M (363 MB instead of 724 MB; dequantized to fp16 at load, so runtime
