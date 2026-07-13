@@ -123,8 +123,15 @@ const BARGE_ENERGY_RATIO = 1.8; // user must clear the echo floor by this much
 const BARGE_ENERGY_MIN = 0.05; // absolute floor (level units, min·4 RMS)
 const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
-const BACKCHANNEL_PAUSE_MIN = 450;
-const BACKCHANNEL_PAUSE_MAX = 800;
+// Backchannel pause window. It sits BELOW the earliest endpoint threshold
+// (endpointPunctMs = 380 ms) on purpose: the endpoint checks run first in the
+// tick with early returns, so any window at/above 380 ms is shadowed — a
+// punct-terminal turn endpoints at 380 ms and a plain turn at 620 ms before a
+// [450,800) backchannel could ever fire. Placing it at [250,380) means a genuine
+// mid-utterance pause is acknowledged before either endpoint fires, adding zero
+// turn latency (the block never returns early / touches the endpoint logic).
+const BACKCHANNEL_PAUSE_MIN = 250;
+const BACKCHANNEL_PAUSE_MAX = 380;
 
 const TERMINAL_PUNCT = /[.!?…]\s*$/;
 const TIMER_UNIT = /(\d+)\s*(seconds?|secs?|minutes?|mins?)/i;
@@ -237,6 +244,19 @@ export class DuplexSession {
   private respondPromise: Promise<void> | null = null;
   private proactiveSpeaking = false;
   private currentTtsText: string | null = null;
+  // Onset filler text for the current reply (e.g. "So,"). JUDGMENT CALL on the
+  // self-echo filter: the filler is audio-only — never shown in the transcript
+  // or pushed to history — but it IS real sound from the speakers, and echo
+  // cancellation is imperfect (see the adaptive barge-floor comments). If the
+  // mic picks up "so"/"right"/"okay" while the assistant is audible and those
+  // words aren't in currentTtsText, filterEcho's ≥70%-overlap test can pass
+  // them through as user speech, feeding the ASR barge path a phantom word.
+  // So the filler words are FOLDED INTO currentTtsText (via trackSpoken's
+  // prefix below) but kept out of state.spoken/fullText — echo filtering sees
+  // them, the UI and history never do. The over-filter risk is negligible:
+  // a genuine interruption composed ≥70% of "so/right/okay" is exactly the
+  // ambiguous double-talk the energy barge path (not ASR) is there to catch.
+  private onsetPrefix = "";
   private bargeAt = 0;
 
   // TTS analyser for the duplex orb core.
@@ -487,18 +507,36 @@ export class DuplexSession {
       return;
     }
 
-    // 3. Backchannel (mid-utterance pause; does not end the turn).
+    // 3. Backchannel (mid-utterance pause; does not end the turn). Only when the
+    //    committed text does NOT look turn-final — a terminal-punct tail means
+    //    the user is finishing, not pausing mid-thought, and that turn is about
+    //    to endpoint anyway.
     if (
       !this.backchannelUsed &&
+      !endsTerminal &&
       speechMs >= BACKCHANNEL_MIN_MS &&
       trailingSilence >= BACKCHANNEL_PAUSE_MIN &&
       trailingSilence < BACKCHANNEL_PAUSE_MAX &&
-      !this.isAssistantAudible()
+      !this.isAssistantAudible() &&
+      // Same voiced-evidence test the phantom-turn guard applies at endpoint,
+      // applied BEFORE humming at the user: the adversarial bench caught the
+      // engine backchanneling at keyboard noise (typing sustains the level
+      // meter past BACKCHANNEL_MIN_MS, but its longest voiced run stays far
+      // under a spoken word's). Runs at most once per utterance (the flag is
+      // set regardless) so the PCM scan cost isn't paid every tick.
+      this.utteranceSoundsVoiced()
     ) {
-      this.backchannelUsed = true;
       this.pipeline.tts.playBackchannel();
       this.cb.onEvent("backchannel");
     }
+  }
+
+  /** Voiced-evidence check over the captured utterance so far (see the
+   *  phantom-turn guard); marks the backchannel as used either way. */
+  private utteranceSoundsVoiced(): boolean {
+    this.backchannelUsed = true;
+    const { maxRunMs, peak } = voicedStats(this.capture.samples());
+    return maxRunMs >= MIN_VOICED_RUN_MS && peak >= MIN_PEAK_ABS;
   }
 
   // --- User turn end -----------------------------------------------------
@@ -582,7 +620,7 @@ export class DuplexSession {
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
     // questions (count, colour, "what do you see") are answered directly from
-    // those measurements — the 270M model deflects on them. Broader /
+    // those measurements — the small local model deflects on them. Broader /
     // interpretive visual questions ("what am I doing", "does my room look
     // tidy") are handed to the LLM with the measured scene as grounding, so the
     // model reasons rather than us templating a reply.
@@ -601,9 +639,7 @@ export class DuplexSession {
     let content = text;
     if (this.vision?.active && this.vision.referencesVision(text)) {
       const facts = this.vision.sceneFacts();
-      content = facts
-        ? `(Right now through the camera you can see ${facts}. You can't tell colours of clothing or fine detail beyond that.) ${text}`
-        : text;
+      content = facts ? `[scene: ${facts}] ${text}` : text;
       this.cb.onEvent("eye · grounding from the camera");
     }
     this.history.push({ role: "user", content, t: this.elapsed() });
@@ -618,7 +654,20 @@ export class DuplexSession {
     // Two-tier path: a tool intent runs as a background task while the fast
     // model stays present. Only one background task at a time; if one is
     // already running, fall through to a normal reply.
-    const tool = this.backgroundTask ? null : detectTool(text);
+    let tool = this.backgroundTask ? null : detectTool(text);
+    // Eye-as-oracle for lookups: when the lookup subject names something the
+    // camera can currently see ("what is the person doing"), the turn is about
+    // the scene, not the web — drop the tool so the scene-grounded LLM answers.
+    // (Direct "tell me about the person" turns never reach here; matchesQuestion
+    // answers them from measurements above.)
+    if (
+      tool?.kind === "lookup" &&
+      this.vision?.active &&
+      this.vision.seesSubject(tool.query)
+    ) {
+      this.cb.onEvent("eye · lookup subject is in frame, answering from scene");
+      tool = null;
+    }
     if (tool) {
       this.startToolTask(tool);
       return;
@@ -666,6 +715,7 @@ export class DuplexSession {
     };
     this.assistant = state;
     this.currentTtsText = "";
+    this.onsetPrefix = "";
     // Recalibrate the adaptive barge-in echo floor for this reply.
     this.bargeFloor = 0;
     this.bargeFloorTicks = 0;
@@ -674,6 +724,7 @@ export class DuplexSession {
     this.cb.onStageActivity("llm", true);
 
     let firstAudioAt = 0;
+    let onsetAudioAt = 0;
     const speakStart = performance.now();
 
     try {
@@ -690,9 +741,17 @@ export class DuplexSession {
           onAnalyser: (analyser) => {
             this.ttsAnalyser = analyser;
           },
+          // The onset filler is audio-only: it must reach the ASR self-echo
+          // filter (via currentTtsText) but never the transcript/history —
+          // see the onsetPrefix field comment for the full reasoning.
+          onOnset: (text) => {
+            this.onsetPrefix = text;
+            this.currentTtsText = text;
+          },
         },
       );
       if (stats.firstAudioMs > 0) firstAudioAt = speakStart + stats.firstAudioMs;
+      if (stats.onsetAudioMs > 0) onsetAudioAt = speakStart + stats.onsetAudioMs;
     } catch (error) {
       if (!controller.signal.aborted) this.cb.onError(error);
     } finally {
@@ -726,6 +785,9 @@ export class DuplexSession {
         firstDelta: this.turnMarks.firstDelta ?? 0,
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
+        // Absent (not 0) when no filler played, so the bench can distinguish
+        // "onsetFiller off / no cached PCM" from a degenerate timestamp.
+        onsetAudio: onsetAudioAt > 0 ? onsetAudioAt : undefined,
         endCause: this.turnMarks.endCause,
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
@@ -831,7 +893,11 @@ export class DuplexSession {
       this.turnMarks.firstSentence = performance.now();
     }
     state.spoken += (state.spoken ? " " : "") + sentence;
-    this.currentTtsText = state.spoken;
+    // Echo filter sees filler + reply (both are audible from the speakers);
+    // state.spoken stays filler-free so the UI/history never show the onset.
+    this.currentTtsText = this.onsetPrefix
+      ? `${this.onsetPrefix} ${state.spoken}`
+      : state.spoken;
     return sentence;
   }
 

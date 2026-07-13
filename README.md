@@ -18,7 +18,7 @@ that fits in a browser.
 | Stage | Model | Runs on |
 | --- | --- | --- |
 | Ear (ASR) | Whisper base.en (fp16) | WebGPU via jax-js |
-| Brain (LLM) | Gemma 3 270M instruction-tuned (fp16) | WebGPU via jax-js |
+| Brain (LLM) | SmolLM2-360M-Instruct (int8 download, fp16 runtime) | WebGPU via jax-js |
 | Voice (TTS) | Kyutai Pocket TTS + Mimi codec (fp16) | WebGPU via jax-js |
 | Eye (vision) | D-FINE small (COCO-80) | WebGPU via `@jax-js/onnx` |
 
@@ -46,8 +46,8 @@ assistant stops.
   "what do you see?" / "how many people?" from the measurements. Proactive
   interjections (stepped away, phone spotted, slouching) are best-effort rule
   heuristics. The webcam shows as a corner PiP with detection boxes.
-- **Two-tier tools** — factual asks are delegated so the 270M model isn't left
-  guessing: weather ("what's the weather in Tokyo" → [open-meteo](https://open-meteo.com/),
+- **Two-tier tools** — factual asks are delegated so the small on-device model
+  isn't left guessing: weather ("what's the weather in Tokyo" → [open-meteo](https://open-meteo.com/),
   in °F/mph), facts ("who is Ada Lovelace" → Wikipedia), plus instant offline
   **calculator** and **clock/date**. Web lookups speak a holding line and fetch
   in the background, then answer on the next silence and render a card; the
@@ -60,14 +60,14 @@ GPU cost per token/frame rather than overlapping stages (which a single device
 can't do — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
 map-reduce campaign log, including the negative results):
 
-- **Fused decode** — the Gemma decode step is fused from ~21 per-layer jit
+- **Fused decode** — the LLM decode step is fused from dozens of per-layer jit
   dispatches into one, and Pocket TTS from ~11 into two, cutting the
   command-buffer submit overhead that dominated per-step cost (~22% each).
 - **GPU top-k sampling** — the LLM samples from a device-side top-64 (one small
-  readback) instead of transferring the full 262k-vocab logits every token,
+  readback) instead of transferring the full vocab logits every token,
   folded into the fused step's single dispatch.
-- **Smaller download** — Gemma's tied embedding table (the single biggest
-  tensor) is shipped int8 and dequantized to fp16 at load, and the three model
+- **Smaller download** — the LLM ships per-row int8 (363 MB instead of 724 MB
+  fp16; perplexity +0.7%) and is dequantized to fp16 at load, and the model
   weights fetch in parallel.
 
 Runtime behaviour is tunable at `src/tunables.ts` (read live, so the in-browser
@@ -81,19 +81,19 @@ npm run dev
 ```
 
 Open http://localhost:5173 in a WebGPU-capable browser (Chrome/Edge on desktop,
-Safari 26+). Click **Load models** (~680 MB on first run, cached in OPFS
-afterwards), grant camera access for the Eye, then press the orb once and just
+Safari 26+). Click **Load models** (~790 MB on first run — SmolLM 363 +
+Pocket TTS 236 + Whisper 144 + D-FINE 42, cached in OPFS afterwards), grant
+camera access for the Eye, then press the orb once and just
 talk — hands-free: turn ends are detected by silence, your words stream into the
 transcript live, the assistant answers out loud and resumes listening. Press the
 orb again to end.
 
-> **Smaller Gemma download.** By default the app fetches an int8-embedding Gemma
-> build (369 MB instead of 536 MB; the tied embedding table is dequantized to
-> fp16 at load, so runtime is unchanged) from
+> **Smaller brain download.** By default the app fetches a per-row int8 build of
+> SmolLM2-360M (363 MB instead of 724 MB; dequantized to fp16 at load, so runtime
+> is unchanged — measured perplexity +0.7%) from
 > [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights). If that
-> download is unreachable it falls back to the full fp16 Gemma file
-> automatically — no setup either way. To serve it yourself, drop the file at
-> `public/weights/gemma-it-q8e.safetensors` and the loader uses that copy first.
+> download is unreachable it falls back to the full fp16 file automatically — no
+> setup either way.
 
 The orb reacts in real time: it breathes when idle, swells with your voice while
 listening, shimmers while the model thinks, and pulses with the synthesized
@@ -108,7 +108,7 @@ The pipeline stages, from microphone to speaker:
 | --- | --- |
 | `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
 | `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. |
-| `src/llm/gemma.ts` | Gemma 3 with a KV cache for fast decoding. Each token is generated in a single fused GPU dispatch, and the int8 embedding table is unpacked to fp16 as the weights load. |
+| `src/llm/smollm.ts` | SmolLM2-360M (Llama architecture) forward pass with a KV cache — the brain. Each token is generated in a single fused GPU dispatch, and the prompt prefill is bucket-padded so jit traces are reused across turns. Chosen via a blind-judged model shootout against same-size and larger alternatives. |
 | `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. |
 | `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
 | `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |

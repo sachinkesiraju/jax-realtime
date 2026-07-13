@@ -11,3 +11,9 @@ dist/
 *.log
 .DS_Store
 public/weights/
+
+# Local bench harness (dev tooling, not part of the app — see
+# docs/BENCHMARKS.md "Method" for what it does)
+bench/
+.worktrees/
+.netlify/

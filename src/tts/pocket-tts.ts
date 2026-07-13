@@ -953,7 +953,7 @@ export type StreamingConvTranspose1d = {
 // out-norm layernorm + the LSD flow net) plus ~10 eager ops (input/out-eos
 // linears, slice, greater, noise); the Mimi decode makes ~3 jit dispatches
 // (2 decoder-transformer layers + SEANet decoder) plus ~12 eager ops (quantizer
-// conv, upsample convtranspose, transposes, slices). Just like the Gemma decode
+// conv, upsample convtranspose, transposes, slices). Just like the LLM decode
 // step, that per-dispatch submit overhead — not GPU compute — dominates the
 // ~1.1x realtime factor. The functions below inline the *identical* math into
 // ONE jitted function per stage so each stage traces to a single dispatch.
@@ -1221,7 +1221,7 @@ const runFlowLMDecodeFused = jit(
 /**
  * Fused-dispatch counterpart to `runFlowLMStep` for the steady-state decode
  * frame (T=1, no conditioning embeds — the flow-LM prefill on step 0 keeps the
- * unfused path, mirroring Gemma's fuse-decode-only split). Same signature minus
+ * unfused path, the same fuse-decode-only split as the LLM). Same signature minus
  * `embeds` and identical side effects (advances the KV caches / kvCacheLen,
  * returns `{ latent, isEos, state }`), so playTTS swaps it in behind
  * TUNABLES.ttsFusedStep. Noise is drawn here exactly as runFlowLMStep does, so

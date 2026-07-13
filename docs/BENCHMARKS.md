@@ -1,5 +1,13 @@
 # Benchmarks & latency hill-climb
 
+> **Historical note.** This file is an append-only campaign log. Cycles 1–5
+> and the original weights-reduction work were measured on the earlier
+> **Gemma 3 270M** brain, which has since been replaced by **SmolLM2-360M**
+> (the Gemma code path is deleted from the tree). Gemma mentions below are
+> preserved as the record of those measurements — every *shipped default*
+> described here applies to the SmolLM2 pipeline, and cycles 6+ plus the
+> branch-vs-main head-to-head were measured on it directly.
+
 ## What's actually comparable to TML
 
 Thinking Machines' headline numbers are mostly *quality* benchmarks we cannot
@@ -288,6 +296,11 @@ than a partial state whose first reply may stall on a download.
 The quantized file is served from `public/weights/` (gitignored); fresh clones
 fall back to the fp16 HF file automatically.
 
+*(Historical — these totals are for the Gemma-era pipeline. The shipped
+pipeline today is SmolLM2-360M int8 363 + Pocket TTS 236 + Whisper base.en
+144 + D-FINE 42 ≈ **790 MB**, still fetched in parallel and OPFS-cached; the
+same per-row int8 scheme carried over to the SmolLM weights.)*
+
 ## Map-reduce campaign — cycle 5 (GPT-Live-inspired: patience + delegation)
 
 Source: OpenAI's GPT-Live launch (July 2026). Its two transferable ideas for a
@@ -403,6 +416,257 @@ frame count both paths (same EOS decision, same 3200 ms audio) = equivalent
 output. E2E verified (62 audio chunks, coherent reply). Shipped on
 (ttsFusedStep). Prefill step 0 stays unfused (fuse-decode-only, like Gemma).
 
+## Map-reduce campaign — cycle 6 (turn-latency: prefill re-trace + onset redo)
+
+Target: the user-felt "delay in speaking after the message is sent" —
+`firstAudio − endOfSpeech` — which regressed with the SmolLM2-360M brain swap.
+New infra: a repeatable Node harness (`bench/run.mjs`, puppeteer-core driving
+real Chrome with `--use-fake-device-for-media-stream` +
+`--use-file-for-fake-audio-capture`; `--no-sandbox` is required or the fake
+device silently reads nothing) that loads the app, disables the Eye, applies
+per-condition TUNABLES overrides, and samples `window.__turnLog`. Clips are
+`say`-synthesized WAVs with 14 s silence pads (one loop = one turn) plus the
+adversarial noise clips described below — local artifacts under
+`bench/clips/` (gitignored), trivially re-made with `say`/`ffmpeg`;
+`bench/probe.mjs` runs console-level micro-benches.
+
+**DIAGNOSE (measured, not assumed):** stage medians put the fat in
+`llmFirst` (endpoint→first LLM delta): 639–1208 ms and *growing per turn*,
+vs endpoint ~450–600 (settle floor, cycle-1 law), sentence ~250–330, TTS
+~90–380 ms. `benchPrefill(250)` found the smoking gun: **334 ms warm vs
+1004 ms on first encounter of a length** — jax-js trace caches key on shapes,
+and every turn has a new prompt length, so all 32 SmolLM prefill layer jits
+re-trace + recompile EVERY turn. The prefill cost was compile time, not GPU
+math (250-token × 360M prefill is ~50 ms of FLOPs).
+
+**MAP** (n=6 turns/cond, warm medians of turns 2–6, same clip, paired
+overrides `llmMaxHistoryTurns:4, llmMaxNewTokens:48` to bound history-growth
+noise; baseline noise band ±150 ms):
+
+| cond | turnLat | llmFirst | onset (first sound) |
+| --- | --- | --- | --- |
+| baseline ×2 | 1815 / 1965 | 674 / 1002 | — |
+| **kv-reuse (SmolLM port)** | **5810 — REJECTED** | 4786 (+16 s re-trace spike) | — |
+| **bucket64 prefill** | **1366** | **347, flat per-turn** | — |
+| onset filler (same-clock) | 1707 (≈noise) | 495 | **659** |
+
+- **KV reuse rejected, family removed** (the cycle-2 rule: proven dead-ends
+  are deleted, not flag-gated). The port was mechanically correct
+  (prefix-match + throw-safe commit), but its suffix feed pays one fused-step
+  GPU sync roundtrip per token — a reply-sized suffix (30–100 tokens) costs
+  seconds, and `ensureSmolLmStateCapacity` growth re-traced the fused jit ON
+  the critical path (the 16 s spike). **Law: on jax-js, token-by-token
+  feeding can never beat a batched prefill for suffixes longer than ~5
+  tokens; KV reuse pays only with a batched offset-prefill (prefix-aware
+  attention mask), which doesn't exist yet.**
+- **bucket64 shipped** (`llmPrefillBucket: 64`): pad the prompt to the next
+  64-token multiple (pad id = eos) so prefill trace shapes repeat. Exact by
+  construction — pads sit at the end, logits read at the last REAL token,
+  pad KV slots are overwritten before ever becoming attendable — and
+  equivalence-gated on-device: argmax identical, max |Δ| 3.6e-5
+  (`benchPrefillEquivalence`).
+- **Onset filler** (cycle-3 Campaign A redo, this time obeying the law): the
+  pre-rendered "So,"/"Right,"/"Okay, so" PCM is scheduled as the first chunk
+  of the SAME streaming player the reply uses — one stream, one clock;
+  overlap is structurally impossible, worst case is dead air. First sound at
+  ~510–805 ms with real-reply latency unchanged. `onsetFiller` stays
+  **default off**: the cycle-3 law demands an ears gate, and only the bench
+  half has passed. Flip it on and listen before shipping it.
+
+**FUSE + HOLDOUT** (bucket64 + onset, unseen clip, n=6):
+
+| cond | turnLat | llmFirst | onset |
+| --- | --- | --- | --- |
+| baseline (holdout clip) | 1713 | 817 (growing, max 1231) | — |
+| **fused (holdout clip)** | **1191 (−30 %)** | **250, flat** | 510 |
+
+No reversal. `llmFirst` stops growing with session length entirely — the
+per-turn re-trace is gone (each new 64-bucket boundary pays one warm-up
+re-trace, then every turn in that bucket is warm).
+
+Residual (recorded): the shipped-defaults confirmation run (no bench caps)
+was blocked by a post-sleep CoreAudio wedge on the bench machine
+(`AudioQueueStart failed -66681` — even `afplay` fails; `sudo killall
+coreaudiod` fixes it). Holdout numbers stand; re-run
+`node bench/run.mjs --clip bench/clips/map_a.wav --turns 6 --label defaults`
+after the audio daemon restart for the record.
+
+## Map-reduce campaign — cycle 7 (three-front: perf residual, memory, conversation quality)
+
+Three parallel diagnoses, one candidate family per front, everything gated by
+paired evals. New infra: `bench/quality.mjs` (scripted chat histories driven
+straight through `__pipeline().llm.generate` — no audio path — scored by
+deterministic checks: asksClarify on garbled input, noFalseClarify on clean,
+notVerbatim on repeats, shortSpoken on open-ended, noMarkdown/noPlaceholder
+everywhere), `bench/memory.mjs` (JS heap via CDP + per-process RSS as a GPU
+proxy), and `bench/launch.mjs` (shared launcher: zombie sweep, 1 MB HTTP disk
+cache so the OPFS model store isn't duplicated, interrupt-safe teardown).
+
+### Perf — ttsPrefillBucket (REJECTED at MAP; law recorded)
+
+Diagnosis was correct: the flow-LM's step-0 prefill (always unfused) re-traces
+its 6 jitted layers per NEW sentence token length — `benchTtsPrefill` measured
+~320–550 ms first-encounter vs ~30–60 ms warm, the source of the 90–380 ms
+tts-stage variance. But the fix that worked for the LLM (bucket-pad to
+16-token multiples, leading spaces through the real tokenizer) made even WARM
+prefills slower (~150–165 ms) and regressed the turn bench's tts median
+115 → 221 ms. **Law: padding pays only when the padded shape's warm cost is
+unchanged — extra flow-LM prefill tokens are not free the way extra SmolLM
+prefill tokens are.** Removed per the dead-end rule; the open lever for the
+variance is fusing the step-0 prefill, not padding it. (`benchTtsPrefill`
+stays as the diagnostic.)
+
+### Memory (SHIPPED: hygiene + lazy Eye)
+
+- Loaders now release the downloaded weight buffers + safetensors views right
+  after the GPU copies exist (verified eager: `np.array` copies at call time),
+  so the `Promise.all` load can't pin up to 724 MB of JS heap next to the GPU
+  weights. Steady-state heap was already fine (~30 MB); this trims the peak.
+- D-FINE is now lazy: the eye toggle drives the existing on-demand load path
+  instead of an unconditional preload, so an unchecked Eye (or denied camera)
+  never downloads (42 MB) or holds GPU residency; "ready" no longer waits on
+  the detector warmup. Verified: eye-off run fetches no D-FINE, eye-on session
+  loads and detects normally.
+- Measurement honesty: macOS RSS of Chrome's GPU process proved too noisy
+  across runs (±100 MB) to headline a number; the deterministic claims above
+  are what shipped. The fp16 GPU weight residency (~1.1 GB across the three
+  models) is the floor until jax-js grows an int8 compute path.
+
+### Conversation quality (SHIPPED: format-token ban + garble clause/exemplar)
+
+Baseline (n=2 runs × 14 items): asksClarify **0/6** — the model confabulates
+on every garbled input; shortSpoken 2/6; format axes clean on the eval set
+(the live "[activity]" failures are conversation-pressure artifacts).
+
+| cond (MAP) | asksClarify | noFalseClarify | shortSpoken | correct |
+| --- | --- | --- | --- | --- |
+| baseline ×2 | 0/6 | 6/6 | 2/6 | 5–6/6 |
+| ban-format-tokens | 0/6 | 6/6 | 3/6 | 6/6 |
+| garble clause alone | **0/6 — inert** | 6/6 | 2/6 | 5/6 |
+| garble clause + 1 exemplar | **5/6** | 6/6 | 4/6 | 5/6 |
+| temperature 0.5 | 0/6 | 6/6 | **4/6** | 6/6 |
+
+- **Ban (shipped on):** 239 of 49k vocab ids whose decoded text contains
+  `[ ] * # \`` get -Infinity at sampling; none contain a letter, so no word is
+  affected — the prompt's "no markdown" request becomes a guarantee. Zero
+  regressions anywhere. Residual: numbered lists ("1. …") are digits and
+  can't be token-banned (seen ~1/40 replies).
+- **Garble clause (shipped on, WITH exemplar):** the instruction alone is
+  inert at 360M; one demonstrated clarify exchange in the prompt is what
+  teaches it (the conversation-quality diagnosis's Tier-2 design, confirmed). Iteration 2:
+  scene-tagged turns skip the exemplar (it leaked a clarify onto "What am I
+  sitting on?"). Final confirmation (n=3 runs): asksClarify 0 → **6/9 MAP,
+  3/6 holdout**, noFalseClarify 8/9 / 6/6, other axes flat. Cost ~35 prompt
+  tokens/turn. Known mild residual: ~1-in-9 clean turns gets a clarify —
+  the recovery (user repeats) is graceful vs the confabulation it replaced.
+- **Temperature 0.5 (NOT shipped, law recorded):** wins brevity alone, but
+  FUSED with the exemplar it reversed on holdout (asksClarify 3/4 → 1/4,
+  factual misses) — cooler sampling fights few-shot imitation. Stays 0.7.
+
+Fusion lesson (again): the shippable fusion was ban+garble only — the
+three-way fusion's holdout reversal is exactly why the HOLDOUT gate exists.
+
+## Parallel-VAD investigation (NOT ADOPTED — baseline has no headroom)
+
+Question: would a parallel VAD (frame-level speech-probability model) beside
+the micro-turn engine improve detection accuracy, serve as a fallback, or
+simplify the energy-heuristic stack without adding latency?
+
+**Method:** adversarial fake-mic bench (`bench/observe.mjs` + new clips) that
+plays hostile audio and counts what the engine DID — turns fired (the
+user-visible failure), phantom discards, backchannels:
+
+| clip | want | baseline result |
+| --- | --- | --- |
+| `noise_typing.wav` (60 s of irregular 15 ms clicks) | 0 turns | **0 turns** — all 16 latched "utterances" discarded by the phantom-turn guard; blemish: 2 backchannels hummed at the keyboard |
+| `noise_ambient.wav` (60 s pink noise) | 0 turns | **0 turns** (1 discard) |
+| `quiet_speech.wav` (speech at 0.15× amplitude) | 1 turn/loop | **3/3 turns, transcripts correct** (mic AGC + the guard's adaptive ambient floor absorb the gain) |
+
+**Verdict: no VAD.** The failure buckets a VAD targets (keyboard transients,
+ambient swells, quiet-speaker misses) are EMPTY at baseline — the
+voiced-run/peak guard plus the downstream transcript gates already reject
+noise at 100 % on this suite while passing 0.15× speech. A second detector
+would add tuning surface, not accuracy. Integration reality reinforces it:
+Silero VAD needs LSTM ops `@jax-js/onnx` doesn't implement; `vad-web` brings
+onnxruntime-web (~24 MB) and wants to own the mic; and the GPU law forbids
+putting it on the WebGPU device. Recorded so the idea isn't retried without
+new evidence of a failing bucket (a real-world garble corpus would be that
+evidence).
+
+The one measured leak WAS fixed classically: the backchannel fired on typing
+noise because it ran before the endpoint-time guard — it now requires the
+same voiced-evidence test (`utteranceSoundsVoiced`, duplex.ts) before humming.
+Confirmed post-fix: 60 s typing clip → 0 turns, **0 backchannels** (was 2),
+19 phantom discards (non-vacuous — the mic heard every click train), and a
+4-turn speech run stayed healthy (turnLat 1195–1535 ms, endpoint ~449 ms,
+zero behavioral change on real speech).
+
+Bench-host note (recurring): the Chrome fake-mic goes silent whenever this
+Mac sleeps — CoreAudio wedges (`AudioQueueStart -66681`, even `afplay`
+fails) and `sudo killall coreaudiod` revives it. A wedged run is detectable
+by zero turns AND zero discards on a clip that should produce either.
+
+## Branch-vs-main head-to-head (pre-merge verification)
+
+Shipped-vs-shipped comparison of this branch against `main` (Gemma-era,
+2987a8b), run back-to-back on the same machine, same clips, same eval items,
+same tunables caps; main served from a worktree on its own port with its own
+OPFS cache.
+
+**Turn latency** (map_a, 6 turns, warm medians):
+
+| | main (Gemma 270M) | branch (SmolLM2-360M) |
+| --- | --- | --- |
+| turn latency | 1566 ms | **1269 ms (−19 %)** |
+| LLM first-token | 566 ms | **323 ms** |
+| TTS first-audio | 216 ms | 144 ms |
+
+A **35 % larger model answering 19 % faster** — the bucketed-prefill work more
+than pays for the brain upgrade.
+
+**Conversation quality** (deterministic axes, n=3 runs, MAP + holdout):
+
+| axis | main MAP / holdout | branch MAP / holdout |
+| --- | --- | --- |
+| noMarkdown | 28/42 · **14/27** | **42/42 · 27/27** (token ban) |
+| asksClarify (garbled) | 0/9 · 0/6 | **6/9 · 2/6** |
+| shortSpoken | **0/9** · 2/6 | 3/9 · 3/6 |
+| correct (factual/scene) | 8/9 · **0/6** | 8/9 · **5/6** |
+| noFalseClarify | 9/9 · 6/6 | 9/9 · 6/6 |
+
+Gemma emits markdown/emoji in a third to half of voice replies ("😊" gets
+handed to TTS), rambles on every open-ended MAP prompt, confabulates on 100 %
+of garbled input, and went 0-for-6 on the holdout factual/scene items. The
+branch's only regression axis: GPU weight residency (SmolLM fp16 724 MB vs
+Gemma 536 MB, +188 MB) — the cost of the bigger brain.
+
+## Open conversation-quality roadmap
+
+Distilled from the five-agent conversation-quality diagnosis (previously
+docs/CONVERSATION.md; its shipped items — history windowing, the scene-tag
+format, humanized tool-failure lines, the reachable backchannel window, the
+garble repair clause + exemplar — are recorded in the campaign sections
+above). Still open, ranked by impact/effort:
+
+1. **ASR confidence gate** — average decoder logprob is nearly free (logits
+   already on CPU in asr/decoding.ts); below a threshold, speak "sorry,
+   could you say that again?" instead of handing garble to the brain.
+   Complements the shipped prompt-side exemplar with a signal-side gate.
+2. **Barge-in buffer hygiene** — at barge-in the capture buffer spans the
+   whole reply period, so reply words + ambient leak into the next turn.
+   Trim to ~1.2 s of pre-roll; keep echo-filtering the aborted reply text.
+3. **Post-fire continuation-merge** — speech resuming <700 ms before first
+   reply audio should abort the reply and re-open the utterance (append,
+   don't restart). The cycle-5 law says this is the only patience design
+   compatible with a lagging cascade ASR.
+4. **Correction-turn tagging** — a rapid "No, …" after a reply gets a
+   "(the user is correcting your previous answer)" prompt prefix.
+5. **Whisper small.en** (144→481 MB, ~3× FLOPs) — better ears, gated on a
+   WER fixture; the int8 brain savings roughly cover the size.
+6. **LLM-emitted tool markers** replacing the lookup/weather regexes, and
+   **tool-context memory** ("what about tomorrow?" follow-ups) — gated on a
+   labeled routing test set first.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
@@ -423,9 +687,10 @@ Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
 3. **Shorter replies** — cap first-sentence tokens; the SYSTEM_HINT already asks
    for 1–3 short sentences. A tighter "lead with one short sentence" nudge lowers
    time-to-first-audio variance.
-4. **LLM prefill speed** — Gemma prefill is the dominant first-token cost; batch
-   the prompt prefill (already single-shot) and keep prompts short (trim history
-   / summarize old turns) so prefill stays cheap as the session grows.
+4. ~~**LLM prefill speed**~~ — *fixed in cycle 6*: the dominant cost was
+   per-prompt-length jit re-tracing, not FLOPs; `llmPrefillBucket: 64` makes
+   trace shapes repeat and holds llmFirst flat (~250-350 ms) as the session
+   grows. KV reuse remains a dead-end until a batched offset-prefill exists.
 5. **ASR commit latency** (for caption freshness / earlier turn-end confidence),
    not turn latency: shorten `minPassIntervalMs`, cap the streaming window to the
    last ~8 s so passes stay fast, tune LocalAgreement so committed text stabilizes
