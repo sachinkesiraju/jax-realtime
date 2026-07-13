@@ -5,8 +5,9 @@
 // condition = one page session; conditions differ only by TUNABLES overrides,
 // so a single build serves every candidate.
 //
+//   bash bench/clips/generate.sh   # once — clips are generated, not committed
 //   node bench/run.mjs --clip bench/clips/map_a.wav --turns 5 \
-//     --label baseline --tunables '{"llmKvReuse":false}'
+//     --label baseline --tunables '{"llmPrefillBucket":0}'
 //
 // Writes bench/results/<label>-<timestamp>.json and prints a summary table.
 // The Chrome profile persists in bench/.profile so OPFS-cached weights are
