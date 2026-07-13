@@ -104,7 +104,13 @@ app.innerHTML = `
         <div class="dock-side">
           <span id="backend-chip" class="backend-chip">WebGPU</span>
           <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
-            <input type="checkbox" id="eye-toggle" disabled />
+            <!-- checked (Eye defaults ON) and NOT disabled: the toggle must be
+                 usable BEFORE "Load models", because D-FINE is loaded lazily —
+                 unchecking here means its 42 MB download + GPU residency never
+                 happen (handleLoad only auto-enables when still checked).
+                 Toggling pre-load is safe: enableVision no-ops without a
+                 pipeline, disableVision is idempotent. -->
+            <input type="checkbox" id="eye-toggle" checked />
             <span>Eye &middot; webcam</span>
           </label>
           <label class="field">
@@ -346,21 +352,13 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
-    // Preload + warm the Eye detector now (not awaited) so enabling the Eye at
-    // "ready" doesn't stall on the D-FINE download/compile. Must start AFTER
-    // loadPipeline: it runs initDevice(), and constructing the ONNX detector
-    // before the WebGPU backend is initialized breaks detection silently.
-    // The Eye is on by default, so load + warm D-FINE as part of the loading
-    // screen (it starts here — after loadPipeline's initDevice, or the ONNX
-    // model races the WebGPU backend). Kicked off now so it downloads while the
-    // backchannels synthesize, then awaited before "ready" so the Eye actually
-    // detects the instant the standby screen appears, not seconds later.
-    detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
-      async (d) => {
-        await d.warmup();
-        return d;
-      },
-    );
+    // NOTE: D-FINE is deliberately NOT preloaded here anymore. The old
+    // unconditional preload meant the 42 MB download + GPU residency happened
+    // even when the user had already unchecked the Eye or the camera would be
+    // denied — pure waste for a stage that enableVision() can lazy-load on
+    // demand anyway. The auto-enable at the bottom of this function (fires
+    // only while the toggle is still checked) drives that existing lazy path,
+    // which shows the same progress rows + "loading D-FINE detector" status.
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
@@ -368,19 +366,8 @@ async function handleLoad() {
     // TUNABLES.onsetFiller — cached PCM is the only way the filler can play
     // instantly while the GPU is busy with the reply's LLM prefill).
     await pipeline.tts.prepareOnsets(el.voiceSelect.value as TTSVoice);
-    // Await the detector's download + JIT warmup (no camera permission needed,
-    // safe to block on) so it's fully compiled by the time we're ready — the
-    // Eye then detects instantly instead of stalling seconds into the standby
-    // screen. Best-effort: a detector failure must not block the app.
-    setStatus("warming up the eye", "busy");
-    try {
-      detector = await detectorPromise;
-    } catch {
-      detectorPromise = null;
-    }
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
-    el.eyeToggle.disabled = false;
     orb.setState("idle");
     setStatus("ready", "idle");
     setHint(
@@ -390,11 +377,16 @@ async function handleLoad() {
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
-    // Turn the Eye on now (not awaited): the detector is already warm, so once
-    // the camera stream starts it detects on the very first frame. Camera
-    // permission (first visit only) happens here without blocking "ready".
-    el.eyeToggle.checked = true;
-    void toggleVision(true);
+    // Auto-enable the Eye (default ON) — but only if the user hasn't already
+    // unchecked it, and NOT awaited: "ready" must never block on the detector.
+    // toggleVision(true) drives enableVision's lazy path, which asks for the
+    // camera FIRST and only then downloads + warms D-FINE (with its own
+    // progress rows), so a denied camera or an unchecked toggle means the
+    // 42 MB detector never touches the network or the GPU. This must run
+    // AFTER loadPipeline: enableVision constructs the ONNX detector, and
+    // doing that before initDevice() has set up the WebGPU backend breaks
+    // detection silently.
+    if (el.eyeToggle.checked) void toggleVision(true);
   } catch (error) {
     console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");
@@ -476,8 +468,23 @@ async function enableVision(): Promise<void> {
   if (!pipeline) return;
   setStatus("loading D-FINE detector", "busy");
   if (!detector) {
-    // Usually already resolved: handleLoad preloads + warms it in parallel
-    // with the voice pipeline.
+    // Camera permission FIRST, download second: if the user denies the camera
+    // there can be no Eye session, so the 42 MB D-FINE download + its GPU
+    // residency should never happen. The probe stream is stopped immediately;
+    // VisionSession.start() re-acquires its own stream in a moment (the
+    // permission is granted by then, so no second prompt). A denial throws
+    // here — before any bytes are fetched — and toggleVision's catch unchecks
+    // the toggle. Only the first enable pays this probe: once `detector` is
+    // cached, vision.start() below is the sole camera acquisition, as before.
+    const probe = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user" },
+    });
+    for (const track of probe.getTracks()) track.stop();
+    // Sole D-FINE load path (handleLoad's unconditional preload was removed —
+    // see the M2 note there): the first enable, including the auto-enable
+    // right after load, downloads + JIT-warms the detector here with the same
+    // progress rows. Cached across toggles, so a mid-session re-enable reuses
+    // the warm detector instantly.
     detectorPromise ??= ObjectDetector.load(onDownloadProgress).then(
       async (d) => {
         await d.warmup();
@@ -487,7 +494,7 @@ async function enableVision(): Promise<void> {
     try {
       detector = await detectorPromise;
     } catch (error) {
-      // A rejected preload must NOT stay cached, or every later toggle awaits
+      // A rejected load must NOT stay cached, or every later toggle awaits
       // the same dead promise and the Eye can never recover. Clear it so a
       // subsequent enable retries the load from scratch.
       detectorPromise = null;
