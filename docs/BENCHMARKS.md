@@ -553,7 +553,7 @@ on every garbled input; shortSpoken 2/6; format axes clean on the eval set
   can't be token-banned (seen ~1/40 replies).
 - **Garble clause (shipped on, WITH exemplar):** the instruction alone is
   inert at 360M; one demonstrated clarify exchange in the prompt is what
-  teaches it (docs/CONVERSATION.md's Tier-2 design, confirmed). Iteration 2:
+  teaches it (the conversation-quality diagnosis's Tier-2 design, confirmed). Iteration 2:
   scene-tagged turns skip the exemplar (it leaked a clarify onto "What am I
   sitting on?"). Final confirmation (n=3 runs): asksClarify 0 → **6/9 MAP,
   3/6 holdout**, noFalseClarify 8/9 / 6/6, other axes flat. Cost ~35 prompt
@@ -639,6 +639,33 @@ handed to TTS), rambles on every open-ended MAP prompt, confabulates on 100 %
 of garbled input, and went 0-for-6 on the holdout factual/scene items. The
 branch's only regression axis: GPU weight residency (SmolLM fp16 724 MB vs
 Gemma 536 MB, +188 MB) — the cost of the bigger brain.
+
+## Open conversation-quality roadmap
+
+Distilled from the five-agent conversation-quality diagnosis (previously
+docs/CONVERSATION.md; its shipped items — history windowing, the scene-tag
+format, humanized tool-failure lines, the reachable backchannel window, the
+garble repair clause + exemplar — are recorded in the campaign sections
+above). Still open, ranked by impact/effort:
+
+1. **ASR confidence gate** — average decoder logprob is nearly free (logits
+   already on CPU in asr/decoding.ts); below a threshold, speak "sorry,
+   could you say that again?" instead of handing garble to the brain.
+   Complements the shipped prompt-side exemplar with a signal-side gate.
+2. **Barge-in buffer hygiene** — at barge-in the capture buffer spans the
+   whole reply period, so reply words + ambient leak into the next turn.
+   Trim to ~1.2 s of pre-roll; keep echo-filtering the aborted reply text.
+3. **Post-fire continuation-merge** — speech resuming <700 ms before first
+   reply audio should abort the reply and re-open the utterance (append,
+   don't restart). The cycle-5 law says this is the only patience design
+   compatible with a lagging cascade ASR.
+4. **Correction-turn tagging** — a rapid "No, …" after a reply gets a
+   "(the user is correcting your previous answer)" prompt prefix.
+5. **Whisper small.en** (144→481 MB, ~3× FLOPs) — better ears, gated on a
+   WER fixture; the int8 brain savings roughly cover the size.
+6. **LLM-emitted tool markers** replacing the lookup/weather regexes, and
+   **tool-context memory** ("what about tomorrow?" follow-ups) — gated on a
+   labeled routing test set first.
 
 ## Hill-climb levers (ordered by expected payoff)
 

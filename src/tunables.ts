@@ -175,7 +175,8 @@ export const TUNABLES = {
    * honors a real ChatML system role, but the clause ALONE was inert at MAP
    * (0/6 asks-to-clarify — a 360M model doesn't follow rules), so the flag
    * also injects ONE few-shot exemplar exchange demonstrating the behavior
-   * (SMOLLM_GARBLE_EXEMPLAR; the docs/CONVERSATION.md Tier-2 design). Read at
+   * (SMOLLM_GARBLE_EXEMPLAR; the conversation-quality diagnosis's Tier-2
+   * design — open roadmap in docs/BENCHMARKS.md). Read at
    * generation time (encodePrompt rebuilds the system turn every call) so the
    * bench can flip it without a reload. SHIPPED ON (cycle 7): clause+exemplar
    * took asksClarify 0/6 → 5/6 on MAP and 0/4 → 3/4 on holdout with zero

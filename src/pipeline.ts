@@ -515,9 +515,10 @@ const SMOLLM_GARBLE_CLAUSE =
 // MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
 // doesn't follow the instruction). Small models imitate demonstrations far
 // better than they follow rules, so the tunable also injects ONE few-shot
-// exemplar exchange (the docs/CONVERSATION.md Tier-2 design: "system-prompt
-// repair clause + 1 few-shot exemplar") ahead of the real history. Kept to a
-// single pair: every exemplar token is prefill cost on every turn.
+// exemplar exchange (the conversation-quality diagnosis's Tier-2 design:
+// "system-prompt repair clause + 1 few-shot exemplar") ahead of the real
+// history. Kept to a single pair: every exemplar token is prefill cost on
+// every turn.
 const SMOLLM_GARBLE_EXEMPLAR: ChatMessage[] = [
   { role: "user", content: "the it about when for Tuesday the", t: 0 },
   {
