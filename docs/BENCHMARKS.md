@@ -556,6 +556,39 @@ on every garbled input; shortSpoken 2/6; format axes clean on the eval set
 Fusion lesson (again): the shippable fusion was ban+garble only — the
 three-way fusion's holdout reversal is exactly why the HOLDOUT gate exists.
 
+## Parallel-VAD investigation (NOT ADOPTED — baseline has no headroom)
+
+Question: would a parallel VAD (frame-level speech-probability model) beside
+the micro-turn engine improve detection accuracy, serve as a fallback, or
+simplify the energy-heuristic stack without adding latency?
+
+**Method:** adversarial fake-mic bench (`bench/observe.mjs` + new clips) that
+plays hostile audio and counts what the engine DID — turns fired (the
+user-visible failure), phantom discards, backchannels:
+
+| clip | want | baseline result |
+| --- | --- | --- |
+| `noise_typing.wav` (60 s of irregular 15 ms clicks) | 0 turns | **0 turns** — all 16 latched "utterances" discarded by the phantom-turn guard; blemish: 2 backchannels hummed at the keyboard |
+| `noise_ambient.wav` (60 s pink noise) | 0 turns | **0 turns** (1 discard) |
+| `quiet_speech.wav` (speech at 0.15× amplitude) | 1 turn/loop | **3/3 turns, transcripts correct** (mic AGC + the guard's adaptive ambient floor absorb the gain) |
+
+**Verdict: no VAD.** The failure buckets a VAD targets (keyboard transients,
+ambient swells, quiet-speaker misses) are EMPTY at baseline — the
+voiced-run/peak guard plus the downstream transcript gates already reject
+noise at 100 % on this suite while passing 0.15× speech. A second detector
+would add tuning surface, not accuracy. Integration reality reinforces it:
+Silero VAD needs LSTM ops `@jax-js/onnx` doesn't implement; `vad-web` brings
+onnxruntime-web (~24 MB) and wants to own the mic; and the GPU law forbids
+putting it on the WebGPU device. Recorded so the idea isn't retried without
+new evidence of a failing bucket (a real-world garble corpus would be that
+evidence).
+
+The one measured leak WAS fixed classically: the backchannel fired on typing
+noise because it ran before the endpoint-time guard — it now requires the
+same voiced-evidence test (`utteranceSoundsVoiced`, duplex.ts) before humming.
+(Post-fix confirmation run pending a CoreAudio restart on the bench machine —
+the fake mic dies whenever the host sleeps; `sudo killall coreaudiod`.)
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

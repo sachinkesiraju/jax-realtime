@@ -517,12 +517,26 @@ export class DuplexSession {
       speechMs >= BACKCHANNEL_MIN_MS &&
       trailingSilence >= BACKCHANNEL_PAUSE_MIN &&
       trailingSilence < BACKCHANNEL_PAUSE_MAX &&
-      !this.isAssistantAudible()
+      !this.isAssistantAudible() &&
+      // Same voiced-evidence test the phantom-turn guard applies at endpoint,
+      // applied BEFORE humming at the user: the adversarial bench caught the
+      // engine backchanneling at keyboard noise (typing sustains the level
+      // meter past BACKCHANNEL_MIN_MS, but its longest voiced run stays far
+      // under a spoken word's). Runs at most once per utterance (the flag is
+      // set regardless) so the PCM scan cost isn't paid every tick.
+      this.utteranceSoundsVoiced()
     ) {
-      this.backchannelUsed = true;
       this.pipeline.tts.playBackchannel();
       this.cb.onEvent("backchannel");
     }
+  }
+
+  /** Voiced-evidence check over the captured utterance so far (see the
+   *  phantom-turn guard); marks the backchannel as used either way. */
+  private utteranceSoundsVoiced(): boolean {
+    this.backchannelUsed = true;
+    const { maxRunMs, peak } = voicedStats(this.capture.samples());
+    return maxRunMs >= MIN_VOICED_RUN_MS && peak >= MIN_PEAK_ABS;
   }
 
   // --- User turn end -----------------------------------------------------
