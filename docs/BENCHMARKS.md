@@ -596,6 +596,40 @@ Mac sleeps — CoreAudio wedges (`AudioQueueStart -66681`, even `afplay`
 fails) and `sudo killall coreaudiod` revives it. A wedged run is detectable
 by zero turns AND zero discards on a clip that should produce either.
 
+## Branch-vs-main head-to-head (pre-merge verification)
+
+Shipped-vs-shipped comparison of this branch against `main` (Gemma-era,
+2987a8b), run back-to-back on the same machine, same clips, same eval items,
+same tunables caps; main served from a worktree on its own port with its own
+OPFS cache.
+
+**Turn latency** (map_a, 6 turns, warm medians):
+
+| | main (Gemma 270M) | branch (SmolLM2-360M) |
+| --- | --- | --- |
+| turn latency | 1566 ms | **1269 ms (−19 %)** |
+| LLM first-token | 566 ms | **323 ms** |
+| TTS first-audio | 216 ms | 144 ms |
+
+A **35 % larger model answering 19 % faster** — the bucketed-prefill work more
+than pays for the brain upgrade.
+
+**Conversation quality** (deterministic axes, n=3 runs, MAP + holdout):
+
+| axis | main MAP / holdout | branch MAP / holdout |
+| --- | --- | --- |
+| noMarkdown | 28/42 · **14/27** | **42/42 · 27/27** (token ban) |
+| asksClarify (garbled) | 0/9 · 0/6 | **6/9 · 2/6** |
+| shortSpoken | **0/9** · 2/6 | 3/9 · 3/6 |
+| correct (factual/scene) | 8/9 · **0/6** | 8/9 · **5/6** |
+| noFalseClarify | 9/9 · 6/6 | 9/9 · 6/6 |
+
+Gemma emits markdown/emoji in a third to half of voice replies ("😊" gets
+handed to TTS), rambles on every open-ended MAP prompt, confabulates on 100 %
+of garbled input, and went 0-for-6 on the holdout factual/scene items. The
+branch's only regression axis: GPU weight residency (SmolLM fp16 724 MB vs
+Gemma 536 MB, +188 MB) — the cost of the bigger brain.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

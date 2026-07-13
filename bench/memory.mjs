@@ -53,7 +53,7 @@ try {
   };
 
   const snaps = [];
-  await page.goto("http://localhost:5173", { waitUntil: "domcontentloaded" });
+  await page.goto(args.url ?? "http://localhost:5173", { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#load-btn:not([disabled])", { timeout: 30_000 });
   snaps.push(await snap("page-loaded"));
 

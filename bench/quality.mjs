@@ -103,7 +103,7 @@ function score(item, reply) {
 const browser = await launchBench();
 try {
   const page = (await browser.pages())[0] ?? (await browser.newPage());
-  await page.goto("http://localhost:5173", { waitUntil: "domcontentloaded" });
+  await page.goto(args.url ?? "http://localhost:5173", { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#load-btn:not([disabled])", { timeout: 30_000 });
   await page.click("#load-btn");
   await page.waitForSelector("#orb-btn:not([disabled])", { timeout: 30 * 60_000 });
