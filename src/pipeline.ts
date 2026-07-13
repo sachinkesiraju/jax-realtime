@@ -512,6 +512,20 @@ const SMOLLM_SYSTEM =
 const SMOLLM_GARBLE_CLAUSE =
   "If the user's message is garbled or doesn't make sense, say you didn't " +
   "catch that and ask them to say it again.";
+// MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
+// doesn't follow the instruction). Small models imitate demonstrations far
+// better than they follow rules, so the tunable also injects ONE few-shot
+// exemplar exchange (the docs/CONVERSATION.md Tier-2 design: "system-prompt
+// repair clause + 1 few-shot exemplar") ahead of the real history. Kept to a
+// single pair: every exemplar token is prefill cost on every turn.
+const SMOLLM_GARBLE_EXEMPLAR: ChatMessage[] = [
+  { role: "user", content: "the it about when for Tuesday the", t: 0 },
+  {
+    role: "assistant",
+    content: "Sorry, I didn't catch that — could you say it again?",
+    t: 0,
+  },
+];
 
 type SmolLmTokenizerData = {
   encoder: Record<string, number>;
@@ -612,6 +626,13 @@ export class SmolLmChatModel implements ChatModel {
         ? `${SMOLLM_SYSTEM} ${SMOLLM_GARBLE_CLAUSE}`
         : SMOLLM_SYSTEM,
     );
+    if (TUNABLES.qualityGarbleClause) {
+      // One demonstrated clarify exchange (see SMOLLM_GARBLE_EXEMPLAR): the
+      // clause alone was inert on this model size; the exemplar is what
+      // actually teaches the behavior. Injected before the real history so
+      // windowHistory can never evict it.
+      for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
+    }
     for (const message of windowHistory(history)) {
       const content = message.content.trim();
       if (content === "") continue;

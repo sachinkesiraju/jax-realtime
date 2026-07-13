@@ -99,6 +99,7 @@ try {
       count = n;
       const last = await page.evaluate(() => {
         const t = window.__turnLog[window.__turnLog.length - 1];
+        if (!t) return { lat: NaN, transcript: "(log reset?)", reply: "" };
         return {
           lat: Math.round(t.firstAudio - t.endOfSpeech),
           transcript: t.transcript,
