@@ -1,7 +1,10 @@
 # Conversation-quality campaign — diagnosis & roadmap
 
 Five parallel diagnosis agents (hearing / brain / flow / grounding / repair) read the
-code and decomposed the live-session failures. This file is the ranked roadmap after dedupe + cross-validation; Tier 1 is implemented.
+code and decomposed the live-session failures. This file is the ranked roadmap after dedupe + cross-validation; Tier 1 is implemented, and the Tier-2
+"repair clause + few-shot exemplar" shipped in cycle 7 (docs/BENCHMARKS.md).
+(Historical: the one Gemma mention below records that brain's config at
+diagnosis time; the shipped brain is SmolLM2-360M.)
 
 ## Cross-agent convergence (the strongest findings)
 

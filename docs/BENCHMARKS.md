@@ -1,5 +1,13 @@
 # Benchmarks & latency hill-climb
 
+> **Historical note.** This file is an append-only campaign log. Cycles 1–5
+> and the original weights-reduction work were measured on the earlier
+> **Gemma 3 270M** brain, which has since been replaced by **SmolLM2-360M**
+> (the Gemma code path is deleted from the tree). Gemma mentions below are
+> preserved as the record of those measurements — every *shipped default*
+> described here applies to the SmolLM2 pipeline, and cycles 6+ plus the
+> branch-vs-main head-to-head were measured on it directly.
+
 ## What's actually comparable to TML
 
 Thinking Machines' headline numbers are mostly *quality* benchmarks we cannot
