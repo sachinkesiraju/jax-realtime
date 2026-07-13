@@ -352,13 +352,17 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
-    // NOTE: D-FINE is deliberately NOT preloaded here anymore. The old
-    // unconditional preload meant the 42 MB download + GPU residency happened
-    // even when the user had already unchecked the Eye or the camera would be
-    // denied — pure waste for a stage that enableVision() can lazy-load on
-    // demand anyway. The auto-enable at the bottom of this function (fires
-    // only while the toggle is still checked) drives that existing lazy path,
-    // which shows the same progress rows + "loading D-FINE detector" status.
+    // Eye is ON by default: start it here, in parallel with the TTS
+    // pre-render below, so the webcam is already detecting on the standby
+    // screen when "ready" appears (the pre-Eye-lazy-load behavior). It is
+    // still CONDITIONAL — toggleVision(true) drives enableVision's lazy
+    // path, which asks for the camera FIRST and only then downloads + warms
+    // D-FINE — so an unchecked toggle or a denied camera still means the
+    // 42 MB detector never touches the network or the GPU, and "ready"
+    // itself never blocks on it (not awaited). Must run AFTER loadPipeline:
+    // enableVision constructs the ONNX detector, and doing that before
+    // initDevice() has set up the WebGPU backend breaks detection silently.
+    if (el.eyeToggle.checked) void toggleVision(true);
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
@@ -377,16 +381,6 @@ async function handleLoad() {
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
-    // Auto-enable the Eye (default ON) — but only if the user hasn't already
-    // unchecked it, and NOT awaited: "ready" must never block on the detector.
-    // toggleVision(true) drives enableVision's lazy path, which asks for the
-    // camera FIRST and only then downloads + warms D-FINE (with its own
-    // progress rows), so a denied camera or an unchecked toggle means the
-    // 42 MB detector never touches the network or the GPU. This must run
-    // AFTER loadPipeline: enableVision constructs the ONNX detector, and
-    // doing that before initDevice() has set up the WebGPU backend breaks
-    // detection silently.
-    if (el.eyeToggle.checked) void toggleVision(true);
   } catch (error) {
     console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");
