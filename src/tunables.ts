@@ -94,6 +94,35 @@ export const TUNABLES = {
    * same audio duration) — equivalent output, fewer dispatches.
    */
   ttsFusedStep: true,
+  /**
+   * Bucket size (tokens) for padding the Pocket TTS flow-LM prefill text;
+   * 0 = off (shipped). Same disease as llmPrefillBucket, different patient:
+   * playTTS's step-0 prefill (always the UNFUSED runFlowLMStep — see
+   * inference.ts `fuseFlow = ttsFusedStep && step > 0`) pushes a
+   * [voiceLen + textLen + 1, 1024] activation through the 6 jitted
+   * streaming-transformer layers plus the jitted out-norm, and textLen is the
+   * sentence's token count — so every NEW sentence length re-traces and
+   * recompiles those jits on the critical path to first audio (the 90–380 ms
+   * per-reply variance in TTS first-audio). Bucketing textLen makes the
+   * prefill trace shapes repeat across sentences.
+   *
+   * Unlike the LLM case there is no logits-gather to fix: the flow-LM reads
+   * its output (and the EOS logit) at the LAST position, which is the BOS
+   * latent concatenated AFTER the text embeds, so padding can never shift the
+   * readout. Pad = LEADING spaces prepended to the prepared text and
+   * re-encoded through the real tokenizer (SpeechSynthesizer's
+   * encodeTextBucketed), mirroring the 8-leading-space pad prepareTextPrompt
+   * already applies to every <5-word phrase — the one padding this exact
+   * model is known to treat as neutral (it is Kyutai's own reference
+   * behavior). End-side padding is deliberately avoided: spaces between the
+   * sentence-final "." and the latent positions are an arrangement the model
+   * never saw in training and risk shifting EOS timing / trailing artifacts.
+   *
+   * Default 0 until the bench proves it AND a listen confirms large pads add
+   * no audible leading silence. A/B: benchTtsPrefill() (prefill-only, shows
+   * re-trace vs warm per length) and benchSynth(text, { bucket }).
+   */
+  ttsPrefillBucket: 0,
 
   // region: tts-onset
   /**

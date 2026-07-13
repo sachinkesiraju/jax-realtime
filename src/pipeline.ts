@@ -9,6 +9,7 @@ import {
   init,
   lax,
   numpy as np,
+  random,
   tree,
 } from "@jax-js/jax";
 import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
@@ -45,8 +46,10 @@ import {
 import { type AudioPlayer, createStreamingPlayer } from "./tts/audio";
 import { playTTS } from "./tts/inference";
 import {
+  createFlowLMState,
   fromSafetensors as ttsFromSafetensors,
   type PocketTTS,
+  runFlowLMStep,
 } from "./tts/pocket-tts";
 
 export type ChatMessage = {
@@ -145,18 +148,29 @@ export class SpeechRecognizer {
       onProgress,
     );
     const tokenizer = WhisperTokenizer.fromVocabBytes(vocab);
-    const data = await fetchWithProgress(
+    // Memory hygiene: the download (~150 MB) and the parsed File are only
+    // needed until the tensors are uploaded to the device. safetensors.parse
+    // returns typed-array VIEWS into the download's ArrayBuffer (zero-copy),
+    // and whisperFromSafetensors copies every tensor into backend memory
+    // EAGERLY (np.array → backend.malloc, which writeBuffer/memcpy's at call
+    // time) before its first await — so once it returns, nothing lazy points
+    // at the download. Null both locals so this async frame (long-lived: the
+    // three model loads run concurrently under Promise.all) can't keep the
+    // buffer reachable a moment longer than model construction.
+    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
       `Whisper ${WHISPER_CONFIG.label} weights`,
       hfWhisperUrl("model.safetensors"),
       onProgress,
     );
-    const weights = safetensors.parse(data);
+    let weights: safetensors.File | null = safetensors.parse(data);
+    data = null; // views inside `weights` keep the buffer alive until upload
     const model = await whisperFromSafetensors(
       weights,
       resolvedDtype,
       WHISPER_CONFIG,
       device,
     );
+    weights = null; // last reference to the download buffer's views
     return new SpeechRecognizer(model, tokenizer, resolvedDtype, device);
   }
 
@@ -523,7 +537,7 @@ export class SmolLmChatModel implements ChatModel {
     );
     const specialIds = new Set(Object.values(spec.special));
 
-    let data: Uint8Array<ArrayBuffer>;
+    let data: Uint8Array<ArrayBuffer> | null;
     try {
       data = await fetchWithProgress(
         "SmolLM2 360M weights (int8)",
@@ -540,8 +554,18 @@ export class SmolLmChatModel implements ChatModel {
         onProgress,
       );
     }
-    const weights = safetensors.parse(data);
+    // Memory hygiene: `data` is 363 MB (int8) / 724 MB (fp16) and the parsed
+    // File's tensors are zero-copy views into it. smolLmFromSafetensors
+    // materializes every weight EAGERLY before its first await — int8 tensors
+    // are dequantized into a fresh Float16Array and fp16 tensors are copied
+    // into backend memory by np.array (backend.malloc copies at call time) —
+    // so after it resolves the download buffer backs nothing. Null the locals
+    // so this frame (alive throughout loadPipeline's Promise.all) doesn't pin
+    // an extra copy of the largest download next to the GPU-resident weights.
+    let weights: safetensors.File | null = safetensors.parse(data);
+    data = null; // views inside `weights` keep the buffer alive until upload
     const model = await smolLmFromSafetensors(weights, np.float16);
+    weights = null; // last reference to the download buffer's views
     return new SmolLmChatModel(model, tokenizer, specialIds);
   }
 
@@ -985,13 +1009,22 @@ export class SpeechSynthesizer {
       onProgress,
     );
     const tokenizer = tokenizers.SentencePiece.fromBinary(tokData);
-    const data = await fetchWithProgress(
+    // Memory hygiene (same pattern as the ASR/LLM loaders): the parsed File's
+    // tensors are zero-copy views into the download buffer, and the TTS
+    // fromSafetensors is fully SYNCHRONOUS — every np.array copies into
+    // backend memory before it returns — so the moment `model` exists the
+    // download backs nothing. Null the locals so this async frame (concurrent
+    // with the other two loads under Promise.all) releases the buffer instead
+    // of holding it next to the GPU-resident weights.
+    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
       "Pocket TTS weights",
       TTS_WEIGHTS_URL,
       onProgress,
     );
-    const weights = safetensors.parse(data);
+    let weights: safetensors.File | null = safetensors.parse(data);
+    data = null; // views inside `weights` keep the buffer alive until upload
     const model = ttsFromSafetensors(weights);
+    weights = null; // last reference to the download buffer's views
     return new SpeechSynthesizer(model, tokenizer);
   }
 
@@ -1027,6 +1060,71 @@ export class SpeechSynthesizer {
     return [text, framesAfterEosGuess];
   }
 
+  /**
+   * Encode `prepared` (output of prepareTextPrompt), padded with LEADING
+   * spaces until the token count reaches the next multiple of `bucket`
+   * (TUNABLES.ttsPrefillBucket; <= 0 or already aligned = plain encode). WHY:
+   * jax-js trace caches key on avals (shapes), and the flow-LM's step-0
+   * prefill (always the unfused runFlowLMStep — inference.ts keeps step 0 off
+   * the fused path) runs its 6 jitted streaming-transformer layers + the
+   * jitted out-norm over a [voiceLen + textLen + 1, 1024] activation. A new
+   * sentence token count means re-tracing them all before the reply's first
+   * audio chunk; bucketing textLen makes warm shapes repeat across sentences
+   * (the LLM's llmPrefillBucket lever, ported to the TTS prefill).
+   *
+   * Pad choice — real spaces through the real tokenizer, at the START:
+   *   - Spaces, because prepareTextPrompt already fronts every <5-word phrase
+   *     with 8 spaces (Kyutai's reference behavior), so leading whitespace is
+   *     the one padding this model demonstrably treats as neutral — it adds
+   *     no leading silence beyond what shipped synthesis already produces.
+   *   - Start-side, because the flow-LM conditions its EOS decision and
+   *     sentence-final prosody on the END of the text (the tokens adjacent to
+   *     the latent positions, which follow the embeds in the prefill).
+   *     Trailing spaces after the final "." are an arrangement the model
+   *     never saw and risk trailing artifacts / shifted EOS timing; leading
+   *     spaces before a capitalized sentence are exactly the training-time
+   *     arrangement.
+   *   - Re-encoding the space-padded TEXT (instead of splicing a pad token id
+   *     into the token array) keeps the sequence exactly what the tokenizer
+   *     itself produces for a space-padded sentence — in-distribution
+   *     segmentation, no assumptions about which "▁" pieces exist.
+   * The readout cannot move: runFlowLMStep slices position -1, the BOS latent
+   * appended AFTER the text embeds, so padding never changes which position
+   * the latent/EOS are read from — only prepends neutral context.
+   *
+   * SentencePiece merges make token count non-additive in the space count, so
+   * we re-encode and adjust; if the exact target is unreachable (e.g. a
+   * tokenizer that collapses whitespace) we fall back to the unpadded
+   * encoding with a warning — correctness over trace warmth, never a silent
+   * behavior change.
+   */
+  private encodeTextBucketed(
+    prepared: string,
+    bucket = TUNABLES.ttsPrefillBucket,
+  ): number[] {
+    const tokens = this.tokenizer.encode(prepared);
+    if (bucket <= 0 || tokens.length % bucket === 0) return tokens;
+    let target = Math.ceil(tokens.length / bucket) * bucket;
+    let spaces = target - tokens.length;
+    for (let tries = 0; tries < 8 && spaces > 0; tries++) {
+      const padded = this.tokenizer.encode(" ".repeat(spaces) + prepared);
+      if (padded.length === target) return padded;
+      spaces += target - padded.length;
+      if (spaces <= 0) {
+        // Merged space pieces overshot the target for every smaller space
+        // count; aim one bucket higher rather than under-pad (an unaligned
+        // length would silently defeat the bucket).
+        target += bucket;
+        spaces += bucket;
+      }
+    }
+    console.warn(
+      `ttsPrefillBucket: could not pad TTS prompt to ${target} tokens; ` +
+        "synthesizing unpadded (re-trace possible)",
+    );
+    return tokens;
+  }
+
   /** Synthesize one line of text into an existing player (no close). */
   private async synthOne(
     voice: TTSVoice,
@@ -1035,7 +1133,7 @@ export class SpeechSynthesizer {
     signal: AbortSignal | null,
   ): Promise<void> {
     const [prepared, framesAfterEos] = this.prepareTextPrompt(text);
-    const tokens = this.tokenizer.encode(prepared);
+    const tokens = this.encodeTextBucketed(prepared);
     const voiceEmbed = await this.getVoiceEmbed(voice);
 
     const tokensAr = np.array(tokens, { dtype: np.uint32 });
@@ -1180,20 +1278,33 @@ export class SpeechSynthesizer {
       voice = TTS_VOICES[0],
       seed = 1234,
       warmup = true,
+      bucket = TUNABLES.ttsPrefillBucket,
     }: {
       fused?: boolean;
       voice?: TTSVoice;
       seed?: number;
       warmup?: boolean;
+      /** ttsPrefillBucket override for A/B (0 = unpadded, shipped). */
+      bucket?: number;
     } = {},
   ): Promise<{
     genMs: number;
     firstAudioMs: number;
     audioDurationMs: number;
     realtimeFactor: number;
+    /** Trace-cold numbers from the warmup run (absent when warmup=false).
+     *  cold − warm firstAudio at a NEW sentence length is exactly the step-0
+     *  re-trace cost that ttsPrefillBucket targets, so the A/B can show it
+     *  without a page reload. */
+    coldGenMs?: number;
+    coldFirstAudioMs?: number;
+    textTokens: number;
+    paddedTokens: number;
+    bucket: number;
   }> {
     const [prepared, framesAfterEos] = this.prepareTextPrompt(sentence);
-    const tokens = this.tokenizer.encode(prepared);
+    const tokens = this.encodeTextBucketed(prepared, bucket);
+    const textTokens = this.tokenizer.encode(prepared).length;
     const voiceEmbed = await this.getVoiceEmbed(voice);
 
     const runOnce = async (): Promise<{
@@ -1235,17 +1346,95 @@ export class SpeechSynthesizer {
     const prev = TUNABLES.ttsFusedStep;
     TUNABLES.ttsFusedStep = fused;
     try {
-      if (warmup) await runOnce();
+      const cold = warmup ? await runOnce() : undefined;
       const { genMs, firstAudioMs, audioDurationMs } = await runOnce();
       return {
         genMs,
         firstAudioMs,
         audioDurationMs,
         realtimeFactor: audioDurationMs > 0 ? genMs / audioDurationMs : NaN,
+        coldGenMs: cold?.genMs,
+        coldFirstAudioMs: cold?.firstAudioMs,
+        textTokens,
+        paddedTokens: tokens.length,
+        bucket,
       };
     } finally {
       TUNABLES.ttsFusedStep = prev;
     }
+  }
+
+  /**
+   * DEV probe for TUNABLES.ttsPrefillBucket: time ONLY the flow-LM's step-0
+   * prefill — the sole part of TTS whose jit traces key on the sentence's
+   * token count — for each sentence, `repeats` times on a fresh state each.
+   * The first run of a NEW prefill shape pays trace+compile for the 6
+   * streaming-transformer layers + out-norm; later runs are warm. With
+   * bucket > 0, sentences whose padded lengths land in the same bucket share
+   * one shape, so every sentence after the first should open warm — with
+   * bucket = 0 each distinct length shows the cold spike (the 90–380 ms
+   * first-audio variance this tunable targets). Mirrors synthOne's embed
+   * construction exactly (same conditionerEmbed gather + voice concat), so
+   * the measured shapes are the real ones.
+   *
+   * Usage: `await window.__pipeline().tts.benchTtsPrefill()` (shipped bucket)
+   *        `await window.__pipeline().tts.benchTtsPrefill(undefined, { bucket: 16 })`
+   */
+  async benchTtsPrefill(
+    sentences: string[] = [
+      // Deliberately different token counts that a 16/32 bucket folds
+      // together — with bucket=0 each pays its own re-trace.
+      "Tell me a little more about the ocean.",
+      "Tell me a little more about the weather today.",
+      "Tell me a little more about the weather and the tides tomorrow.",
+    ],
+    opts: { bucket?: number; voice?: TTSVoice; repeats?: number } = {},
+  ): Promise<Record<string, unknown>> {
+    const bucket = opts.bucket ?? TUNABLES.ttsPrefillBucket;
+    const repeats = opts.repeats ?? 2;
+    const voiceEmbed = await this.getVoiceEmbed(opts.voice ?? TTS_VOICES[0]);
+    const results: Record<string, unknown>[] = [];
+    for (const sentence of sentences) {
+      const [prepared] = this.prepareTextPrompt(sentence);
+      const tokens = this.encodeTextBucketed(prepared, bucket);
+      const runsMs: number[] = [];
+      for (let r = 0; r < repeats; r++) {
+        const tokensAr = np.array(tokens, { dtype: np.uint32 });
+        let embeds = this.model.flowLM.conditionerEmbed.ref.slice(tokensAr);
+        embeds = np.concatenate([voiceEmbed.ref, embeds]);
+        // Fresh state per run, exactly like a real sentence's step 0: empty
+        // KV caches, offset 0, BOS latent as the sequence. runFlowLMStep
+        // consumes the refs/embeds and disposes the empty input caches.
+        const state = createFlowLMState(this.model.flowLM);
+        const t0 = performance.now();
+        const {
+          latent,
+          isEos,
+          state: newState,
+        } = runFlowLMStep(
+          tree.ref(this.model.flowLM),
+          state,
+          random.key(0),
+          this.model.flowLM.bosEmb.ref.reshape([1, -1]),
+          embeds,
+          0, // step-0 prefill always starts at position 0
+        );
+        await blockUntilReady([latent.ref, isEos.ref]);
+        runsMs.push(performance.now() - t0);
+        latent.dispose();
+        isEos.dispose();
+        tree.dispose(newState.kvCaches);
+      }
+      results.push({
+        sentence,
+        textTokens: this.tokenizer.encode(prepared).length,
+        paddedTokens: tokens.length,
+        // The actual jit trace-key length: voice frames + text tokens + BOS.
+        prefillLen: voiceEmbed.shape[0] + tokens.length + 1,
+        runsMs: runsMs.map((t) => +t.toFixed(1)),
+      });
+    }
+    return { bucket, repeats, results };
   }
 
   /**
