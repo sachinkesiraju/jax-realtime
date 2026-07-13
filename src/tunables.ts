@@ -134,6 +134,54 @@ export const TUNABLES = {
    * 88% on holdout, zero small-talk false triggers in both splits.
    */
   toolRouting: "broad" as "conservative" | "broad",
+
+  // region: quality (campaign 3 — conversation quality)
+  //
+  // Three INDEPENDENTLY-gated candidates targeting observed live failures of
+  // the SmolLM2-360M brain. Each defaults to the SHIPPED behavior so the
+  // external eval (bench/quality.mjs) can A/B every knob in isolation. The
+  // eval scores: asksClarify on garbled input, noFalseClarify on clean input,
+  // notVerbatim on repeat requests, shortSpoken on open-ended prompts, and
+  // noMarkdown/noPlaceholder on everything.
+  /**
+   * Token-level hard ban on formatting junk in SmolLM sampling. Observed live
+   * failure: replies containing markdown/template artifacts like "I'm really
+   * into [activity]s" or "**great**" — a VOICE assistant never needs [ ] * #
+   * or backtick in its output, so any token whose decoded text contains one
+   * of those characters gets its logit set to -Infinity before the
+   * temperature/top-p draw (see SmolLmChatModel.maskFormatTokens). The ban
+   * set is built once, lazily, by scanning the tokenizer's full id→bytes
+   * decoder map (BPE tokens are multi-char, so encoding "[" alone would miss
+   * merged tokens like " [" or "]("). The system-prompt instruction alone
+   * ("no lists ... or markdown") demonstrably does not stop a 360M model;
+   * this makes the junk unsampleable instead of merely discouraged. Safe for
+   * the "[scene: …]" tag because that appears only in PROMPT text (user
+   * content), never in generated output. Judged by noMarkdown/noPlaceholder
+   * (should go to 100%) with asksClarify/shortSpoken watched for regressions.
+   */
+  qualityBanFormatTokens: false,
+  /**
+   * Append one clarify-on-garble sentence to the SmolLM system prompt.
+   * Observed live failure: ASR-garbled input ("whazzit fmm the uh...") gets a
+   * confident confabulated answer instead of a clarifying question. SmolLM2
+   * honors a real ChatML system role, so a single positive-phrased
+   * instruction (see SMOLLM_GARBLE_CLAUSE) teaches "didn't catch that — say
+   * it again" behavior. Read at generation time (encodePrompt rebuilds the
+   * system turn every call) so the bench can flip it without a reload.
+   * Judged by asksClarify on garbled inputs, gated on noFalseClarify staying
+   * flat on clean inputs (the failure mode of an over-eager clause).
+   */
+  qualityGarbleClause: false,
+  /**
+   * SmolLM sampling temperature (was hardcoded 0.7 in generateStream).
+   * Observed live failure: occasional rambling / off-prompt drift, which
+   * lower temperature plausibly tames on a 360M model — but too low risks
+   * verbatim repeats (the repetition penalty only covers the previous reply)
+   * and duller open-ended answers. Shipped value 0.7 (unchanged); the bench
+   * A/Bs 0.5. Judged across ALL quality axes, especially notVerbatim (watch
+   * for regression) vs shortSpoken/factual (expected gain).
+   */
+  qualityTemperature: 0.7,
 };
 
 export type Tunables = typeof TUNABLES;
