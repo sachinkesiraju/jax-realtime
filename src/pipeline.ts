@@ -488,6 +488,16 @@ const SMOLLM_SYSTEM =
   "spoken style — a sentence or two, no lists, bullet points, or markdown. A " +
   "[scene: …] tag tells you what the camera sees; never read a bracketed tag " +
   "aloud.";
+// Optional clarify-on-garble instruction (TUNABLES.qualityGarbleClause).
+// Observed live failure: speech recognition sometimes hands the brain
+// gibberish ("whazzit fmm the uh...") and a 360M model answers it CONFIDENTLY
+// instead of asking for a repeat. One sentence, positive phrasing ("say X"
+// rather than "don't guess" — naming a behavior to avoid primes small models
+// to do it), appended to SMOLLM_SYSTEM at prompt-encode time so the bench can
+// flip the tunable between sessions without a reload.
+const SMOLLM_GARBLE_CLAUSE =
+  "If the user's message is garbled or doesn't make sense, say you didn't " +
+  "catch that and ask them to say it again.";
 
 type SmolLmTokenizerData = {
   encoder: Record<string, number>;
@@ -569,7 +579,15 @@ export class SmolLmChatModel implements ChatModel {
     const turn = (role: string, content: string) => {
       tokens.push(SMOLLM_IM_START, ...enc(`${role}\n${content}`), SMOLLM_IM_END, ...nl);
     };
-    turn("system", SMOLLM_SYSTEM);
+    // System string is assembled HERE (not at module scope) so the garble
+    // clause reflects the tunable's value at generation time — the quality
+    // bench flips it per-session without reloading the model.
+    turn(
+      "system",
+      TUNABLES.qualityGarbleClause
+        ? `${SMOLLM_SYSTEM} ${SMOLLM_GARBLE_CLAUSE}`
+        : SMOLLM_SYSTEM,
+    );
     for (const message of windowHistory(history)) {
       const content = message.content.trim();
       if (content === "") continue;
@@ -577,6 +595,57 @@ export class SmolLmChatModel implements ChatModel {
     }
     tokens.push(SMOLLM_IM_START, ...enc("assistant\n"));
     return tokens;
+  }
+
+  // Lazily-built set of token ids whose decoded text contains formatting junk
+  // a voice assistant must never SPEAK: [ ] * # ` (markdown emphasis/headers/
+  // code fences and the "[activity]" template-placeholder pattern seen live).
+  // Built by scanning the FULL vocabulary — BPE merges mean the junk hides in
+  // multi-char tokens (" [", "](", "**", "###"), so encoding "[" alone would
+  // miss most of them. `tokenizer.decoder` is BpeEncoding's id→bytes map (the
+  // exact non-special vocab, ~49k entries), and decode([id]) turns each entry
+  // into text; the banned characters are all single-byte ASCII, so they
+  // survive decoding even inside tokens that are otherwise partial UTF-8.
+  // One pass at first use (~49k tiny decodes), then cached for the session.
+  // Measured on the shipped artifact: 239 of 49135 vocab ids banned, e.g.
+  // "**", " [", "](", "###", "``" — and ZERO of them contain a letter, so no
+  // ordinary word is collateral damage (verified offline against
+  // smollm2-360m-tokenizer.json). Deliberately NOT banned: apostrophes/
+  // quotes/parens/dashes — legitimate in speech — and special ids
+  // (<|im_end|> must stay sampleable as the stop token).
+  private bannedFormatIds: Set<number> | null = null;
+
+  private getBannedFormatIds(): Set<number> {
+    if (this.bannedFormatIds) return this.bannedFormatIds;
+    const junk = /[[\]*#`]/;
+    const banned = new Set<number>();
+    for (const id of this.tokenizer.decoder.keys()) {
+      if (junk.test(this.tokenizer.decode([id]))) banned.add(id);
+    }
+    this.bannedFormatIds = banned;
+    return banned;
+  }
+
+  // Hard mask (TUNABLES.qualityBanFormatTokens): set banned candidates' logits
+  // to -Infinity so the temperature/top-p draw can NEVER pick them — the
+  // system prompt already says "no lists ... or markdown" and the model emits
+  // them anyway, so this failure needs a mechanism, not more instructions.
+  // exp(-Inf - max) = 0, so a banned candidate gets zero probability mass and
+  // the nucleus renormalizes over what remains. Safe for the prompt-side
+  // "[scene: …]" tag: the mask applies only to SAMPLED output tokens. In the
+  // degenerate case where every top-k candidate is banned (never observed;
+  // k = 64), sampleFromCandidates falls back to the argmax — a banned token —
+  // rather than throwing, which is the right failure mode mid-conversation.
+  private maskFormatTokens(
+    values: number[],
+    indices: ArrayLike<number>,
+  ): number[] {
+    if (!TUNABLES.qualityBanFormatTokens) return values;
+    const banned = this.getBannedFormatIds();
+    for (let j = 0; j < values.length; j++) {
+      if (banned.has(indices[j])) values[j] = -Infinity;
+    }
+    return values;
   }
 
   // HF-style repetition penalty over the top-k candidates: divide (or, for
@@ -612,7 +681,13 @@ export class SmolLmChatModel implements ChatModel {
       values[i] = packed[i];
       indices[i] = packed[SMOLLM_TOPK + i];
     }
-    return sampleTopKPairs(this.penalize(values, indices, penalize), indices, opts);
+    // Ban mask AFTER the repetition penalty: -Inf is a fixed point of the
+    // penalty math, but ordering it last makes "banned means banned" obvious.
+    return sampleTopKPairs(
+      this.maskFormatTokens(this.penalize(values, indices, penalize), indices),
+      indices,
+      opts,
+    );
   }
 
   private async sampleFromLogits(
@@ -623,11 +698,15 @@ export class SmolLmChatModel implements ChatModel {
     const [vals, idx] = lax.topK(logits, SMOLLM_TOPK); // consumes logits
     const v = Array.from((await vals.data()) as ArrayLike<number>);
     const ix = (await idx.data()) as ArrayLike<number>;
-    return sampleTopKPairs(this.penalize(v, ix, penalize), ix, {
-      temperature,
-      topK: SMOLLM_TOPK,
-      topP: 0.95,
-    });
+    return sampleTopKPairs(
+      this.maskFormatTokens(this.penalize(v, ix, penalize), ix),
+      ix,
+      {
+        temperature,
+        topK: SMOLLM_TOPK,
+        topP: 0.95,
+      },
+    );
   }
 
   private decodeVisible(tokens: number[]): string {
@@ -786,7 +865,11 @@ export class SmolLmChatModel implements ChatModel {
   ): AsyncGenerator<string, GenerateStats, void> {
     const promptTokens = this.encodePrompt(history);
     const generatedTokens: number[] = [];
-    const temperature = 0.7;
+    // Read per-generation (not hoisted to a const) so the quality bench can
+    // A/B temperature between turns without reloading the model. Shipped 0.7;
+    // lower values are a candidate fix for observed rambling, traded against
+    // verbatim-repeat and dull-answer risk (see tunables.ts).
+    const temperature = TUNABLES.qualityTemperature;
     // Seed the repetition penalty with the previous assistant turn's tokens so a
     // "say it differently" follow-up can't echo the same reply verbatim; each
     // freshly generated token is added below.
