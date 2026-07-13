@@ -7,13 +7,11 @@
 //
 // Writes bench/results/memory-<label>-<ts>.json.
 
-import { launch } from "puppeteer-core";
 import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { launchBench, ROOT } from "./launch.mjs";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = Object.fromEntries(
   process.argv.slice(2).map((a, i, all) =>
     a.startsWith("--") ? [a.slice(2), all[i + 1]] : null,
@@ -39,13 +37,7 @@ function helperRss() {
   };
 }
 
-const browser = await launch({
-  executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  headless: false,
-  protocolTimeout: 0,
-  userDataDir: resolve(ROOT, "bench/.profile"),
-  args: ["--no-sandbox", "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", "--mute-audio"],
-});
+const browser = await launchBench();
 try {
   const page = (await browser.pages())[0] ?? (await browser.newPage());
   const snap = async (phase) => {

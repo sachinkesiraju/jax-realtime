@@ -481,6 +481,81 @@ coreaudiod` fixes it). Holdout numbers stand; re-run
 `node bench/run.mjs --clip bench/clips/map_a.wav --turns 6 --label defaults`
 after the audio daemon restart for the record.
 
+## Map-reduce campaign — cycle 7 (three-front: perf residual, memory, conversation quality)
+
+Three parallel diagnoses, one candidate family per front, everything gated by
+paired evals. New infra: `bench/quality.mjs` (scripted chat histories driven
+straight through `__pipeline().llm.generate` — no audio path — scored by
+deterministic checks: asksClarify on garbled input, noFalseClarify on clean,
+notVerbatim on repeats, shortSpoken on open-ended, noMarkdown/noPlaceholder
+everywhere), `bench/memory.mjs` (JS heap via CDP + per-process RSS as a GPU
+proxy), and `bench/launch.mjs` (shared launcher: zombie sweep, 1 MB HTTP disk
+cache so the OPFS model store isn't duplicated, interrupt-safe teardown).
+
+### Perf — ttsPrefillBucket (REJECTED at MAP; law recorded)
+
+Diagnosis was correct: the flow-LM's step-0 prefill (always unfused) re-traces
+its 6 jitted layers per NEW sentence token length — `benchTtsPrefill` measured
+~320–550 ms first-encounter vs ~30–60 ms warm, the source of the 90–380 ms
+tts-stage variance. But the fix that worked for the LLM (bucket-pad to
+16-token multiples, leading spaces through the real tokenizer) made even WARM
+prefills slower (~150–165 ms) and regressed the turn bench's tts median
+115 → 221 ms. **Law: padding pays only when the padded shape's warm cost is
+unchanged — extra flow-LM prefill tokens are not free the way extra SmolLM
+prefill tokens are.** Removed per the dead-end rule; the open lever for the
+variance is fusing the step-0 prefill, not padding it. (`benchTtsPrefill`
+stays as the diagnostic.)
+
+### Memory (SHIPPED: hygiene + lazy Eye)
+
+- Loaders now release the downloaded weight buffers + safetensors views right
+  after the GPU copies exist (verified eager: `np.array` copies at call time),
+  so the `Promise.all` load can't pin up to 724 MB of JS heap next to the GPU
+  weights. Steady-state heap was already fine (~30 MB); this trims the peak.
+- D-FINE is now lazy: the eye toggle drives the existing on-demand load path
+  instead of an unconditional preload, so an unchecked Eye (or denied camera)
+  never downloads (42 MB) or holds GPU residency; "ready" no longer waits on
+  the detector warmup. Verified: eye-off run fetches no D-FINE, eye-on session
+  loads and detects normally.
+- Measurement honesty: macOS RSS of Chrome's GPU process proved too noisy
+  across runs (±100 MB) to headline a number; the deterministic claims above
+  are what shipped. The fp16 GPU weight residency (~1.1 GB across the three
+  models) is the floor until jax-js grows an int8 compute path.
+
+### Conversation quality (SHIPPED: format-token ban + garble clause/exemplar)
+
+Baseline (n=2 runs × 14 items): asksClarify **0/6** — the model confabulates
+on every garbled input; shortSpoken 2/6; format axes clean on the eval set
+(the live "[activity]" failures are conversation-pressure artifacts).
+
+| cond (MAP) | asksClarify | noFalseClarify | shortSpoken | correct |
+| --- | --- | --- | --- | --- |
+| baseline ×2 | 0/6 | 6/6 | 2/6 | 5–6/6 |
+| ban-format-tokens | 0/6 | 6/6 | 3/6 | 6/6 |
+| garble clause alone | **0/6 — inert** | 6/6 | 2/6 | 5/6 |
+| garble clause + 1 exemplar | **5/6** | 6/6 | 4/6 | 5/6 |
+| temperature 0.5 | 0/6 | 6/6 | **4/6** | 6/6 |
+
+- **Ban (shipped on):** 239 of 49k vocab ids whose decoded text contains
+  `[ ] * # \`` get -Infinity at sampling; none contain a letter, so no word is
+  affected — the prompt's "no markdown" request becomes a guarantee. Zero
+  regressions anywhere. Residual: numbered lists ("1. …") are digits and
+  can't be token-banned (seen ~1/40 replies).
+- **Garble clause (shipped on, WITH exemplar):** the instruction alone is
+  inert at 360M; one demonstrated clarify exchange in the prompt is what
+  teaches it (docs/CONVERSATION.md's Tier-2 design, confirmed). Iteration 2:
+  scene-tagged turns skip the exemplar (it leaked a clarify onto "What am I
+  sitting on?"). Final confirmation (n=3 runs): asksClarify 0 → **6/9 MAP,
+  3/6 holdout**, noFalseClarify 8/9 / 6/6, other axes flat. Cost ~35 prompt
+  tokens/turn. Known mild residual: ~1-in-9 clean turns gets a clarify —
+  the recovery (user repeats) is graceful vs the confabulation it replaced.
+- **Temperature 0.5 (NOT shipped, law recorded):** wins brevity alone, but
+  FUSED with the exemplar it reversed on holdout (asksClarify 3/4 → 1/4,
+  factual misses) — cooler sampling fights few-shot imitation. Stays 0.7.
+
+Fusion lesson (again): the shippable fusion was ban+garble only — the
+three-way fusion's holdout reversal is exactly why the HOLDOUT gate exists.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**

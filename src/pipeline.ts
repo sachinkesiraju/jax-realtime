@@ -626,11 +626,15 @@ export class SmolLmChatModel implements ChatModel {
         ? `${SMOLLM_SYSTEM} ${SMOLLM_GARBLE_CLAUSE}`
         : SMOLLM_SYSTEM,
     );
-    if (TUNABLES.qualityGarbleClause) {
-      // One demonstrated clarify exchange (see SMOLLM_GARBLE_EXEMPLAR): the
-      // clause alone was inert on this model size; the exemplar is what
-      // actually teaches the behavior. Injected before the real history so
-      // windowHistory can never evict it.
+    // One demonstrated clarify exchange (see SMOLLM_GARBLE_EXEMPLAR): the
+    // clause alone was inert on this model size; the exemplar is what
+    // actually teaches the behavior. Injected before the real history so
+    // windowHistory can never evict it. Scene-tagged turns skip it: they are
+    // camera-grounded, never garble candidates, and the confirmation run
+    // showed the exemplar can leak a clarify onto them ("What am I sitting
+    // on?" → "couldn't quite follow").
+    const lastUser = [...history].reverse().find((m) => m.role === "user");
+    if (TUNABLES.qualityGarbleClause && !lastUser?.content.includes("[scene:")) {
       for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
     }
     for (const message of windowHistory(history)) {
@@ -1164,70 +1168,17 @@ export class SpeechSynthesizer {
     return [text, framesAfterEosGuess];
   }
 
-  /**
-   * Encode `prepared` (output of prepareTextPrompt), padded with LEADING
-   * spaces until the token count reaches the next multiple of `bucket`
-   * (TUNABLES.ttsPrefillBucket; <= 0 or already aligned = plain encode). WHY:
-   * jax-js trace caches key on avals (shapes), and the flow-LM's step-0
-   * prefill (always the unfused runFlowLMStep — inference.ts keeps step 0 off
-   * the fused path) runs its 6 jitted streaming-transformer layers + the
-   * jitted out-norm over a [voiceLen + textLen + 1, 1024] activation. A new
-   * sentence token count means re-tracing them all before the reply's first
-   * audio chunk; bucketing textLen makes warm shapes repeat across sentences
-   * (the LLM's llmPrefillBucket lever, ported to the TTS prefill).
-   *
-   * Pad choice — real spaces through the real tokenizer, at the START:
-   *   - Spaces, because prepareTextPrompt already fronts every <5-word phrase
-   *     with 8 spaces (Kyutai's reference behavior), so leading whitespace is
-   *     the one padding this model demonstrably treats as neutral — it adds
-   *     no leading silence beyond what shipped synthesis already produces.
-   *   - Start-side, because the flow-LM conditions its EOS decision and
-   *     sentence-final prosody on the END of the text (the tokens adjacent to
-   *     the latent positions, which follow the embeds in the prefill).
-   *     Trailing spaces after the final "." are an arrangement the model
-   *     never saw and risk trailing artifacts / shifted EOS timing; leading
-   *     spaces before a capitalized sentence are exactly the training-time
-   *     arrangement.
-   *   - Re-encoding the space-padded TEXT (instead of splicing a pad token id
-   *     into the token array) keeps the sequence exactly what the tokenizer
-   *     itself produces for a space-padded sentence — in-distribution
-   *     segmentation, no assumptions about which "▁" pieces exist.
-   * The readout cannot move: runFlowLMStep slices position -1, the BOS latent
-   * appended AFTER the text embeds, so padding never changes which position
-   * the latent/EOS are read from — only prepends neutral context.
-   *
-   * SentencePiece merges make token count non-additive in the space count, so
-   * we re-encode and adjust; if the exact target is unreachable (e.g. a
-   * tokenizer that collapses whitespace) we fall back to the unpadded
-   * encoding with a warning — correctness over trace warmth, never a silent
-   * behavior change.
-   */
-  private encodeTextBucketed(
-    prepared: string,
-    bucket = TUNABLES.ttsPrefillBucket,
-  ): number[] {
-    const tokens = this.tokenizer.encode(prepared);
-    if (bucket <= 0 || tokens.length % bucket === 0) return tokens;
-    let target = Math.ceil(tokens.length / bucket) * bucket;
-    let spaces = target - tokens.length;
-    for (let tries = 0; tries < 8 && spaces > 0; tries++) {
-      const padded = this.tokenizer.encode(" ".repeat(spaces) + prepared);
-      if (padded.length === target) return padded;
-      spaces += target - padded.length;
-      if (spaces <= 0) {
-        // Merged space pieces overshot the target for every smaller space
-        // count; aim one bucket higher rather than under-pad (an unaligned
-        // length would silently defeat the bucket).
-        target += bucket;
-        spaces += bucket;
-      }
-    }
-    console.warn(
-      `ttsPrefillBucket: could not pad TTS prompt to ${target} tokens; ` +
-        "synthesizing unpadded (re-trace possible)",
-    );
-    return tokens;
-  }
+  // NOTE (cycle 7): bucket-padding the TTS text prompt (leading spaces to the
+  // next 16-token multiple, the llmPrefillBucket lever ported to the flow-LM
+  // prefill) was built and REJECTED at MAP. The re-trace tax is real
+  // (benchTtsPrefill: ~320-550 ms on first encounter of a sentence length vs
+  // ~30-60 ms warm) but the padded prompt made even WARM prefills slower
+  // (~150-165 ms) and the turn bench's tts stage regressed 115 -> 221 ms
+  // median — the extra leading-space tokens cost more per reply than the
+  // occasional re-trace they avoid, since real sentence lengths repeat enough
+  // to stay mostly warm. Removed per the dead-end rule; the remaining
+  // hypothesis for the ~90-380 ms tts variance is FUSING the step-0 prefill
+  // (inference.ts keeps step 0 on the unfused path), not padding it.
 
   /** Synthesize one line of text into an existing player (no close). */
   private async synthOne(
@@ -1237,7 +1188,7 @@ export class SpeechSynthesizer {
     signal: AbortSignal | null,
   ): Promise<void> {
     const [prepared, framesAfterEos] = this.prepareTextPrompt(text);
-    const tokens = this.encodeTextBucketed(prepared);
+    const tokens = this.tokenizer.encode(prepared);
     const voiceEmbed = await this.getVoiceEmbed(voice);
 
     const tokensAr = np.array(tokens, { dtype: np.uint32 });
@@ -1382,14 +1333,11 @@ export class SpeechSynthesizer {
       voice = TTS_VOICES[0],
       seed = 1234,
       warmup = true,
-      bucket = TUNABLES.ttsPrefillBucket,
     }: {
       fused?: boolean;
       voice?: TTSVoice;
       seed?: number;
       warmup?: boolean;
-      /** ttsPrefillBucket override for A/B (0 = unpadded, shipped). */
-      bucket?: number;
     } = {},
   ): Promise<{
     genMs: number;
@@ -1397,18 +1345,16 @@ export class SpeechSynthesizer {
     audioDurationMs: number;
     realtimeFactor: number;
     /** Trace-cold numbers from the warmup run (absent when warmup=false).
-     *  cold − warm firstAudio at a NEW sentence length is exactly the step-0
-     *  re-trace cost that ttsPrefillBucket targets, so the A/B can show it
-     *  without a page reload. */
+     *  cold − warm firstAudio at a NEW sentence length is the step-0
+     *  re-trace cost (bucket-padding it away was tried and rejected in
+     *  cycle 7 — see the note above synthOne). */
     coldGenMs?: number;
     coldFirstAudioMs?: number;
     textTokens: number;
-    paddedTokens: number;
-    bucket: number;
   }> {
     const [prepared, framesAfterEos] = this.prepareTextPrompt(sentence);
-    const tokens = this.encodeTextBucketed(prepared, bucket);
-    const textTokens = this.tokenizer.encode(prepared).length;
+    const tokens = this.tokenizer.encode(prepared);
+    const textTokens = tokens.length;
     const voiceEmbed = await this.getVoiceEmbed(voice);
 
     const runOnce = async (): Promise<{
@@ -1460,8 +1406,6 @@ export class SpeechSynthesizer {
         coldGenMs: cold?.genMs,
         coldFirstAudioMs: cold?.firstAudioMs,
         textTokens,
-        paddedTokens: tokens.length,
-        bucket,
       };
     } finally {
       TUNABLES.ttsFusedStep = prev;
@@ -1469,38 +1413,33 @@ export class SpeechSynthesizer {
   }
 
   /**
-   * DEV probe for TUNABLES.ttsPrefillBucket: time ONLY the flow-LM's step-0
-   * prefill — the sole part of TTS whose jit traces key on the sentence's
-   * token count — for each sentence, `repeats` times on a fresh state each.
-   * The first run of a NEW prefill shape pays trace+compile for the 6
-   * streaming-transformer layers + out-norm; later runs are warm. With
-   * bucket > 0, sentences whose padded lengths land in the same bucket share
-   * one shape, so every sentence after the first should open warm — with
-   * bucket = 0 each distinct length shows the cold spike (the 90–380 ms
-   * first-audio variance this tunable targets). Mirrors synthOne's embed
-   * construction exactly (same conditionerEmbed gather + voice concat), so
-   * the measured shapes are the real ones.
+   * DEV probe: time ONLY the flow-LM's step-0 prefill — the sole part of TTS
+   * whose jit traces key on the sentence's token count — for each sentence,
+   * `repeats` times on a fresh state each. The first run of a NEW prefill
+   * shape pays trace+compile for the 6 streaming-transformer layers +
+   * out-norm; later runs are warm. This documents the residual 90–380 ms
+   * first-audio variance (bucket-padding it away was tried and REJECTED in
+   * cycle 7 — see the note above synthOne). Mirrors synthOne's embed
+   * construction exactly, so the measured shapes are the real ones.
    *
-   * Usage: `await window.__pipeline().tts.benchTtsPrefill()` (shipped bucket)
-   *        `await window.__pipeline().tts.benchTtsPrefill(undefined, { bucket: 16 })`
+   * Usage: `await window.__pipeline().tts.benchTtsPrefill()`
    */
   async benchTtsPrefill(
     sentences: string[] = [
-      // Deliberately different token counts that a 16/32 bucket folds
-      // together — with bucket=0 each pays its own re-trace.
+      // Deliberately different token counts — each distinct length pays its
+      // own one-time re-trace.
       "Tell me a little more about the ocean.",
       "Tell me a little more about the weather today.",
       "Tell me a little more about the weather and the tides tomorrow.",
     ],
-    opts: { bucket?: number; voice?: TTSVoice; repeats?: number } = {},
+    opts: { voice?: TTSVoice; repeats?: number } = {},
   ): Promise<Record<string, unknown>> {
-    const bucket = opts.bucket ?? TUNABLES.ttsPrefillBucket;
     const repeats = opts.repeats ?? 2;
     const voiceEmbed = await this.getVoiceEmbed(opts.voice ?? TTS_VOICES[0]);
     const results: Record<string, unknown>[] = [];
     for (const sentence of sentences) {
       const [prepared] = this.prepareTextPrompt(sentence);
-      const tokens = this.encodeTextBucketed(prepared, bucket);
+      const tokens = this.tokenizer.encode(prepared);
       const runsMs: number[] = [];
       for (let r = 0; r < repeats; r++) {
         const tokensAr = np.array(tokens, { dtype: np.uint32 });
@@ -1531,14 +1470,13 @@ export class SpeechSynthesizer {
       }
       results.push({
         sentence,
-        textTokens: this.tokenizer.encode(prepared).length,
-        paddedTokens: tokens.length,
+        textTokens: tokens.length,
         // The actual jit trace-key length: voice frames + text tokens + BOS.
         prefillLen: voiceEmbed.shape[0] + tokens.length + 1,
         runsMs: runsMs.map((t) => +t.toFixed(1)),
       });
     }
-    return { bucket, repeats, results };
+    return { repeats, results };
   }
 
   /**

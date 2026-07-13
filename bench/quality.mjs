@@ -14,12 +14,10 @@
 // Each item is scored on EVERY run (sampling is stochastic; more runs = less
 // noise). The same seed items are used for every condition (paired eval).
 
-import { launch } from "puppeteer-core";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { launchBench, ROOT } from "./launch.mjs";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = Object.fromEntries(
   process.argv.slice(2).map((a, i, all) =>
     a.startsWith("--") ? [a.slice(2), all[i + 1]] : null,
@@ -71,8 +69,12 @@ const HOLDOUT_ITEMS = [
 const ITEMS = args.holdout != null ? HOLDOUT_ITEMS : MAP_ITEMS;
 
 // --- Deterministic checks ---------------------------------------------------
+// Detector for a clarify-style reply. Deliberately broad: the confirmation
+// run showed real clarifies scored as misses ("could you please repeat it?",
+// "I don't see your message here") — a too-strict detector penalizes exactly
+// the behavior being taught.
 const CLARIFY_RE =
-  /\b(didn'?t (quite )?(catch|get|hear)|say (that|it) again|could you repeat|not sure (i|I) (understood|heard)|rephrase|come again|missed that)\b/i;
+  /\b(didn'?t (quite )?(catch|get|hear|follow)|(couldn'?t|can'?t) (quite )?(catch|follow|make out|understand)|say (that|it) again|(could|can|would) you( please)? (repeat|say|rephrase)|not sure (i|I) (understood|heard)|rephrase|come again|missed that|don'?t see your message)\b/i;
 const sentences = (t) => (t.match(/[^.!?]+[.!?]+/g) ?? [t]).length;
 const words = (t) => t.split(/\s+/).filter(Boolean);
 
@@ -98,13 +100,7 @@ function score(item, reply) {
 }
 
 // --- Drive the page ----------------------------------------------------------
-const browser = await launch({
-  executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  headless: false,
-  protocolTimeout: 0,
-  userDataDir: resolve(ROOT, "bench/.profile"),
-  args: ["--no-sandbox", "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", "--mute-audio"],
-});
+const browser = await launchBench();
 try {
   const page = (await browser.pages())[0] ?? (await browser.newPage());
   await page.goto("http://localhost:5173", { waitUntil: "domcontentloaded" });

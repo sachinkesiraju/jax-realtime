@@ -94,35 +94,12 @@ export const TUNABLES = {
    * same audio duration) — equivalent output, fewer dispatches.
    */
   ttsFusedStep: true,
-  /**
-   * Bucket size (tokens) for padding the Pocket TTS flow-LM prefill text;
-   * 0 = off (shipped). Same disease as llmPrefillBucket, different patient:
-   * playTTS's step-0 prefill (always the UNFUSED runFlowLMStep — see
-   * inference.ts `fuseFlow = ttsFusedStep && step > 0`) pushes a
-   * [voiceLen + textLen + 1, 1024] activation through the 6 jitted
-   * streaming-transformer layers plus the jitted out-norm, and textLen is the
-   * sentence's token count — so every NEW sentence length re-traces and
-   * recompiles those jits on the critical path to first audio (the 90–380 ms
-   * per-reply variance in TTS first-audio). Bucketing textLen makes the
-   * prefill trace shapes repeat across sentences.
-   *
-   * Unlike the LLM case there is no logits-gather to fix: the flow-LM reads
-   * its output (and the EOS logit) at the LAST position, which is the BOS
-   * latent concatenated AFTER the text embeds, so padding can never shift the
-   * readout. Pad = LEADING spaces prepended to the prepared text and
-   * re-encoded through the real tokenizer (SpeechSynthesizer's
-   * encodeTextBucketed), mirroring the 8-leading-space pad prepareTextPrompt
-   * already applies to every <5-word phrase — the one padding this exact
-   * model is known to treat as neutral (it is Kyutai's own reference
-   * behavior). End-side padding is deliberately avoided: spaces between the
-   * sentence-final "." and the latent positions are an arrangement the model
-   * never saw in training and risk shifting EOS timing / trailing artifacts.
-   *
-   * Default 0 until the bench proves it AND a listen confirms large pads add
-   * no audible leading silence. A/B: benchTtsPrefill() (prefill-only, shows
-   * re-trace vs warm per length) and benchSynth(text, { bucket }).
-   */
-  ttsPrefillBucket: 0,
+  // NOTE (cycle 7): a ttsPrefillBucket lever (pad the flow-LM prefill text to
+  // 16-token multiples, llmPrefillBucket's twin) lived here and was REJECTED
+  // at MAP: the padded prompt made warm prefills SLOWER (~150 ms vs ~30-60 ms)
+  // and the turn bench's tts stage regressed 115 -> 221 ms median. The step-0
+  // re-trace variance it targeted is real (benchTtsPrefill shows it); the
+  // open lever is fusing the step-0 prefill, not padding it.
 
   // region: tts-onset
   /**
@@ -185,30 +162,37 @@ export const TUNABLES = {
    * ("no lists ... or markdown") demonstrably does not stop a 360M model;
    * this makes the junk unsampleable instead of merely discouraged. Safe for
    * the "[scene: …]" tag because that appears only in PROMPT text (user
-   * content), never in generated output. Judged by noMarkdown/noPlaceholder
-   * (should go to 100%) with asksClarify/shortSpoken watched for regressions.
+   * content), never in generated output. SHIPPED ON (cycle 7): zero
+   * regressions across every eval axis on MAP + holdout, and it converts the
+   * prompt's "no markdown" request from a suggestion into a guarantee (239 of
+   * 49k vocab ids banned; none contain a letter, so no word is affected).
    */
-  qualityBanFormatTokens: false,
+  qualityBanFormatTokens: true,
   /**
    * Append one clarify-on-garble sentence to the SmolLM system prompt.
    * Observed live failure: ASR-garbled input ("whazzit fmm the uh...") gets a
    * confident confabulated answer instead of a clarifying question. SmolLM2
-   * honors a real ChatML system role, so a single positive-phrased
-   * instruction (see SMOLLM_GARBLE_CLAUSE) teaches "didn't catch that — say
-   * it again" behavior. Read at generation time (encodePrompt rebuilds the
-   * system turn every call) so the bench can flip it without a reload.
-   * Judged by asksClarify on garbled inputs, gated on noFalseClarify staying
-   * flat on clean inputs (the failure mode of an over-eager clause).
+   * honors a real ChatML system role, but the clause ALONE was inert at MAP
+   * (0/6 asks-to-clarify — a 360M model doesn't follow rules), so the flag
+   * also injects ONE few-shot exemplar exchange demonstrating the behavior
+   * (SMOLLM_GARBLE_EXEMPLAR; the docs/CONVERSATION.md Tier-2 design). Read at
+   * generation time (encodePrompt rebuilds the system turn every call) so the
+   * bench can flip it without a reload. SHIPPED ON (cycle 7): clause+exemplar
+   * took asksClarify 0/6 → 5/6 on MAP and 0/4 → 3/4 on holdout with zero
+   * false clarifies on clean input and other axes flat. Cost: ~35 extra
+   * prompt tokens per turn (bucket-padded prefill absorbs it).
    */
-  qualityGarbleClause: false,
+  qualityGarbleClause: true,
   /**
    * SmolLM sampling temperature (was hardcoded 0.7 in generateStream).
    * Observed live failure: occasional rambling / off-prompt drift, which
    * lower temperature plausibly tames on a 360M model — but too low risks
    * verbatim repeats (the repetition penalty only covers the previous reply)
-   * and duller open-ended answers. Shipped value 0.7 (unchanged); the bench
-   * A/Bs 0.5. Judged across ALL quality axes, especially notVerbatim (watch
-   * for regression) vs shortSpoken/factual (expected gain).
+   * and duller open-ended answers. 0.5 was A/B'd in cycle 7: it won brevity
+   * on MAP (shortSpoken 2/6 → 4/6) but FUSED with the garble exemplar it
+   * reversed on holdout (asksClarify 3/4 → 1/4, factual misses) — cooler
+   * sampling fights the few-shot behavior. Stays 0.7 (the garble win is
+   * worth more than the brevity win); recorded so 0.5 isn't retried blind.
    */
   qualityTemperature: 0.7,
 };

@@ -12,14 +12,9 @@
 // The Chrome profile persists in bench/.profile so OPFS-cached weights are
 // downloaded once. The Eye is force-disabled (it interjects mid-bench).
 
-import { launch } from "puppeteer-core";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const CHROME =
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+import { resolve } from "node:path";
+import { launchBench, ROOT } from "./launch.mjs";
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a, i, all) =>
@@ -39,23 +34,10 @@ const median = (xs) => {
   return s.length ? s[Math.floor(s.length / 2)] : NaN;
 };
 
-const browser = await launch({
-  executablePath: CHROME,
-  headless: false,
-  // Model load blocks the page main thread for long stretches (wasm compile,
-  // GPU warmup), which stalls CDP round-trips — disable the protocol timeout.
-  protocolTimeout: 0,
-  userDataDir: resolve(ROOT, "bench/.profile"),
-  args: [
-    "--no-sandbox", // fake-device file capture cannot read the WAV under the sandbox
-    "--use-fake-device-for-media-stream",
-    "--use-fake-ui-for-media-stream",
-    `--use-file-for-fake-audio-capture=${clip}`,
-    "--autoplay-policy=no-user-gesture-required",
-    "--mute-audio",
-    "--window-size=1200,900",
-  ],
-});
+const browser = await launchBench([
+  `--use-file-for-fake-audio-capture=${clip}`,
+  "--window-size=1200,900",
+]);
 
 try {
   const page = (await browser.pages())[0] ?? (await browser.newPage());
