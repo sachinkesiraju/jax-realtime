@@ -12,9 +12,8 @@ dist/
 .DS_Store
 public/weights/
 
-# Bench artifacts
-bench/.profile/
-bench/results/
+# Local bench harness (dev tooling, not part of the app — see
+# docs/BENCHMARKS.md "Method" for what it does)
+bench/
 .worktrees/
 .netlify/
-bench/clips/
