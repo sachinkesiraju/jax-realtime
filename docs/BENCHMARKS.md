@@ -606,6 +606,37 @@ Mac sleeps — CoreAudio wedges (`AudioQueueStart -66681`, even `afplay`
 fails) and `sudo killall coreaudiod` revives it. A wedged run is detectable
 by zero turns AND zero discards on a clip that should produce either.
 
+## Cycle 8 — growing-history delays, realtime feel, reply brevity
+
+Field report: "weird delays, especially as message history grows — one turn
+hit 8 s", plus "convos feel low quality / voice responses don't feel
+realtime". Reproduced (14-turn defaults session): llmFirst oscillated
+300 → 1036 ms with history growth. Two re-trace mechanisms:
+1. **KV capacity crossing** — the first prompt past 512 tokens grew the KV
+   cache 512 → 1024, re-tracing all 32 prefill layer jits (capacity is a
+   static trace key) AND the big fused decode jit mid-conversation: the
+   multi-second (~8 s observed) one-time stall.
+2. **Bucket churn** — 64-token prefill buckets meant a new shape (~0.5–1 s
+   first-encounter re-trace) every couple of turns while history grew.
+
+Shipped fixes, all validated on a 14-turn defaults session:
+- `SMOLLM_KV_CAPACITY = 1536` — one KV shape for the whole session (no
+  crossing; ensureSmolLmStateCapacity still guards pathological prompts).
+  Cost ~126 MB vs ~42 MB, one state at a time.
+- `llmPrefillBucket` 64 → 256 — at most ~5 prefill shapes/session; warmup()
+  now pre-traces the first three buckets + the decode shape at load (~2-3 s
+  one-time).
+- Result: llmFirst flat (288–689 ms, no spikes), warm turnLat median
+  1511 ms, max 1768 ms across 14 turns.
+- `onsetFiller` ON — first sound now lands 435–602 ms after end of speech,
+  every turn (the "doesn't feel realtime" fix). The cycle-3 ears gate moves
+  to production listening: flip off if the filler-then-pause cadence sounds
+  worse than silence.
+- `llmMaxNewTokens` 96 → 64 — reply brevity: quality bench shortSpoken
+  3/9 → **8/9** MAP, 3/6 → **5/6** holdout, with every other axis flat or
+  better (asksClarify 7/9, noFalseClarify 9/9, format 42/42, correct 8/9 on
+  MAP; holdout `correct` wobble is the known spider-legs item noise).
+
 ## Branch-vs-main head-to-head (pre-merge verification)
 
 Shipped-vs-shipped comparison of this branch against `main` (Gemma-era,
