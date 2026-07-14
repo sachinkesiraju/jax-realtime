@@ -698,6 +698,63 @@ above). Still open, ranked by impact/effort:
    **tool-context memory** ("what about tomorrow?" follow-ups) — gated on a
    labeled routing test set first.
 
+## Cycle 9 — cascade consolidation: the Kyutai streaming ear (PORTED; default-off pending semantic VAD)
+
+Motivated by the 2026 landscape survey: native full-duplex models
+(BayLing-Duplex, DuplexSLA) prove where this goes but are 7-9B — 4-5x past
+browser budgets — while Kyutai's delayed-streams STT (stt-1b-en_fr) offers
+the cascade-preserving consolidation: a natively STREAMING ear that replaces
+Whisper + LocalAgreement-2 + the finalize pass with monotonic committed text,
+and carries a semantic-VAD head (end-of-turn probability) that is the only
+principled attack left on the endpoint floor (cycle-5 law: no pre-fire
+continuation signal exists in a lagging cascade ASR — this model IS the
+signal).
+
+Phase-gated port, every gate measured:
+
+| phase | gate | result |
+| --- | --- | --- |
+| A: feasibility (synthetic shapes, this machine) | step ≤ 40 ms; memory OK | STT-shape step **36 ms**, Mimi-encoder shape ~4 ms; +2.2 GB fp16 allocates + computes cleanly |
+| B: Mimi encoder port (jax-js, streaming) | ≥95 % semantic-codebook parity | **100 %** semantic / 95 % all-32 vs HF MimiModel; ~20 ms/frame |
+| C1: stt-1b decoder port | ≥98 % golden-token parity | **193/193 (100 %)**, fp16 AND per-row-int8; 23 ms/frame; transcript identical |
+| C1.5: true end-to-end | correct transcript from raw PCM | exact transcript, browser, our encoder → our int8 decoder |
+| C2: live integration | works under the duplex engine | 8/8 turns correct on the fake-mic bench after one fix (below) |
+
+Weights hosted: kyutai-stt-1b-i8 (991 MB, per-row int8 → fp16 at load) +
+mimi-encoder-fp16 (112 MB) on sachink98/jax-realtime-weights. Engine is
+selectable via `asrEngine: "whisper" | "kyutai"` (load-time; Whisper path
+byte-identical when unselected).
+
+**Live A/B (map_a, 8 turns, paired):**
+
+| | whisper | kyutai v2 |
+| --- | --- | --- |
+| turn latency (median) | **1479 ms** | 1733 ms |
+| endpoint | **451 ms** | ~750 ms |
+| transcripts | 8/8 | 8/8 words correct (silence-cause turns lose the trailing "?" — the delayed stream hadn't flushed it) |
+| GPU while listening | ~250 ms Whisper pass per 150 ms tick | ~45 ms per 160 ms tick |
+
+**Defect found and fixed by the bench (the reason v1 isn't v2):** after a
+reply, the lane drained the whole pause-period capture backlog through the
+sequential 45 ms/frame stream — an 18 s stall that concatenated stale
+utterances. Fixed with backlog skip-ahead: pause-period audio (reply echo +
+ignored speech, by definition) is never decoded; the cursor jumps to a 2 s
+pre-roll with a fresh stream state. This is also the honest answer to the
+echo-filter question: the kyutai lane skips reply-period audio instead of
+filtering it.
+
+**Verdict: default stays "whisper" for now.** The kyutai ear is correct and
+stable but +254 ms median: punct-endpointing waits for punctuation that the
+delayed stream delivers ~0.5 s late — a texture the timer knobs cannot fix
+(tried: shrinking endpointPunctMs just re-routes turns to the silence path).
+The flip-gate is **Phase D: the semantic-VAD head** (extra_heads in the
+checkpoint, currently implemented only in Kyutai's Rust server) — replace
+punct+silence timers with the model's own end-of-turn probability, which
+fires WITHOUT waiting for delayed punctuation and adapts to content (the
+patience mechanism cycle 5 proved impossible from the outside). If Phase D
+lands under ~500 ms effective endpoint, the kyutai ear wins on every axis
+and deletes streaming.ts entirely.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
