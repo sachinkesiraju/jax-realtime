@@ -84,6 +84,23 @@ const MAX_FRAMES_PER_BATCH = 25;
 // trained-in text delay (+ safety margin). If live benching shows even this
 // too slow, 0.75 s (9-10 frames) still clears the delay with less margin.
 const FLUSH_FRAMES = 15;
+// Backlog skip-ahead. While the lane is paused (assistant speaking) the
+// capture buffer keeps growing with audio we must NOT transcribe — it's the
+// reply period: our own playback echo, room noise, and anything the user
+// said that the energy barge-in deliberately ignored. The first live bench
+// proved chewing through it is catastrophic: a long reply left a 15-20 s
+// backlog that took ~18 s of GPU to drain, concatenated stale utterances
+// into the next turn, and wedged turn latency. (Whisper's lane had the same
+// audio but its window re-transcribes cheaply and an echo filter drops the
+// reply words; a sequential 45 ms/frame stream cannot afford that.) So: when
+// the backlog exceeds MAX_BACKLOG_FRAMES, jump the cursor to the last
+// PRE_ROLL_FRAMES and rebuild fresh encoder/decoder state — skipped audio is
+// never decoded. The pre-roll (2 s) comfortably covers a barge-in utterance
+// (barge fires ~300 ms after speech onset and the reply stops ~instantly,
+// so the user's words live in the buffer tail) while capping catch-up at
+// ~1.1 s of GPU.
+const MAX_BACKLOG_FRAMES = 30; // > 2.4 s behind → skip ahead
+const PRE_ROLL_FRAMES = 25; // resume from the last 2 s
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -286,6 +303,21 @@ export class KyutaiStreamingTranscriber implements Transcriber {
     cap: number,
     isFinalize = false,
   ): Promise<void> {
+    // Backlog skip-ahead (see MAX_BACKLOG_FRAMES): audio that piled up while
+    // the lane was paused is reply-period audio we must not decode. Jump the
+    // cursor and start a fresh stream state — the model must never attend
+    // across the skip (it would be a discontinuity it never saw in training).
+    if (!isFinalize) {
+      const avail = availableFrames(this.getSamples().length);
+      if (avail - this.framesConsumed > MAX_BACKLOG_FRAMES) {
+        this.framesConsumed = avail - PRE_ROLL_FRAMES;
+        this.disposeStates();
+        await this.ensureStates(gen);
+        // Text decoded before the pause was this same listening window's —
+        // dropping the audio between means it no longer joins up; keep what
+        // was committed (endpointing already saw it) and continue appending.
+      }
+    }
     for (let n = 0; n < cap; n++) {
       if (gen !== this.generation) return;
       // Mid-batch bail: a reply starting mid-catch-up should pause the lane
@@ -370,6 +402,9 @@ export class KyutaiStreamingTranscriber implements Transcriber {
     if (this.sttState) {
       tree.dispose(this.sttState.caches);
       this.sttState = null;
+      // The bos step belongs to the decoder state's lifetime: any fresh state
+      // (reset OR backlog skip-ahead) must re-run step 0 before real frames.
+      this.bosStepDone = false;
     }
   }
 }
