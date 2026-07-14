@@ -22,6 +22,20 @@ import {
 } from "./asr/decoding";
 import { whisperLogMel } from "./asr/features";
 import {
+  createSttState,
+  fromSafetensors as sttFromSafetensors,
+  STT_CONFIG,
+  type SttModel,
+  sttStep,
+} from "./asr/kyutai-stt";
+import {
+  createMimiEncodeState,
+  encodeFrame,
+  fromSafetensors as mimiFromSafetensors,
+  MIMI_CONFIG,
+  type MimiEncoderModel,
+} from "./asr/mimi-encode";
+import {
   createWhisperState,
   fromSafetensors as whisperFromSafetensors,
   type KVCache,
@@ -127,6 +141,9 @@ function hfWhisperUrl(file: string): string {
 }
 
 export class SpeechRecognizer {
+  /** Discriminant for the VoicePipeline.asr union (see KyutaiRecognizer). */
+  readonly engine = "whisper" as const;
+
   private busy = false;
 
   private constructor(
@@ -350,6 +367,141 @@ export class SpeechRecognizer {
       if (crossKV) tree.dispose(crossKV);
       if (state) tree.dispose(state);
       this.busy = false;
+    }
+  }
+}
+
+// Kyutai delayed-streams STT weights (TUNABLES.asrEngine = "kyutai"), hosted
+// on the same HF repo as the SmolLM artifacts. The decoder ships per-row
+// symmetric int8 (991 MB; dequantized to fp16 at load by sttFromSafetensors —
+// same scheme as the SmolLM q8r build) and the Mimi encoder fp16 (112 MB,
+// upcast to fp32 at load; see mimi-encode.ts for why the encoder runs fp32).
+const KYUTAI_BASE =
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
+const KYUTAI_STT_WEIGHTS_URL = `${KYUTAI_BASE}/kyutai-stt-1b-i8.safetensors`;
+const KYUTAI_MIMI_WEIGHTS_URL = `${KYUTAI_BASE}/mimi-encoder-fp16.safetensors`;
+const KYUTAI_STT_TOKENIZER_URL = `${KYUTAI_BASE}/kyutai-stt-tokenizer.model`;
+
+/**
+ * The Kyutai ASR lane: streaming Mimi encoder + stt-1b decoder + SentencePiece
+ * tokenizer, loaded when TUNABLES.asrEngine === "kyutai" INSTEAD of Whisper.
+ * This is a model-holder, not a transcriber: the actual streaming loop lives
+ * in src/asr/kyutai-stream.ts (KyutaiStreamingTranscriber), which drives
+ * encodeFrame/sttStep against these models. It still exposes the two members
+ * the rest of the app touches on `pipeline.asr` regardless of engine:
+ *   - `isBusy` — true while the streaming lane is doing GPU work, so the
+ *     vision stage (main.ts pauseWhile) and duplex.audioActive() can yield
+ *     the GPU exactly as they do around Whisper passes. The transcriber owns
+ *     the work, so it reports busyness in via `markBusy`.
+ *   - `warmup()` — one synthetic silent utterance through encoder+decoder at
+ *     load, pre-tracing all three fused-step traces (encoder first-frame,
+ *     encoder steady-state, decoder step) so the first real turn doesn't pay
+ *     multi-second JIT compiles.
+ * There is deliberately NO `transcribe()` — nothing calls it on this lane
+ * (StreamingTranscriber, the only transcribe() consumer, is never constructed
+ * for the kyutai engine; duplex branches on `engine` at session start).
+ */
+export class KyutaiRecognizer {
+  /** Discriminant for the VoicePipeline.asr union (see SpeechRecognizer). */
+  readonly engine = "kyutai" as const;
+
+  private busy = false;
+
+  private constructor(
+    readonly mimi: MimiEncoderModel,
+    readonly stt: SttModel,
+    readonly tokenizer: tokenizers.SentencePiece,
+  ) {}
+
+  static async load(onProgress: ProgressFn): Promise<KyutaiRecognizer> {
+    // The three downloads run in parallel (HTTP/2 multiplexes them), each with
+    // its own clearly-named progress row. Same memory hygiene as the Whisper
+    // loader: null the download buffer + parsed File as soon as the tensors
+    // are uploaded so this long-lived async frame can't pin ~1.1 GB.
+    const [mimi, stt, tokenizer] = await Promise.all([
+      (async () => {
+        let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
+          "Kyutai Mimi encoder weights",
+          KYUTAI_MIMI_WEIGHTS_URL,
+          onProgress,
+        );
+        let file: safetensors.File | null = safetensors.parse(data);
+        data = null;
+        const model = mimiFromSafetensors(file);
+        file = null;
+        await blockUntilReady(model);
+        return model;
+      })(),
+      (async () => {
+        let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
+          "Kyutai STT-1B weights (int8)",
+          KYUTAI_STT_WEIGHTS_URL,
+          onProgress,
+        );
+        let file: safetensors.File | null = safetensors.parse(data);
+        data = null;
+        const model = await sttFromSafetensors(file, np.float16);
+        file = null;
+        return model;
+      })(),
+      (async () => {
+        const data = await fetchWithProgress(
+          "Kyutai STT tokenizer",
+          KYUTAI_STT_TOKENIZER_URL,
+          onProgress,
+        );
+        return tokenizers.SentencePiece.fromBinary(data);
+      })(),
+    ]);
+    return new KyutaiRecognizer(mimi, stt, tokenizer);
+  }
+
+  /** True while the streaming lane (kyutai-stream.ts) has a frame batch or a
+   *  finalize flush in flight on the GPU. */
+  get isBusy(): boolean {
+    return this.busy;
+  }
+
+  /** Reported by KyutaiStreamingTranscriber around its GPU work. */
+  markBusy(busy: boolean): void {
+    this.busy = busy;
+  }
+
+  /**
+   * One synthetic silent utterance through encoder + decoder: the decoder bos
+   * step plus a few silence frames. Frame 0 uses the encoder's first-frame
+   * trace variant (replicate-padding init), frame 1+ the steady-state trace,
+   * and every sttStep reuses one fused decoder trace — so this compiles all
+   * the kernels the live loop will ever dispatch (the KV shift paths are
+   * plain eager slice/pad ops, no jit). Mirrors SpeechRecognizer.warmup().
+   */
+  async warmup(): Promise<void> {
+    try {
+      const encState = createMimiEncodeState(this.mimi);
+      const sttState = createSttState(this.stt);
+      const silence = new Float32Array(MIMI_CONFIG.frameSize);
+      const bosFrame = new Int32Array(STT_CONFIG.numCodebooks).fill(
+        STT_CONFIG.audioBosTokenId,
+      );
+      // Decoder step 0 consumes the bos frame (no audio) — see kyutai-stt.ts.
+      (await sttStep(this.stt, sttState, bosFrame)).hidden.dispose();
+      for (let i = 0; i < 3; i++) {
+        const { codes, preQuant } = encodeFrame(this.mimi, encState, silence);
+        preQuant.dispose();
+        const ids = await codes.data();
+        const { hidden } = await sttStep(
+          this.stt,
+          sttState,
+          ids as ArrayLike<number>,
+        );
+        hidden.dispose();
+      }
+      tree.dispose([encState.convStates, encState.kvCaches]);
+      encState.downsampleState?.dispose();
+      tree.dispose(sttState.caches);
+    } catch {
+      // Best-effort, like the Whisper warmup: a failure only means the first
+      // real utterance pays the JIT compile cost.
     }
   }
 }
@@ -1641,7 +1793,16 @@ function withFirstAudio(inner: AudioPlayer, onFirst: () => void): AudioPlayer {
 }
 
 export type VoicePipeline = {
-  asr: SpeechRecognizer;
+  /**
+   * The ASR lane for the engine chosen at load time (TUNABLES.asrEngine).
+   * Both variants expose the members every generic touchpoint uses (`isBusy`
+   * for GPU-yield checks in main.ts/duplex.audioActive, `warmup()` at load);
+   * the `engine` literal discriminates for the engine-specific consumers
+   * (duplex constructs a StreamingTranscriber around SpeechRecognizer's
+   * transcribe(), or a KyutaiStreamingTranscriber around KyutaiRecognizer's
+   * models — see DuplexSession.start).
+   */
+  asr: SpeechRecognizer | KyutaiRecognizer;
   llm: ChatModel;
   tts: SpeechSynthesizer;
   /** Compute device the ASR lane runs on ("wasm" when available, else "webgpu"). */
@@ -1683,13 +1844,20 @@ export async function loadPipeline(
   onProgress: ProgressFn,
 ): Promise<VoicePipeline> {
   const setup = await initDevice();
-  // All three weight downloads run in parallel (they were sequential; HTTP/2
+  // ASR engine is chosen ONCE, here: the two engines download disjoint weight
+  // sets (Whisper ~150 MB vs Kyutai 991+112 MB), so TUNABLES.asrEngine is a
+  // load-time knob — flipping it mid-session does nothing without a reload
+  // (documented on the tunable). The Whisper path below is byte-identical to
+  // the pre-kyutai code when asrEngine === "whisper".
+  // All weight downloads run in parallel (they were sequential; HTTP/2
   // multiplexes them over one connection, so wall-clock ≈ the largest file).
   const [asr, llm, tts] = await Promise.all([
-    SpeechRecognizer.load(onProgress, {
-      device: setup.asrDevice,
-      dtype: setup.asrDtype,
-    }),
+    TUNABLES.asrEngine === "kyutai"
+      ? KyutaiRecognizer.load(onProgress)
+      : SpeechRecognizer.load(onProgress, {
+          device: setup.asrDevice,
+          dtype: setup.asrDtype,
+        }),
     SmolLmChatModel.load(onProgress),
     SpeechSynthesizer.load(onProgress),
   ]);

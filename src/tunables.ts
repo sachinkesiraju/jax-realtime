@@ -17,6 +17,35 @@ export const TUNABLES = {
   minSpeechMs: 350,
 
   // region: asr
+  /**
+   * Which ASR "ear" the session runs. Read ONCE, at LOAD time (loadPipeline) —
+   * the two engines download disjoint weights, so flipping it mid-session does
+   * nothing; changing it requires a page reload.
+   *
+   * "whisper" (default, shipped): Whisper base.en (~150 MB) re-transcribing
+   * the growing utterance window every asrPassIntervalMs, with the
+   * LocalAgreement-2 commit policy, self-echo filtering against
+   * currentTtsText, and a full-window finalize() pass as the short-utterance
+   * fallback (src/asr/streaming.ts).
+   *
+   * "kyutai": Kyutai's delayed-streams stt-1b-en_fr — a TRUE streaming
+   * transcriber. The mic PCM is resampled 16→24 kHz, encoded to 32 Mimi RVQ
+   * codes per 80 ms frame (streaming encoder, src/asr/mimi-encode.ts), and a
+   * 1B temporal transformer emits one text token per frame
+   * (src/asr/kyutai-stt.ts); text arrives monotonically ~0.5 s behind the
+   * audio (a trained-in delay) and is NEVER revised, so there is no
+   * tentative-tail / LocalAgreement machinery and no re-transcription — each
+   * frame is encoded and decoded exactly once (~45 ms of GPU per 80 ms of
+   * audio). finalize() only needs to drain the frame backlog plus ~1 s of
+   * synthetic silence to flush the trained-in delay, instead of re-running the
+   * whole window. Cost: a 991 MB int8 decoder + 112 MB fp16 encoder download
+   * (vs Whisper's ~150 MB) and no self-echo word filter (the Kyutai lane
+   * relies on pauseWhile — no frames are processed while the assistant is
+   * audible — plus the energy barge-in; see src/asr/kyutai-stream.ts).
+   * DEFAULT stays "whisper" until the live bench (turn bench + observe suite)
+   * shows the Kyutai lane winning; flip only after benching.
+   */
+  asrEngine: "whisper" as "whisper" | "kyutai",
   /** Minimum time between the starts of two streaming Whisper passes. */
   asrPassIntervalMs: 150,
   /** Max utterance window fed to Whisper, seconds. */

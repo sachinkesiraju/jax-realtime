@@ -4,7 +4,9 @@
 // continuously-running streaming ASR lane. TTS/LLM run on WebGPU; ASR runs on
 // wasm (when available) so it can transcribe while the assistant speaks.
 
+import { KyutaiStreamingTranscriber } from "./asr/kyutai-stream";
 import { StreamingTranscriber, type StreamingUpdate } from "./asr/streaming";
+import type { Transcriber } from "./asr/transcriber";
 import { VoiceCapture } from "./mic";
 import { analyserLevel } from "./orb";
 import type {
@@ -216,7 +218,7 @@ export class DuplexSession {
   private readonly cb: DuplexCallbacks;
   private vision: VisionSession | null;
 
-  private transcriber: StreamingTranscriber | null = null;
+  private transcriber: Transcriber | null = null;
   private tick: ReturnType<typeof setInterval> | null = null;
   private running = false;
 
@@ -330,17 +332,32 @@ export class DuplexSession {
     this.capture.clear();
     await this.capture.resume();
 
-    this.transcriber = new StreamingTranscriber(
-      this.pipeline.asr,
-      () => this.capture.samples(),
-      (update) => this.onTranscript(update),
-      () => (this.isAssistantAudible() ? this.currentTtsText : null),
-      {
-        // Interval/window come from TUNABLES (read live by the loop). Pause
-        // while the assistant is speaking so ASR doesn't steal the GPU from TTS.
-        pauseWhile: () => this.isAssistantAudible(),
-      },
-    );
+    // Engine chosen at LOAD time (TUNABLES.asrEngine → loadPipeline); both
+    // transcribers implement the same Transcriber contract, so this branch is
+    // the only engine-aware code in the duplex engine. The Kyutai lane has no
+    // self-echo word filter — it relies on pauseWhile (no frames processed
+    // while the assistant is audible) + the energy barge-in (see
+    // asr/kyutai-stream.ts for the tradeoff).
+    const asr = this.pipeline.asr;
+    this.transcriber =
+      asr.engine === "kyutai"
+        ? new KyutaiStreamingTranscriber(
+            asr,
+            () => this.capture.samples(),
+            (update) => this.onTranscript(update),
+            { pauseWhile: () => this.isAssistantAudible() },
+          )
+        : new StreamingTranscriber(
+            asr,
+            () => this.capture.samples(),
+            (update) => this.onTranscript(update),
+            () => (this.isAssistantAudible() ? this.currentTtsText : null),
+            {
+              // Interval/window come from TUNABLES (read live by the loop). Pause
+              // while the assistant is speaking so ASR doesn't steal the GPU from TTS.
+              pauseWhile: () => this.isAssistantAudible(),
+            },
+          );
     this.transcriber.start();
 
     this.running = true;
