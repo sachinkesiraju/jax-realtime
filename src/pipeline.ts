@@ -492,6 +492,18 @@ const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
 const SMOLLM_Q8_URL = `${SMOLLM_BASE}/smollm2-360m-it-q8r.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
 const SMOLLM_REPEAT_PENALTY = 1.3;
+// KV capacity every turn's state is created with. jax-js traces key on
+// shapes, and the KV capacity is one of them: with the default 512-block
+// growth, the first prompt to cross 512 tokens re-traced all 32 prefill
+// layer jits AND the big fused decode jit mid-conversation — a one-time
+// multi-second stall (observed up to 8-16 s) exactly when history gets
+// long. 1536 covers the windowed prompt (llmMaxHistoryTurns caps it well
+// under this) + a full reply, so a session only ever sees ONE capacity
+// shape, and warmup() pre-traces it at load. Cost: ~126 MB KV vs ~42 MB at
+// 512 — one state exists at a time and is disposed per turn.
+// ensureSmolLmStateCapacity still guards the pathological over-1536 prompt
+// (it grows and pays a re-trace rather than crashing).
+const SMOLLM_KV_CAPACITY = 1536;
 const EMPTY_SET: ReadonlySet<number> = new Set<number>();
 const SMOLLM_IM_START = 1; // <|im_start|>
 const SMOLLM_IM_END = 2; // <|im_end|> — ends the assistant turn
@@ -596,10 +608,36 @@ export class SmolLmChatModel implements ChatModel {
 
   async warmup(): Promise<void> {
     try {
+      // One real (tiny) generation first: traces the decode step at the
+      // session's single KV capacity plus the smallest prefill bucket.
       const stream = this.generateStream([{ role: "user", content: "Hi" }], 2);
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       for await (const _ of stream) {
         /* drain */
+      }
+      // Pre-trace the prefill shapes a session actually reaches as history
+      // grows (T = one bucket, two, three). Without this, each new bucket's
+      // first encounter re-traced 32 layer jits mid-conversation (~0.5-1 s
+      // added to that turn — the "delays grow with history" report). ~2-3 s
+      // of one-time load cost buys re-trace-free conversations.
+      const bucket = TUNABLES.llmPrefillBucket;
+      if (bucket > 0) {
+        const filler = this.tokenizer.encode(
+          " tell me a little more about the ocean and the weather today",
+        );
+        for (const target of [bucket * 2, bucket * 3]) {
+          const tokens = this.encodePrompt([{ role: "user", content: "Hi" }]);
+          while (tokens.length < target) tokens.push(...filler);
+          tokens.length = target - 1; // bucket pad brings it to `target`
+          const state = createSmolLmState({
+            dtype: np.float16,
+            capacity: SMOLLM_KV_CAPACITY,
+          });
+          const logits = this.runBucketedPrefill(tokens, state);
+          await blockUntilReady(logits.ref);
+          logits.dispose();
+          tree.dispose(state);
+        }
       }
     } catch {
       // Best-effort; a failure just means the first real turn pays JIT cost.
@@ -843,7 +881,7 @@ export class SmolLmChatModel implements ChatModel {
 
     const times: number[] = [];
     for (let r = 0; r < runs; r++) {
-      const state = createSmolLmState({ dtype: np.float16 });
+      const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
       const t0 = performance.now();
       const logits = this.runBucketedPrefill(tokens, state, bucket);
       await blockUntilReady(logits.ref);
@@ -881,7 +919,7 @@ export class SmolLmChatModel implements ChatModel {
     tokens.length = nTokens;
 
     const readLogits = async (b: number): Promise<Float32Array> => {
-      const state = createSmolLmState({ dtype: np.float16 });
+      const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
       const logits = this.runBucketedPrefill(tokens, state, b);
       // astype consumes `logits` (move semantics); data() drains the result.
       const data = new Float32Array(await logits.astype(np.float32).data());
@@ -933,7 +971,7 @@ export class SmolLmChatModel implements ChatModel {
     let firstTokenMs = 0;
     let emitted = "";
 
-    const state = createSmolLmState({ dtype: np.float16 });
+    const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
     let pending: np.Array | null = this.runBucketedPrefill(promptTokens, state);
     let pendingIsCombined = false;
 
