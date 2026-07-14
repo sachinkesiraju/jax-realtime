@@ -181,6 +181,30 @@ export class KyutaiStreamingTranscriber implements Transcriber {
   }
 
   /**
+   * Wait for the delayed text stream to settle (see Transcriber.settle). The
+   * VAD endpoint fires ~0.24 s after end-of-speech but tokens for the last
+   * words arrive ~0.5 s behind the audio; the loop keeps decoding the real
+   * trailing silence, so settling is just polling `committed` until it stops
+   * growing for two frame-intervals. Bounded by maxMs — if the stream is
+   * somehow starved (GPU contention), the caller proceeds with what exists
+   * (the old truncation behavior) rather than stalling the turn.
+   */
+  async settle(maxMs: number): Promise<void> {
+    const start = performance.now();
+    let last = this.committedText;
+    let stableSince = performance.now();
+    while (performance.now() - start < maxMs) {
+      await sleep(TICK_MS / 2);
+      if (this.committedText !== last) {
+        last = this.committedText;
+        stableSince = performance.now();
+      } else if (performance.now() - stableSince >= TICK_MS * 2) {
+        return; // no growth across ~2 processing intervals — flushed
+      }
+    }
+  }
+
+  /**
    * Latest frame's semantic-VAD "user is done talking" probability — prs[2],
    * the 2 s-horizon head, the one unmute thresholds (see kyutai-stt.ts).
    * null until (a) vad-capable weights have been loaded (older cached weight

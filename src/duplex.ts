@@ -620,6 +620,18 @@ export class DuplexSession {
       endCause: this.lastEndCause,
     };
 
+    // Delayed-stream settle: a semantic-VAD endpoint fires ~0.24 s after the
+    // user finishes, but the kyutai text stream lags the audio ~0.5 s — read
+    // bestText() immediately and the last words are missing (the mini bench
+    // caught exactly this). Wait for the stream to stop growing (bounded;
+    // ~0.3-0.5 s in practice) before snapshotting. Whisper's transcriber has
+    // no settle() — zero change on that engine.
+    if (this.lastEndCause === "vad" && transcriber.settle) {
+      this.cb.onStageActivity("asr", true);
+      await transcriber.settle(900);
+      this.cb.onStageActivity("asr", false);
+    }
+
     // Latency hillclimb: the streaming loop has already transcribed this
     // utterance incrementally, so prefer its result and skip the extra
     // multi-second Whisper finalize pass that used to dominate turn latency.

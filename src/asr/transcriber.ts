@@ -26,6 +26,16 @@ export interface Transcriber {
   /** Best transcript available right now WITHOUT extra model work (the
    *  turn-end fast path — see duplex.endUserTurn). */
   bestText(): string;
+
+  /**
+   * Optional: wait for the committed stream to SETTLE before reading
+   * bestText(). Only meaningful for delayed-stream engines (kyutai): their
+   * text lags the audio by ~0.5 s, so an endpoint that fires the moment the
+   * user finishes (semantic VAD) lands before the last words have flushed —
+   * settle() polls until the text stops growing (or maxMs), closing the
+   * truncation gap the mini bench caught ("...hobby to do on the").
+   */
+  settle?(maxMs: number): Promise<void>;
   /**
    * OPTIONAL semantic-VAD hook (Kyutai lane only): latest frame's model-
    * predicted probability that the user is done talking, or null when
