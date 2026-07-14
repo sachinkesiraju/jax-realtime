@@ -51,6 +51,33 @@
 // 16 layers -> norm -> lm_head -> argmax on GPU, and only the winning token
 // id is read back. Position scalars are traced np.Arrays so a single trace
 // serves every frame.
+//
+// SEMANTIC-VAD EXTRA HEADS (vadProbs). kyutai/stt-1b-en_fr also ships 4 tiny
+// "extra heads" trained to predict the probability that the user is done
+// talking (kyutai.org/stt) — implemented upstream only in Kyutai's Rust
+// server. Reverse-engineered spec (moshi rust/moshi-core/src/lm.rs + asr.rs,
+// delayed-streams-modeling configs/config-stt-en_fr-hf.toml, and unmute's
+// consumer unmute/stt/speech_to_text.py):
+//   * Weights: extra_heads.{0..3}.weight, each [6, 2048], bias-free, in the
+//     CANDLE checkpoint only (kyutai/stt-1b-en_fr-candle — absent from the
+//     HF transformers export; base weights of the two are bit-identical, so
+//     the heads apply directly to our hidden state). Exported here as
+//     extraHeads.{i}.weight by bench/stt/export_weights.py.
+//   * Math: logits_i = W_i @ ys where ys is the POST-final-norm hidden state
+//     (lm.rs forward_cond returns ys = out_norm(transformer_out) — the same
+//     tensor that feeds text_linear/lm_head, i.e. exactly the `hidden` this
+//     fused step already computes); p_i = softmax(logits_i)[0] is the
+//     probability the user has finished (asr.rs takes element 0 of each
+//     head; the other 5 classes are unused by every consumer).
+//   * Head i predicts "finished" at horizon [0.5, 1, 2, 3][i] seconds
+//     (delayed-streams-modeling issue #8). Unmute's decision rule pauses on
+//     prs[2] (the 2 s horizon) > 0.6 after a near-instant EMA
+//     (attack/release 0.01 s at 12.5 Hz ⇒ alpha ≈ 0.996, effectively raw),
+//     ignoring the first 12 steps ("all over the place in the first few
+//     steps"), and treats prs[2] < 0.4 as "user speaking" for barge-in.
+// The heads fold into the same fused dispatch (one extra [4·6, 2048] matmul,
+// near-zero cost); loading tolerates weight files without them (vadProbs
+// null → callers fall back to timer endpointing) so old cached weights work.
 import {
   blockUntilReady,
   defaultDevice,
@@ -61,6 +88,13 @@ import {
   tree,
 } from "@jax-js/jax";
 import { safetensors, tokenizers } from "@jax-js/loaders";
+
+import {
+  createMimiEncodeState,
+  encodeFrame,
+  fromSafetensors as mimiFromSafetensors,
+  MIMI_CONFIG,
+} from "./mimi-encode";
 
 export const STT_CONFIG = {
   textVocabSize: 8001,
@@ -78,6 +112,13 @@ export const STT_CONFIG = {
   ropeTheta: 100_000,
   rmsNormEps: 1e-8,
   frameRate: 12.5, // Hz; one text token per 80 ms frame
+  // Semantic-VAD "extra heads" (see the vadProbs section of the module
+  // comment): 4 heads, one per end-of-turn prediction horizon, softmax over
+  // 6 classes each. numVadHeads matches config-stt-en_fr-hf.toml
+  // ([modules.asr.model.extra_heads] num_heads = 4, dim = 6).
+  numVadHeads: 4,
+  vadHeadDim: 6,
+  vadHorizonsSec: [0.5, 1, 2, 3], // head i predicts "done" at this horizon
 } as const;
 
 // KV-cache capacity. Window is 375 including self, so a step needs at most
@@ -104,6 +145,9 @@ export type SttModel = {
   lmHead: Linear; // [8001, 2048], untied
   layers: SttLayer[]; // 16
   norm: RMSNorm;
+  /** Semantic-VAD extra heads, [6, 2048] each (see module comment). Absent
+   *  when the weight file predates the VAD export — vadProbs is then null. */
+  extraHeads?: Linear[];
 };
 
 export type SttKVCache = {
@@ -224,16 +268,20 @@ function layerInline(
 
 // ---------------------------------------------------------------------------
 // Fused per-frame step: embedding sum -> 16 layers -> norm -> lm_head ->
-// argmax, one jitted dispatch. `ids` are the 33 PRE-OFFSET flat-table row
-// indices (computed on the JS side — cheaper than in-trace offset math and
-// keeps the trace input a single array).
+// argmax (+ the semantic-VAD extra heads when loaded), one jitted dispatch.
+// `ids` are the 33 PRE-OFFSET flat-table row indices (computed on the JS
+// side — cheaper than in-trace offset math and keeps the trace input a
+// single array). `vadProbs` is a 0-or-1-element list (a [4] array of each
+// head's softmax[0] when the model has extraHeads, else empty) — the LIST
+// keeps one jit signature serving both model structures (jit re-traces per
+// input tree structure, so each variant gets its own cached trace).
 const runSttStepFused = jit(function runSttStepFused(
   model: SttModel,
   caches: SttKVCache[],
   ids: np.Array, // [33] uint32: [text row, audio rows...]
   position: np.Array, // int32 scalar
   kvCacheLen: np.Array, // int32 scalar
-): [np.Array, np.Array, SttKVCache[]] {
+): [np.Array, np.Array, np.Array[], SttKVCache[]] {
   // Summed embedding of the text token + all 32 audio codes. fp32 residual
   // stream (the fp16 table rows are upcast before the 33-way sum).
   let x = model.embed.weight.slice(ids).astype(np.float32).sum(0, {
@@ -259,10 +307,21 @@ const runSttStepFused = jit(function runSttStepFused(
   const logits = linearInline(model.lmHead, x.ref); // [1, 8001]
   const tokenId = np.argmax(logits, -1).astype(np.int32); // [1]
 
+  // Semantic-VAD extra heads on the same post-final-norm hidden state (see
+  // module comment): per head, softmax over 6 classes, element 0 = P(user
+  // done talking). All four 6×2048 matmuls fuse into this dispatch.
+  const vadProbs: np.Array[] = [];
+  if (model.extraHeads) {
+    const probs = model.extraHeads.map((head) =>
+      nn.softmax(linearInline(head, x.ref).astype(np.float32), -1).slice(0, 0),
+    ); // 4 × [] scalars (softmax[0] of each head)
+    vadProbs.push(np.stack(probs)); // [4]
+  }
+
   // Also expose the final-norm hidden state — the parity probe compares it
   // against the transformers fixture to localize errors. [2048], cheap.
   const hidden = x.reshape([STT_CONFIG.hiddenSize]);
-  return [tokenId, hidden, newCaches];
+  return [tokenId, hidden, vadProbs, newCaches];
 });
 
 // ---------------------------------------------------------------------------
@@ -288,14 +347,17 @@ export function createSttState(model: SttModel): SttState {
  * Run one decoder step on a frame's 32 Mimi codes (pass all
  * `STT_CONFIG.audioBosTokenId` for the initial bos frame). Autoregressive:
  * awaits the argmax readback and feeds it to the next step via
- * `state.prevToken`. Returns the text token id plus the final-norm hidden
- * state (for parity debugging; dispose it if unused).
+ * `state.prevToken`. Returns the text token id, the final-norm hidden state
+ * (for parity debugging; dispose it if unused), and `vadProbs` — the four
+ * semantic-VAD "user is done talking" probabilities (one per horizon
+ * `STT_CONFIG.vadHorizonsSec`, already read back; see module comment) or
+ * null when the loaded weights lack the extra heads.
  */
 export async function sttStep(
   model: SttModel,
   state: SttState,
   codes: ArrayLike<number>,
-): Promise<{ tokenId: number; hidden: np.Array }> {
+): Promise<{ tokenId: number; hidden: np.Array; vadProbs: Float32Array | null }> {
   const { numCodebooks, textVocabSize, codebookVocabSize } = STT_CONFIG;
   if (codes.length !== numCodebooks) {
     throw new Error(`Expected ${numCodebooks} codes, got ${codes.length}`);
@@ -321,7 +383,8 @@ export async function sttStep(
 
   let tokenArr: np.Array;
   let hidden: np.Array;
-  [tokenArr, hidden, state.caches] = runSttStepFused(
+  let vadArrs: np.Array[];
+  [tokenArr, hidden, vadArrs, state.caches] = runSttStepFused(
     tree.ref(model),
     state.caches,
     np.array(ids, { dtype: np.uint32 }),
@@ -331,10 +394,15 @@ export async function sttStep(
   state.position++;
   state.kvCacheLen++;
 
-  // data() consumes tokenArr (move semantics) — no dispose needed.
+  // data() consumes tokenArr / the vad array (move semantics) — no dispose
+  // needed. The GPU work is one dispatch; the second readback rides the same
+  // sync point as the first.
   const tokenId = Number((await tokenArr.data())[0]);
+  const vadProbs = vadArrs.length
+    ? ((await vadArrs[0].data()) as Float32Array)
+    : null;
   state.prevToken = tokenId;
-  return { tokenId, hidden };
+  return { tokenId, hidden, vadProbs };
 }
 
 /** Decode text tokens to a transcript. Ids 0..3 are specials (pad included —
@@ -462,6 +530,14 @@ export async function fromSafetensors(
       `Expected ${STT_CONFIG.numLayers} STT layers, found ${model.layers.length}`,
     );
   }
+  // Semantic-VAD heads are OPTIONAL: older exported/cached weight files lack
+  // them (vadProbs stays null and callers fall back to timer endpointing).
+  // But a PARTIAL set means a corrupted export — fail loudly.
+  if (model.extraHeads && model.extraHeads.length !== STT_CONFIG.numVadHeads) {
+    throw new Error(
+      `Expected ${STT_CONFIG.numVadHeads} VAD extra heads, found ${model.extraHeads.length}`,
+    );
+  }
   return blockUntilReady(model);
 }
 
@@ -557,4 +633,153 @@ export async function sttParity(
     frameMsMean: steady.reduce((a, b) => a + b, 0) / steady.length,
     weightsMB: Math.round(weightsData.length / 1e6),
   };
+}
+
+// ---------------------------------------------------------------------------
+// DEV semantic-VAD behavioral probe. Run via a bare vite page:
+//   import("/src/asr/kyutai-stt.ts").then((m) => m.sttVadProbe())          // "speech"
+//   import("/src/asr/kyutai-stt.ts").then((m) => m.sttVadProbe("midpause"))
+//
+// HONESTY NOTE: no reference implementation of the extra heads exists
+// outside Kyutai's Rust server, so unlike the token/hidden parity gates this
+// is a BEHAVIORAL check, not golden parity. It runs the speech fixture
+// (bench/mimi/fixture_speech.json: real speech ending ~2.4 s in, then padded
+// silence) through the full encoder+decoder and dumps the per-frame
+// P(user done talking) series (prs, one per horizon 0.5/1/2/3 s). Expected
+// if the port is right: prs[2] LOW (<~0.2) while speech is ongoing, rising
+// sharply within a few frames of the real end of speech and staying high
+// through the silence. Mode "midpause" concatenates fixture speech + 0.6 s
+// silence + the same speech again + trailing silence. MEASURED CAVEAT: the
+// fixture utterance is a COMPLETE question ("What is your favorite hobby to
+// do on the weekend?"), so the model legitimately calls a pause after it an
+// end of turn (that is the correct semantic read); what "midpause" actually
+// demonstrates is instant revocation — the probability collapses to ~0.01
+// the frame speech resumes. The true semantic-vs-energy differentiator is
+// mode "midclause": the same 0.64 s of silence spliced in MID-SENTENCE
+// (after ~1.2 s of speech) — an energy VAD sees the identical pause, but
+// the semantic head should stay low because the clause is unfinished.
+type VadProbeFixture = { pcm: number[] };
+
+export async function sttVadProbe(
+  mode: "speech" | "midpause" | "midclause" = "speech",
+  fixtureUrl: string = "/bench/mimi/fixture_speech.json",
+  weightsUrl: string = "/bench/stt/kyutai-stt.fp16.safetensors",
+  mimiWeightsUrl: string = "/bench/mimi/mimi-encoder.fp16.safetensors",
+) {
+  await init("webgpu");
+  defaultDevice("webgpu");
+
+  const [fixture, sttData, mimiData] = await Promise.all([
+    fetch(fixtureUrl).then((r) => r.json()) as Promise<VadProbeFixture>,
+    fetch(weightsUrl)
+      .then((r) => r.arrayBuffer())
+      .then((b) => new Uint8Array(b)),
+    fetch(mimiWeightsUrl)
+      .then((r) => r.arrayBuffer())
+      .then((b) => new Uint8Array(b)),
+  ]);
+  const model = await fromSafetensors(safetensors.parse(sttData));
+  if (!model.extraHeads) {
+    tree.dispose(model);
+    return { error: "weights have no extraHeads — re-run bench/stt/export_weights.py" };
+  }
+  const mimi = mimiFromSafetensors(safetensors.parse(mimiData));
+
+  const F = MIMI_CONFIG.frameSize;
+  const src = Float32Array.from(fixture.pcm);
+  let pcm: Float32Array<ArrayBuffer>;
+  // The fixture's real speech ends ~2.4 s in (frame 30); the rest is padded
+  // silence.
+  const SPEECH_END_FRAME = 30;
+  if (mode === "speech") {
+    // Speech + 4 s of the fixture's own trailing silence (frames past ~2.4 s).
+    pcm = src.slice(0, (SPEECH_END_FRAME + 50) * F);
+  } else if (mode === "midpause") {
+    // Fixture speech (incl. a couple frames of its natural trailing silence),
+    // a 0.64 s fake pause, the same speech again, then 2.4 s true silence.
+    const seg = src.slice(0, 32 * F);
+    const pauseFrames = 8; // 0.64 s
+    pcm = new Float32Array((32 + pauseFrames + 32 + 30) * F);
+    pcm.set(seg, 0);
+    pcm.set(seg, (32 + pauseFrames) * F);
+  } else {
+    // Mid-CLAUSE pause: first 1.2 s of the utterance (mid-sentence), 0.64 s
+    // of silence, then the remainder of the utterance, then true silence.
+    const cut = 15; // frames; ~1.2 s
+    const pauseFrames = 8; // 0.64 s
+    const rest = 32 - cut;
+    pcm = new Float32Array((cut + pauseFrames + rest + 30) * F);
+    pcm.set(src.slice(0, cut * F), 0);
+    pcm.set(src.slice(cut * F, 32 * F), (cut + pauseFrames) * F);
+  }
+
+  const encState = createMimiEncodeState(mimi);
+  const state = createSttState(model);
+  const bosFrame = new Int32Array(STT_CONFIG.numCodebooks).fill(
+    STT_CONFIG.audioBosTokenId,
+  );
+  const numFrames = Math.floor(pcm.length / F);
+
+  // series[s] = prs for the step that CONSUMED audio frame s (decoder step
+  // s+1 — step 0 is the bos frame and consumes no audio).
+  const series: number[][] = [];
+  const tokens: number[] = [];
+  (await sttStep(model, state, bosFrame)).hidden.dispose();
+  for (let i = 0; i < numFrames; i++) {
+    const { codes, preQuant } = encodeFrame(
+      mimi,
+      encState,
+      pcm.slice(i * F, (i + 1) * F),
+    );
+    preQuant.dispose();
+    const ids = await codes.data();
+    const { tokenId, hidden, vadProbs } = await sttStep(
+      model,
+      state,
+      ids as ArrayLike<number>,
+    );
+    hidden.dispose();
+    tokens.push(tokenId);
+    series.push([...vadProbs!].map((p) => Math.round(p * 1000) / 1000));
+  }
+  tree.dispose([state, model]);
+  tree.dispose([encState.convStates, encState.kvCaches, mimi]);
+  encState.downsampleState?.dispose();
+
+  // Summary over prs[2] (the 2 s horizon head — the one unmute thresholds).
+  const prs2 = series.map((p) => p[2]);
+  const firstAbove = (from: number, thresh: number) => {
+    for (let i = from; i < prs2.length; i++) if (prs2[i] > thresh) return i;
+    return -1;
+  };
+  const maxIn = (a: number, b: number) =>
+    Math.max(...prs2.slice(Math.max(0, a), Math.min(prs2.length, b)));
+  const summary =
+    mode === "speech"
+      ? {
+          // Skip the first 12 frames (unstable, per unmute) for the speech max.
+          maxDuringSpeech: maxIn(12, SPEECH_END_FRAME),
+          firstFrameAbove0_6: firstAbove(SPEECH_END_FRAME - 2, 0.6),
+          framesFromSpeechEndTo0_6:
+            firstAbove(SPEECH_END_FRAME - 2, 0.6) - SPEECH_END_FRAME,
+          minAfterRise: Math.min(
+            ...prs2.slice(Math.max(SPEECH_END_FRAME + 8, 0)),
+          ),
+        }
+      : mode === "midpause"
+        ? {
+            // Fake pause spans frames 32..39; second speech 40..71; true end ~70.
+            maxAtFakePause: maxIn(30, 42),
+            maxDuringSecondSpeech: maxIn(46, 68),
+            maxAfterTrueEnd: maxIn(72, prs2.length),
+            firstAbove0_6AfterTrueEnd: firstAbove(70, 0.6),
+          }
+        : {
+            // Mid-clause pause spans frames 15..22; speech resumes 23..40;
+            // true end ~38 (= 30 - 15 + 23).
+            maxAtMidClausePause: maxIn(14, 25),
+            maxAfterTrueEnd: maxIn(40, prs2.length),
+            firstAbove0_6AfterTrueEnd: firstAbove(36, 0.6),
+          };
+  return { mode, frames: numFrames, summary, prs2, series, tokens };
 }

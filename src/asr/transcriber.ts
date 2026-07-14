@@ -27,6 +27,15 @@ export interface Transcriber {
    *  turn-end fast path — see duplex.endUserTurn). */
   bestText(): string;
   /**
+   * OPTIONAL semantic-VAD hook (Kyutai lane only): latest frame's model-
+   * predicted probability that the user is done talking, or null when
+   * unavailable (Whisper lane doesn't implement it; the Kyutai lane returns
+   * null until vad-capable weights are loaded and ≥2 frames of the current
+   * utterance have decoded). The duplex tick uses it — when the
+   * kyutaiVadEndpoint tunable is on — INSTEAD of the punct/silence timers.
+   */
+  pauseProb?(): number | null;
+  /**
    * Turn-end slow path: produce the best final transcript, doing extra model
    * work if needed (Whisper: one full-window pass; Kyutai: drain the frame
    * backlog + flush the trained-in 0.5 s text delay with synthetic silence).

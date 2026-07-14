@@ -134,6 +134,11 @@ export class KyutaiStreamingTranscriber implements Transcriber {
   private tokens: number[] = [];
   private committedText = "";
   private lastChangeAt = 0;
+  // Latest frame's semantic-VAD probabilities (see kyutai-stt.ts module
+  // comment) + how many REAL audio frames this utterance has decoded. null
+  // until vad-capable weights emitted a frame; reset() clears both.
+  private lastVadProbs: Float32Array | null = null;
+  private vadFrames = 0;
   // Set by finalize(): the utterance's decoder state has consumed synthetic
   // silence and MUST NOT eat more real frames; every endUserTurn path resets
   // shortly after finalize, this just closes the one-tick race window.
@@ -175,6 +180,20 @@ export class KyutaiStreamingTranscriber implements Transcriber {
     return this.committedText.trim();
   }
 
+  /**
+   * Latest frame's semantic-VAD "user is done talking" probability — prs[2],
+   * the 2 s-horizon head, the one unmute thresholds (see kyutai-stt.ts).
+   * null until (a) vad-capable weights have been loaded (older cached weight
+   * files lack the extra heads) AND (b) at least 2 real frames of THIS
+   * utterance have decoded — the first steps' predictions are unstable
+   * (unmute skips 12; the duplex minSpeechMs floor covers the rest), and a
+   * stale pre-reset value must never endpoint a fresh utterance.
+   */
+  pauseProb(): number | null {
+    if (!this.lastVadProbs || this.vadFrames < 2) return null;
+    return this.lastVadProbs[2];
+  }
+
   start(): void {
     if (this.active) return;
     this.active = true;
@@ -210,6 +229,8 @@ export class KyutaiStreamingTranscriber implements Transcriber {
     this.framesConsumed = 0;
     this.bosStepDone = false;
     this.finalized = false;
+    this.lastVadProbs = null;
+    this.vadFrames = 0;
     this.lastChangeAt = performance.now();
     void this.enqueue(async () => {
       this.disposeStates();
@@ -343,13 +364,17 @@ export class KyutaiStreamingTranscriber implements Transcriber {
     // A reset may have landed during the readback; the stale states get
     // rebuilt on the chain right after this link, so just drop the frame.
     if (gen !== this.generation) return;
-    const { tokenId, hidden } = await sttStep(
+    const { tokenId, hidden, vadProbs } = await sttStep(
       this.asr.stt,
       this.sttState!,
       ids as ArrayLike<number>,
     );
     hidden.dispose();
     if (gen !== this.generation) return;
+    if (vadProbs) {
+      this.lastVadProbs = vadProbs;
+      this.vadFrames++;
+    }
     this.ingestToken(tokenId);
   }
 

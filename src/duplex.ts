@@ -268,7 +268,7 @@ export class DuplexSession {
   // Bench instrumentation: stage marks for the turn currently being answered;
   // pushed to TURN_LOG when the response ends.
   private turnMarks: Partial<TurnRecord> = {};
-  private lastEndCause: "punct" | "silence" | "max" = "punct";
+  private lastEndCause: "punct" | "silence" | "max" | "vad" = "punct";
 
   private timers: PendingTimer[] = [];
 
@@ -514,14 +514,37 @@ export class DuplexSession {
     // signal), and the tentative tail that knows better lags the audio by more
     // than the punct window. The viable design is post-fire continuation-merge
     // (abort the reply if speech resumes before first audio); see BENCHMARKS.
-    const endByPunct =
-      endsTerminal && trailingSilence >= TUNABLES.endpointPunctMs;
-    const endBySilence = trailingSilence >= TUNABLES.endpointSilenceMs;
+    // 2a. Semantic-VAD endpoint (Kyutai lane only — see the kyutaiVadEndpoint
+    //     tunable). The model itself predicts P(user done talking) per 80 ms
+    //     frame from content and intonation; when that signal is available it
+    //     REPLACES the punct/silence timers entirely — no waiting for the
+    //     delayed text stream to deliver terminal punctuation, no fixed
+    //     silence window. Guards kept identical to the timer path: the
+    //     minSpeechMs floor here, the max-utterance cap, and the phantom-turn
+    //     guard + empty-transcript discard downstream in endUserTurn.
+    //     pauseProb() is non-null only after ≥2 decoded frames of THIS
+    //     utterance (and only with vad-capable weights), so a fresh utterance
+    //     can't endpoint on a stale probability.
+    const pauseProb = TUNABLES.kyutaiVadEndpoint
+      ? (this.transcriber.pauseProb?.() ?? null)
+      : null;
     const endByMax = speechMs >= MAX_UTTERANCE_MS;
-    if (speechMs >= TUNABLES.minSpeechMs && (endByPunct || endBySilence || endByMax)) {
-      this.lastEndCause = endByPunct ? "punct" : endBySilence ? "silence" : "max";
-      void this.endUserTurn(this.silenceStart || now);
-      return;
+    if (pauseProb !== null) {
+      const endByVad = pauseProb >= TUNABLES.kyutaiVadThreshold;
+      if (speechMs >= TUNABLES.minSpeechMs && (endByVad || endByMax)) {
+        this.lastEndCause = endByVad ? "vad" : "max";
+        void this.endUserTurn(this.silenceStart || now);
+        return;
+      }
+    } else {
+      const endByPunct =
+        endsTerminal && trailingSilence >= TUNABLES.endpointPunctMs;
+      const endBySilence = trailingSilence >= TUNABLES.endpointSilenceMs;
+      if (speechMs >= TUNABLES.minSpeechMs && (endByPunct || endBySilence || endByMax)) {
+        this.lastEndCause = endByPunct ? "punct" : endBySilence ? "silence" : "max";
+        void this.endUserTurn(this.silenceStart || now);
+        return;
+      }
     }
 
     // 3. Backchannel (mid-utterance pause; does not end the turn). Only when the

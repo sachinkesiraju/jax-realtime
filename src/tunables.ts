@@ -46,6 +46,31 @@ export const TUNABLES = {
    * shows the Kyutai lane winning; flip only after benching.
    */
   asrEngine: "whisper" as "whisper" | "kyutai",
+  /**
+   * Semantic-VAD endpointing for the Kyutai lane. Only active when
+   * asrEngine === "kyutai" AND the loaded weights carry the model's
+   * "extra heads" (pauseProb() non-null; older cached weight files lack
+   * them and the tick falls back to the punct/silence timers). stt-1b was
+   * trained to predict the probability the user is DONE TALKING alongside
+   * the text (kyutai.org/stt; heads reverse-engineered from Kyutai's Rust
+   * server — see src/asr/kyutai-stt.ts). When active, the endpoint decision
+   * REPLACES the punct/silence trailing-silence timers: the turn ends the
+   * moment the latest frame's pauseProb clears kyutaiVadThreshold (with the
+   * same minSpeechMs floor and the max-utterance cap). This attacks the
+   * live-bench verdict on the Kyutai lane (+254 ms vs Whisper): punct
+   * endpointing waits for text the delayed stream delivers ~0.5 s late,
+   * while the VAD head reads the AUDIO — its pause prediction adapts to
+   * content and intonation instead of a fixed silence window.
+   */
+  kyutaiVadEndpoint: true,
+  /**
+   * pauseProb threshold that ends the turn. 0.6 is the decision rule
+   * Kyutai's own consumer ships (unmute/unmute_handler.py determine_pause:
+   * `stt.pause_prediction.value > 0.6`, on the same prs[2] head this port
+   * exposes, smoothed by an EMA so fast — half-life 10 ms vs the 80 ms
+   * frame — that it is effectively the raw per-frame value we use).
+   */
+  kyutaiVadThreshold: 0.6,
   /** Minimum time between the starts of two streaming Whisper passes. */
   asrPassIntervalMs: 150,
   /** Max utterance window fed to Whisper, seconds. */
@@ -255,8 +280,9 @@ export type TurnRecord = {
   transcriptReady: number;
   /** Whether the fast bestText path was used (vs a full finalize pass). */
   usedBestText: boolean;
-  /** Which endpoint rule fired the turn (campaign-1 diagnosis). */
-  endCause?: "punct" | "silence" | "max";
+  /** Which endpoint rule fired the turn (campaign-1 diagnosis). "vad" =
+   *  the Kyutai semantic-VAD head (kyutaiVadEndpoint). */
+  endCause?: "punct" | "silence" | "max" | "vad";
   /** First LLM text delta arrived. */
   firstDelta: number;
   /** First sentence/clause handed to TTS. */
