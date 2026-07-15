@@ -86,6 +86,29 @@ export class VoiceCapture {
     this.totalSamples = 0;
   }
 
+  /**
+   * Drop all but the most recent `ms` of buffered PCM (barge-in buffer
+   * hygiene — see TUNABLES.bargePreRollMs). Implemented on the same
+   * oldest-chunks-first discipline as the rolling `maxSamples` cap above, so
+   * the samples()/durationSeconds() contract is untouched: the buffer is
+   * still a contiguous most-recent tail of the capture, just a shorter one.
+   * Chunk-granular on purpose: worklet blocks are 128 samples (8 ms at
+   * 16 kHz), so the kept tail can exceed `ms` by at most one block — we KEEP
+   * the extra rather than slicing a chunk, because trimming must never risk
+   * cutting into the audio the caller wants (the user's barge words).
+   * level() is untouched (recentLevel is a separate smoothed meter, not
+   * derived from the buffer).
+   */
+  trimToLast(ms: number): void {
+    const keep = Math.max(0, Math.round((ms / 1000) * SAMPLE_RATE));
+    while (
+      this.chunks.length > 0 &&
+      this.totalSamples - this.chunks[0].length >= keep
+    ) {
+      this.totalSamples -= this.chunks.shift()!.length;
+    }
+  }
+
   /** Copy of all PCM captured since the last clear(), at 16 kHz mono. */
   samples(): Float32Array {
     const out = new Float32Array(this.totalSamples);

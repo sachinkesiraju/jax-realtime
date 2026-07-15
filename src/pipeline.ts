@@ -1121,6 +1121,12 @@ export type SpeakOptions = {
    *  filler is audible speech the mic may pick up, even though it is never
    *  part of the reply text/history). */
   onOnset?: (text: string) => void;
+  /** Fired the instant the first SYNTHESIZED chunk is scheduled (the onset
+   *  filler never triggers this — it has its own onOnset). speakStream only:
+   *  the duplex layer uses it to close the continuation-merge window in real
+   *  time on replies that play no onset filler; the SpeakStats.firstAudioMs
+   *  value only arrives after the whole stream finishes, far too late. */
+  onFirstAudio?: () => void;
 };
 
 const TTS_SAMPLE_RATE = 24_000; // Mimi codec output rate.
@@ -1287,7 +1293,7 @@ export class SpeechSynthesizer {
   async speakStream(
     voice: TTSVoice,
     sentences: AsyncIterable<string>,
-    { signal, onAnalyser, onOnset }: SpeakOptions = {},
+    { signal, onAnalyser, onOnset, onFirstAudio }: SpeakOptions = {},
   ): Promise<SpeakStats> {
     const startTime = performance.now();
     let firstAudioMs = 0;
@@ -1295,7 +1301,10 @@ export class SpeechSynthesizer {
     const inner = createStreamingPlayer();
     onAnalyser?.(inner.analyser);
     const player = withFirstAudio(inner, () => {
-      if (firstAudioMs === 0) firstAudioMs = performance.now() - startTime;
+      if (firstAudioMs === 0) {
+        firstAudioMs = performance.now() - startTime;
+        onFirstAudio?.();
+      }
     });
 
     // Barge-in can fire while we're between sentences (awaiting the next LLM

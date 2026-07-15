@@ -122,6 +122,14 @@ const BARGE_FLOOR_CALIB_TICKS = 3; // ~450 ms to estimate the echo floor
 const BARGE_ENERGY_RATIO = 1.8; // user must clear the echo floor by this much
 const BARGE_ENERGY_MIN = 0.05; // absolute floor (level units, min·4 RMS)
 const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
+// Post-fire continuation-merge (TUNABLES.continuationMerge): sustained ticks
+// above START_LEVEL, inside the merge window, that count as "the user's
+// speech resumed". Same shape as the listening-phase onset detector: one tick
+// is a blip (a chair creak, a breath), two consecutive ticks (~300 ms) is
+// speech. Deliberately NOT the energy-barge threshold — the merge window is
+// silent (no reply audio yet), so there is no echo floor to clear and
+// START_LEVEL is the right gate, exactly as in the listening phase.
+const MERGE_RESUME_TICKS = 2;
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
 // Backchannel pause window. It sits BELOW the earliest endpoint threshold
 // (endpointPunctMs = 380 ms) on purpose: the endpoint checks run first in the
@@ -199,6 +207,16 @@ type AssistantState = {
   controller: AbortController;
   fullText: string; // everything the LLM has produced so far
   spoken: string; // sentences actually handed to TTS
+  // Continuation-merge (TUNABLES.continuationMerge) bookkeeping:
+  /** While the merge window is open this reply is PROVISIONAL — the assistant
+   *  bubble (onAssistantStart/Partial) is held back so a merged-away reply
+   *  leaves zero UI trace. Cleared (and the bubble revealed) when the window
+   *  closes at first audible audio. */
+  uiDeferred: boolean;
+  /** Set by handleContinuationMerge before aborting: tells respond()'s
+   *  teardown that this reply was rescinded — no history entry, no bubble,
+   *  no TURN_LOG record. The turn never happened. */
+  merged: boolean;
 };
 
 type PendingTimer = {
@@ -238,6 +256,30 @@ export class DuplexSession {
   // A barge-in continuation skips the phantom-turn guard (its sustained energy
   // already proved itself to the barge detector).
   private bargeContinuation = false;
+
+  // Post-fire continuation-merge (TUNABLES.continuationMerge) state.
+  // Window = [turn fired & respond() dispatched, first AUDIBLE reply chunk).
+  // While it is open, the fired turn's undoable side effects are deferred
+  // (pendingTurn below) and sustained mic energy rescinds the reply instead
+  // of barging in — there is nothing audible to barge in ON yet.
+  private mergeWindowOpen = false;
+  private mergeResumeTicks = 0; // consecutive loud ticks inside the window
+  // The fired turn's deferred side effects. `msg` is the history entry that
+  // COULD NOT be deferred (the LLM prompt is built from history at
+  // generateStream() time, so it must be in place before the reply starts) —
+  // it is the one thing a merge has to UNDO (splice back out). Everything
+  // else — the user bubble (onUserTurn), the timer parse, capture.clear() /
+  // transcriber.reset() / resetUtterance() — is DEFERRED to window close
+  // instead, because deferral is strictly simpler than undo: there is no
+  // "remove bubble" callback surface to invent, no un-schedule-timer path,
+  // and the capture/ASR state must stay alive anyway for the utterance to be
+  // append-able. Cost of deferral: on a normal (unmerged) turn the user
+  // bubble/timer land ~0.5–1.2 s later, at first audible audio — invisible
+  // next to the reply latency it rides on.
+  private pendingTurn: { text: string; msg: ChatMessage } | null = null;
+  // Merges absorbed by the utterance currently in progress; the eventual
+  // completed turn logs `merged: true` in its TurnRecord and resets this.
+  private pendingMerges = 0;
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -409,7 +451,29 @@ export class DuplexSession {
     //    fire when the level clears that floor by a ratio. The ASR path can't
     //    help here — it's paused during assistant speech to free the GPU.
     if (this.phase === "responding" && this.assistant) {
-      if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
+      // 1a. Continuation-merge check FIRST (cycle-5 law: in a lagging cascade
+      //     ASR there is NO reliable pre-fire continuation signal, so patience
+      //     is bought post-fire). While the merge window is open the reply has
+      //     produced NO audible audio yet, so sustained mic energy can only be
+      //     the user resuming the utterance — there is nothing to barge in on.
+      //     Same onset detector as the listening phase (level > START_LEVEL,
+      //     sustained), on a dedicated counter so a stale aboveTicks streak
+      //     from before the endpoint can never trip it.
+      if (this.mergeWindowOpen) {
+        if (level > START_LEVEL) this.mergeResumeTicks++;
+        else this.mergeResumeTicks = 0;
+        if (this.mergeResumeTicks >= MERGE_RESUME_TICKS) {
+          this.handleContinuationMerge();
+          return;
+        }
+        // Barge-in echo-floor calibration is DEFERRED while the window is
+        // open: the floor must measure the reply's playback echo, and nothing
+        // is audible yet — calibrating on window silence would bake in a
+        // too-low floor. bargeFloorTicks starts counting the tick after the
+        // window closes, i.e. from the first audible audio, which is exactly
+        // when the echo exists. (With continuationMerge off the window never
+        // opens and calibration starts at respond() dispatch, as shipped.)
+      } else if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
         // Calibration window: the loudest thing the mic hears now is our own
         // echo, so take the max as the floor to beat.
         this.bargeFloor = Math.max(this.bargeFloor, level);
@@ -616,7 +680,6 @@ export class DuplexSession {
     }
 
     this.cb.onMetric({ asrLagMs });
-    this.cb.onUserTurn(text);
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
     // questions (count, colour, "what do you see") are answered directly from
@@ -624,9 +687,13 @@ export class DuplexSession {
     // interpretive visual questions ("what am I doing", "does my room look
     // tidy") are handed to the LLM with the measured scene as grounding, so the
     // model reasons rather than us templating a reply.
+    // (No continuation-merge on this path: the answer is proactive speech, not
+    // a respond() reply, so there is no pre-audio window to watch — shipped
+    // immediate bookkeeping kept.)
     if (this.vision?.active && this.vision.matchesQuestion(text)) {
       const reply = this.vision.answer(text);
       this.cb.onEvent("eye · answering from the camera");
+      this.cb.onUserTurn(text);
       this.history.push({ role: "user", content: text, t: this.elapsed() });
       this.capture.clear();
       transcriber.reset();
@@ -642,14 +709,12 @@ export class DuplexSession {
       content = facts ? `[scene: ${facts}] ${text}` : text;
       this.cb.onEvent("eye · grounding from the camera");
     }
-    this.history.push({ role: "user", content, t: this.elapsed() });
-    this.maybeScheduleTimer(text);
-
-    // Fresh audio window for the response phase: barge-in detection must see
-    // only NEW committed words (spoken over the reply), not this turn's.
-    this.capture.clear();
-    transcriber.reset();
-    this.resetUtterance();
+    // The history push happens NOW even when continuation-merge will defer the
+    // rest: respond() builds the LLM prompt from history, so the user message
+    // must be in place before the reply starts. A merge undoes exactly this
+    // one push (see handleContinuationMerge).
+    const userMsg: ChatMessage = { role: "user", content, t: this.elapsed() };
+    this.history.push(userMsg);
 
     // Two-tier path: a tool intent runs as a background task while the fast
     // model stays present. Only one background task at a time; if one is
@@ -669,8 +734,48 @@ export class DuplexSession {
       tool = null;
     }
     if (tool) {
+      // Tool turns keep the shipped immediate bookkeeping (no merge window):
+      // the holding line is proactive speech via startToolTask, not a
+      // respond() reply, so there is no abortable pre-audio pipeline to
+      // rescind — a resume during the holding line is just the user talking,
+      // handled by the ordinary listening phase.
+      this.cb.onUserTurn(text);
+      this.maybeScheduleTimer(text);
+      this.capture.clear();
+      transcriber.reset();
+      this.resetUtterance();
       this.startToolTask(tool);
       return;
+    }
+
+    if (TUNABLES.continuationMerge && this.lastEndCause !== "max") {
+      // POST-FIRE CONTINUATION-MERGE window opens. Defer every side effect a
+      // merge would otherwise need to undo (see the pendingTurn field comment
+      // for the defer-vs-undo reasoning). Crucially capture.clear() /
+      // transcriber.reset() are deferred too: the whisper streaming lane
+      // happily keeps transcribing the still-growing buffer, so if the user
+      // resumes we re-open the SAME utterance — audio and committed text
+      // intact — instead of re-seeding anything. The response-phase contract
+      // those calls used to serve ("barge-in ASR must see only NEW words")
+      // is re-established at window close, which is exactly when barge-in
+      // becomes possible (the reply is audible from then on).
+      //
+      // "max"-fired turns are EXEMPT: at a max fire the user is typically
+      // still talking (the cap cut them off deliberately, to bound utterance
+      // growth), so the resume detector would trip instantly and re-open the
+      // just-capped utterance in an endless fire→merge→fire loop. The cap
+      // must stay a hard stop.
+      this.pendingTurn = { text, msg: userMsg };
+      this.mergeWindowOpen = true;
+      this.mergeResumeTicks = 0;
+    } else {
+      this.cb.onUserTurn(text);
+      this.maybeScheduleTimer(text);
+      // Fresh audio window for the response phase: barge-in detection must see
+      // only NEW committed words (spoken over the reply), not this turn's.
+      this.capture.clear();
+      transcriber.reset();
+      this.resetUtterance();
     }
 
     this.respondPromise = this.respond(endOfSpeechAt);
@@ -712,6 +817,11 @@ export class DuplexSession {
       controller,
       fullText: "",
       spoken: "",
+      // Merge window open ⇒ this reply is provisional: hold the assistant
+      // bubble back so a merged-away reply leaves no UI trace ("the turn
+      // never happened"). Revealed by closeMergeWindow() at first audio.
+      uiDeferred: this.mergeWindowOpen,
+      merged: false,
     };
     this.assistant = state;
     this.currentTtsText = "";
@@ -720,7 +830,7 @@ export class DuplexSession {
     this.bargeFloor = 0;
     this.bargeFloorTicks = 0;
     this.aboveBargeTicks = 0;
-    this.cb.onAssistantStart();
+    if (!state.uiDeferred) this.cb.onAssistantStart();
     this.cb.onStageActivity("llm", true);
 
     let firstAudioAt = 0;
@@ -747,7 +857,25 @@ export class DuplexSession {
           onOnset: (text) => {
             this.onsetPrefix = text;
             this.currentTtsText = text;
+            // MERGE WINDOW CLOSES AT THE ONSET, not at first synth audio.
+            // The spec's window is "before the reply speaks" — and the onset
+            // IS the reply speaking: real sound from the speakers (~0.5 s
+            // in), so a resume after the user heard "So," is the user
+            // talking OVER the assistant, i.e. a normal barge-in. Yes, that
+            // makes the window short (~0.5 s) on onset-filler turns — that's
+            // the honest reading of the spec; the alternative (merging after
+            // an audible "So,") would rescind a reply the user already
+            // responded to. The cycle-3 one-stream/one-clock law guarantees
+            // onset ≤ first synth audio, so closing here is always the
+            // earlier of the two. currentTtsText is set above BEFORE closing
+            // so the echo filter is armed the instant closeMergeWindow's
+            // transcriber.reset() opens the fresh window.
+            this.closeMergeWindow();
           },
+          // No-onset replies (onsetFiller off / no cached voice): the window
+          // closes at the first synthesized chunk instead — the first moment
+          // the reply is audible.
+          onFirstAudio: () => this.closeMergeWindow(),
         },
       );
       if (stats.firstAudioMs > 0) firstAudioAt = speakStart + stats.firstAudioMs;
@@ -762,6 +890,29 @@ export class DuplexSession {
     }
 
     const interrupted = controller.signal.aborted;
+
+    if (state.merged) {
+      // CONTINUATION MERGE: this reply was rescinded before it ever became
+      // audible — the turn NEVER HAPPENED. So, unlike a barge-in abort:
+      // - no assistant history entry and no interrupted bubble (the bubble
+      //   was never shown: uiDeferred held it back for the whole window);
+      // - no TURN_LOG record (turnMarks dropped) — the eventual turn over
+      //   the full merged utterance logs instead, with merged: true;
+      // - no startFreshListening — handleContinuationMerge already put the
+      //   engine back in listening with the utterance still open (capture
+      //   buffer and streaming-ASR commit state intact, speechStartAt
+      //   continuing), so clearing anything here would destroy the merge.
+      this.turnMarks = {};
+      if (this.assistant === state) this.assistant = null;
+      return;
+    }
+
+    // A reply that died with the merge window still open (stop()/watchdog
+    // abort or a TTS/LLM failure before any audio) still owes the deferred
+    // user-turn side effects — flush them so the history entry that already
+    // exists isn't invisible in the UI. No-op when the window closed normally.
+    this.closeMergeWindow();
+
     const finalText = interrupted
       ? `${state.spoken.trim()} [interrupted]`.trim()
       : state.fullText.trim();
@@ -792,7 +943,13 @@ export class DuplexSession {
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
         interrupted,
+        // Absent (not false) when no merge happened, mirroring onsetAudio's
+        // convention — the bench counts turns with merged === true.
+        merged: this.pendingMerges > 0 ? true : undefined,
       });
+      // The merges are consumed by the turn that finally completed over the
+      // whole utterance; a fresh utterance starts its count at zero.
+      this.pendingMerges = 0;
       // Bounded ring: the bench only ever inspects recent turns, and a long
       // live session would otherwise grow this array (and its retained
       // transcript/reply strings) without limit.
@@ -839,7 +996,11 @@ export class DuplexSession {
       if (!this.turnMarks.firstDelta) this.turnMarks.firstDelta = performance.now();
       buffer += delta;
       state.fullText += delta;
-      this.cb.onAssistantPartial(state.fullText);
+      // While the merge window is open the reply is provisional — deltas
+      // accumulate in state.fullText but stay off-screen so a merged-away
+      // reply leaves no trace; closeMergeWindow() replays the accumulated
+      // text when the window closes.
+      if (!state.uiDeferred) this.cb.onAssistantPartial(state.fullText);
 
       // Fastest first audio: flush the first clause as soon as a comma/colon/
       // semicolon appears (once there's enough to sound natural), so speech
@@ -901,6 +1062,92 @@ export class DuplexSession {
     return sentence;
   }
 
+  // --- Continuation merge (TUNABLES.continuationMerge) --------------------
+
+  /**
+   * Close the merge window and flush the fired turn's deferred side effects.
+   * Called (a) from respond()'s speakStream callbacks at the first AUDIBLE
+   * chunk — the onset filler when one plays, else the first synthesized chunk
+   * (from then on resumed speech is a normal barge-in), and (b) from
+   * respond()'s teardown as a safety flush for replies that die before any
+   * audio. Idempotent: no-op once the window is closed (or was never opened,
+   * e.g. continuationMerge off).
+   */
+  private closeMergeWindow(): void {
+    if (!this.mergeWindowOpen) return;
+    this.mergeWindowOpen = false;
+    this.mergeResumeTicks = 0;
+
+    // Deferred user-turn side effects: the turn is now definitive (the reply
+    // is audible), so show the user bubble and parse the timer intent.
+    const pending = this.pendingTurn;
+    this.pendingTurn = null;
+    if (pending) {
+      this.cb.onUserTurn(pending.text);
+      this.maybeScheduleTimer(pending.text);
+    }
+
+    // Deferred fresh-audio window (see endUserTurn): from here on, committed
+    // ASR words must be NEW speech only — the response-phase contract that
+    // barge-in relies on. Doing this at window close instead of at fire is
+    // what made the utterance merge-able (the buffer stayed alive).
+    this.capture.clear();
+    this.transcriber?.reset();
+    this.resetUtterance();
+
+    // Reveal the deferred assistant bubble with everything the LLM has
+    // produced so far; subsequent deltas stream into it normally.
+    const state = this.assistant;
+    if (state?.uiDeferred) {
+      state.uiDeferred = false;
+      this.cb.onAssistantStart();
+      if (state.fullText) this.cb.onAssistantPartial(state.fullText);
+    }
+  }
+
+  /**
+   * The user's speech resumed inside the merge window: rescind the in-flight
+   * reply and re-open the utterance so it APPENDS (never restarts). Abort
+   * mechanics are exactly barge-in's (controller.abort); the bookkeeping is
+   * deliberately different — see respond()'s state.merged teardown branch.
+   */
+  private handleContinuationMerge(): void {
+    this.mergeWindowOpen = false;
+    this.mergeResumeTicks = 0;
+    this.pendingMerges++;
+
+    // Undo the one side effect that couldn't be deferred: the user-turn
+    // history push (the LLM prompt needed it). Splice by identity — a
+    // proactive line or tool result could in principle have appended entries
+    // after it, so "pop the last entry" would be wrong.
+    const pending = this.pendingTurn;
+    this.pendingTurn = null;
+    if (pending) {
+      const idx = this.history.lastIndexOf(pending.msg);
+      if (idx !== -1) this.history.splice(idx, 1);
+    }
+
+    // Abort exactly like barge-in; state.merged tells respond()'s teardown
+    // to suppress history/UI/TURN_LOG (the turn never happened).
+    const state = this.assistant;
+    if (state) {
+      state.merged = true;
+      state.controller.abort();
+    }
+    this.cb.onEvent("continuation · merged");
+
+    // Re-open the utterance. speechStartAt was never reset (resetUtterance
+    // was deferred), so it CONTINUES from the original onset — endpointing,
+    // the backchannel gate and the MAX_UTTERANCE_MS cap all measure the whole
+    // merged utterance, and the capture buffer + streaming-ASR commit state
+    // are untouched, so the eventual transcript covers all of it. Only the
+    // trailing-silence clock resets: the resume that got us here is speech.
+    this.phase = "listening";
+    this.respondingSince = 0;
+    this.silenceStart = 0;
+    this.aboveBargeTicks = 0;
+  }
+
   // --- Barge-in ----------------------------------------------------------
 
   private handleBargeIn(now: number): void {
@@ -910,6 +1157,24 @@ export class DuplexSession {
     // The interrupting speech is already being captured & transcribed (echo
     // cancellation keeps our own playback out of the buffer), so treat it as a
     // fresh user utterance already in progress — don't clear it.
+    // BUFFER HYGIENE (TUNABLES.bargePreRollMs, 0 = off): "don't clear" must
+    // not mean "keep everything". The buffer at this moment spans the whole
+    // reply period — imperfectly-cancelled reply echo plus ambient noise that
+    // PRECEDE the user's barge words — and the first post-barge ASR passes
+    // run after respond()'s teardown nulls currentTtsText, so the ≥70%
+    // echo filter is disarmed and the stale audio transcribes as user speech.
+    // Keep only the last ~1.2 s of PCM (the energy detector needed ~2 loud
+    // ticks ≈ 300 ms to fire, so the pre-roll comfortably covers the user's
+    // first words) and reset the streaming lane's commit state so any text
+    // committed from reply-period audio — or an in-flight pass over the
+    // untrimmed window (generation-checked and discarded by reset) — can't
+    // leak into this turn's transcript. Echo filtering of whatever reply
+    // audio remains inside the pre-roll is unchanged (filterEcho still runs
+    // while the assistant is audible).
+    if (TUNABLES.bargePreRollMs > 0) {
+      this.capture.trimToLast(TUNABLES.bargePreRollMs);
+      this.transcriber?.reset();
+    }
     this.phase = "listening";
     this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
     this.silenceStart = 0;
@@ -1109,6 +1374,10 @@ export class DuplexSession {
     this.capture.clear();
     this.transcriber?.reset();
     this.resetUtterance();
+    // A merged-into utterance that ends up discarded here (phantom guard,
+    // empty/degenerate transcript) takes its absorbed merges with it — they
+    // must not tag some later, unrelated turn as merged.
+    this.pendingMerges = 0;
     this.cb.onCaptions("", "");
   }
 }

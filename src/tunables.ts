@@ -7,6 +7,38 @@ export const TUNABLES = {
   // region: engine
   /** Micro-turn policy tick. Read at session start. */
   tickMs: 150,
+  /**
+   * POST-FIRE CONTINUATION-MERGE (cycle 10; the cycle-5 spec finally built).
+   * The cycle-5 patience campaign proved (0-for-5) that a mid-thought pause
+   * CANNOT be ridden out before the endpoint fires: at a mid-clause pause the
+   * committed text ends at the last complete sentence (a false "finished"
+   * signal) and the tentative tail that knows better lags the audio by more
+   * than the punct window — in a lagging cascade ASR there is NO reliable
+   * pre-fire continuation signal, and widening the windows taxes every turn
+   * (the forbidden cycle-1/3 trade). So patience is bought AFTER the fire
+   * instead: the turn fires normally, and if the user's speech resumes during
+   * the ~0.5–1.2 s before the reply becomes AUDIBLE (single-GPU law: that gap
+   * exists on every turn and we cannot shrink it — so use it), the in-flight
+   * reply is silently rescinded and the utterance re-opens and APPENDS
+   * (capture buffer + streaming-ASR lane are never cleared, so the eventual
+   * transcript covers the whole utterance). The merge window closes at the
+   * first audible chunk — the onset filler when one plays, else the first
+   * synthesized chunk — because once the assistant is audible, resumed speech
+   * is the user talking OVER it, i.e. a normal barge-in (unchanged).
+   */
+  continuationMerge: true,
+  /**
+   * Barge-in capture-buffer hygiene: on barge-in, trim the capture buffer to
+   * the last N ms of PCM. 0 = old behavior (keep everything). WHY: at barge
+   * time the buffer spans the entire reply period, so imperfectly-cancelled
+   * reply echo + ambient noise PRECEDE the user's barge words and pollute the
+   * next turn's transcript (the ≥70%-overlap echo filter helps but is only
+   * armed while the assistant is audible — the post-barge ASR passes run
+   * after teardown, unfiltered). The barge onset detector needed ~2 loud
+   * ticks ≈ 300 ms to fire, so 1200 ms of pre-roll comfortably covers the
+   * user's first words plus margin while discarding the reply-period audio.
+   */
+  bargePreRollMs: 1200,
 
   // region: endpoint
   /** Silence to end a turn whose committed text ends in . ! ? */
@@ -99,8 +131,14 @@ export const TUNABLES = {
    *
    * Numerically the fused path runs the identical math in the identical order
    * (the inline helpers are verbatim copies of the jitted originals with the
-   * inner jit calls inlined to avoid nested-jit boundaries); the flow-LM prefill
-   * (step 0) still uses the unfused path (fuse-decode-only, like the LLM). A/B with `window.__pipeline().tts.benchSynth(sentence, {fused})`.
+   * inner jit calls inlined to avoid nested-jit boundaries). Since cycle 10 the
+   * flag covers BOTH the step-0 prefill (`runFlowLMPrefillFused` — one jit
+   * whose trace keys on the sentence length, so a NEW length costs 1 compile
+   * instead of ~7 layer re-traces) AND the steady-state decode; one flag
+   * because both fusions share the same verbatim-inline construction and the
+   * same equivalence gate (benchPrefillFusedEquivalence in tts/inference.ts),
+   * and a decoupled prefill would just add an untested 4th config. A/B with
+   * `window.__pipeline().tts.benchSynth(sentence, {fused})`.
    * Shipped on: bench (fixed seed) showed 1291→1010 ms gen (~22%), realtime
    * factor 0.40→0.31, with identical frame count both paths (same EOS decision,
    * same audio duration) — equivalent output, fewer dispatches.
@@ -112,6 +150,8 @@ export const TUNABLES = {
   // and the turn bench's tts stage regressed 115 -> 221 ms median. The step-0
   // re-trace variance it targeted is real (benchTtsPrefill shows it); the
   // open lever is fusing the step-0 prefill, not padding it.
+  // (cycle 10): that lever is now built — the step-0 prefill fuses under
+  // ttsFusedStep above; see runFlowLMPrefillFused in tts/pocket-tts.ts.
 
   // region: tts-onset
   /**
@@ -244,6 +284,12 @@ export type TurnRecord = {
   transcript: string;
   reply: string;
   interrupted: boolean;
+  /** True when this turn absorbed ≥1 post-fire continuation-merge (an earlier
+   *  endpoint fired on the same utterance, the reply was rescinded before it
+   *  became audible, and the utterance re-opened — see
+   *  TUNABLES.continuationMerge). Absent = no merge. The bench counts merges
+   *  from this so a midpause clip can assert "one merged turn, not two". */
+  merged?: boolean;
 };
 
 /** Rolling log of completed turns, for the bench (exposed on window in DEV). */
