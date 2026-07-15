@@ -1147,17 +1147,24 @@ type FlowLMDecodeModel = Pick<
   "inputLinear" | "transformer" | "outNorm" | "outEos" | "flowNet"
 >;
 
-// The fused flow-LM decode step as plain tracer ops (no jit boundary), shared
-// by the jit wrapper below. Mirrors runFlowLMStep exactly for the decode case
-// (T=1, no conditioning embeds): input projection → transformer stack (KV
-// scatter in-trace) → out-norm → EOS logit → LSD flow decode. `offset` and
-// `kvCacheLen` are np.Array scalars (reused per layer → `.ref` per use, dispose
-// after the loop); `noise` is precomputed by the caller so the RNG draw is
-// byte-identical to the unfused path.
-function flowLMDecodeStepBody(
+// The fused flow-LM step as plain tracer ops (no jit boundary), shared by the
+// two jit wrappers below. Mirrors runFlowLMStep exactly for both cases:
+//   - decode (T=1, `embeds` null): input projection → transformer stack (KV
+//     scatter in-trace) → out-norm → EOS logit → LSD flow decode;
+//   - step-0 prefill (`embeds` = [T_cond, dim] voice+text conditioning):
+//     identical except the conditioning is concatenated ahead of the projected
+//     BOS latent, and the empty input KV caches route each layer's attention
+//     through its isPrefill branch (resolved at trace time from the cache
+//     shape, the same mechanism runMimiDecodeStepFused relies on for its
+//     first frame), which EMITS the caches for step 1 as {key: k, value: v}.
+// `offset` and `kvCacheLen` are np.Array scalars (reused per layer → `.ref`
+// per use, dispose after the loop); `noise` is precomputed by the caller so
+// the RNG draw is byte-identical to the unfused path.
+function flowLMStepBody(
   { inputLinear, transformer, outNorm, outEos, flowNet }: FlowLMDecodeModel,
   kvCaches: KVCache[],
   sequence: np.Array,
+  embeds: np.Array | null,
   offset: np.Array,
   kvCacheLen: np.Array,
   noise: np.Array,
@@ -1165,6 +1172,8 @@ function flowLMDecodeStepBody(
   lsdDecodeSteps: number,
 ): [np.Array, np.Array, KVCache[]] {
   let input = runLinear(inputLinear, sequence);
+
+  if (embeds !== null) input = np.concatenate([embeds, input], 0);
 
   for (let i = 0; i < transformer.length; i++) {
     [input, kvCaches[i]] = streamingTransformerLayerInline(
@@ -1204,10 +1213,11 @@ const runFlowLMDecodeFused = jit(
     eosThreshold: number,
     lsdDecodeSteps: number,
   ): [np.Array, np.Array, KVCache[]] {
-    return flowLMDecodeStepBody(
+    return flowLMStepBody(
       model,
       kvCaches,
       sequence,
+      null,
       offset,
       kvCacheLen,
       noise,
@@ -1218,11 +1228,45 @@ const runFlowLMDecodeFused = jit(
   { staticArgnums: [6, 7] },
 );
 
+// Step-0 prefill variant: same shared body, plus the conditioning `embeds` as
+// a trace input. A separate jit from runFlowLMDecodeFused because the pytree
+// structure differs (embeds present) — the two never share a cache entry
+// anyway (different sequence lengths). The trace keys on the conditioning
+// length [voiceLen + textLen, dim], so a NEW sentence length re-traces —
+// exactly as the unfused path's length-keyed jits do; a warm length costs one
+// dispatch instead of ~8 jits + ~10 eager ops.
+const runFlowLMPrefillFusedJit = jit(
+  function runFlowLMPrefillFusedJit(
+    model: FlowLMDecodeModel,
+    kvCaches: KVCache[],
+    sequence: np.Array,
+    embeds: np.Array,
+    offset: np.Array,
+    kvCacheLen: np.Array,
+    noise: np.Array,
+    eosThreshold: number,
+    lsdDecodeSteps: number,
+  ): [np.Array, np.Array, KVCache[]] {
+    return flowLMStepBody(
+      model,
+      kvCaches,
+      sequence,
+      embeds,
+      offset,
+      kvCacheLen,
+      noise,
+      eosThreshold,
+      lsdDecodeSteps,
+    );
+  },
+  { staticArgnums: [7, 8] },
+);
+
 /**
  * Fused-dispatch counterpart to `runFlowLMStep` for the steady-state decode
- * frame (T=1, no conditioning embeds — the flow-LM prefill on step 0 keeps the
- * unfused path, the same fuse-decode-only split as the LLM). Same signature minus
- * `embeds` and identical side effects (advances the KV caches / kvCacheLen,
+ * frame (T=1, no conditioning embeds — the step-0 prefill has its own fused
+ * counterpart, `runFlowLMPrefillFused` below). Same signature minus `embeds`
+ * and identical side effects (advances the KV caches / kvCacheLen,
  * returns `{ latent, isEos, state }`), so playTTS swaps it in behind
  * TUNABLES.ttsFusedStep. Noise is drawn here exactly as runFlowLMStep does, so
  * for a fixed seed the draw is byte-identical.
@@ -1299,6 +1343,100 @@ export function runFlowLMStepFused(
     latent,
     isEos,
     state: { kvCaches: newCaches, kvCacheLen: kvCacheLen + 1 },
+  };
+}
+
+/**
+ * Fused-dispatch counterpart to `runFlowLMStep` for the STEP-0 PREFILL: the
+ * conditioning embeds (voice + text) concatenated ahead of the projected BOS
+ * latent, run through the 6 streaming-transformer layers (empty KV caches →
+ * each layer's isPrefill branch, which emits the step-1 caches), out-norm,
+ * EOS head, and LSD/flow decode — all in ONE jitted dispatch. What step 0
+ * does that decode doesn't: the concat, the T = voiceLen+textLen+1 sequence,
+ * and the cache CREATION (full causal attention, no KV scatter). What it
+ * doesn't do: the KV capacity-growth pad (kvCacheLen is 0, so runFlowLMStep's
+ * growth loop is a no-op — step 1 pads the emitted [T, H, D] caches to the
+ * next multiple of 64, identically on both paths). Same signature as
+ * runFlowLMStep (embeds required, non-null) and identical side effects, so
+ * playTTS swaps it in for step 0 behind TUNABLES.ttsFusedPrefill. Noise is
+ * drawn exactly as runFlowLMStep draws it, so for a fixed seed the RNG stream
+ * is byte-identical.
+ *
+ * Built as the cycle-7 open lever against the ~90–380 ms step-0 re-trace
+ * variance (bucket-padding the text was tried and REJECTED first). Measured
+ * verdict (cycle 10, benchPrefillFusedEquivalence): output-equivalent but NOT
+ * faster — the unfused path's 6 layer calls share one jit cache entry
+ * (identical avals), and the cold cost at a new length is dominated by
+ * per-shape GPU kernel/pipeline creation shared by both paths, so this fused
+ * trace's own bigger compile (~+90–160 ms) exceeds the unfused residual
+ * (~+15–50 ms) while warm is parity. Default-off; see TUNABLES.ttsFusedPrefill.
+ */
+export function runFlowLMPrefillFused(
+  {
+    bosEmb,
+    conditionerEmbed,
+    embMean,
+    embStd,
+    flowNet,
+    inputLinear,
+    outNorm,
+    outEos,
+    speakerProjWeight,
+    transformer,
+  }: FlowLMModel,
+  { kvCaches, kvCacheLen }: FlowLMState,
+  key: np.Array,
+  sequence: np.Array, // [S, ldim] - BOS latent (S=1 in practice)
+  embeds: np.Array, // [T_cond, dim] - conditioning, voice and text
+  offset: number,
+  lsdDecodeSteps: number = 1,
+  temperature: number = 0.7,
+  noiseClamp: number | null = null,
+  eosThreshold: number = -4.0,
+): { latent: np.Array; isEos: np.Array; state: FlowLMState } {
+  // Unused fields (match runFlowLMStep). ldim comes off bosEmb before dispose.
+  conditionerEmbed.dispose();
+  embMean.dispose();
+  embStd.dispose();
+  speakerProjWeight.dispose();
+  const ldim = bosEmb.shape[0];
+  bosEmb.dispose();
+
+  // No KV capacity-growth loop here: at prefill kvCacheLen is 0 and the input
+  // caches are empty (runFlowLMStep's growth loop no-ops on kvCacheLen > 0).
+  // The unfused path advances kvCacheLen by input.shape[0]; grab the shapes
+  // before the jit consumes the arrays.
+  const seqLen = embeds.shape[0] + sequence.shape[0];
+
+  // Noise drawn exactly as runFlowLMStep, then handed to the trace as an input.
+  const std = Math.sqrt(temperature);
+  let noise = random.normal(key, [1, ldim]).mul(std);
+  if (noiseClamp !== null) {
+    noise = np.clip(noise, -noiseClamp, noiseClamp);
+  }
+
+  const offsetArr = np.array(offset, { dtype: np.int32 });
+  const kvCacheLenArr = np.array(kvCacheLen, { dtype: np.int32 });
+
+  let latent: np.Array;
+  let isEos: np.Array;
+  let newCaches: KVCache[];
+  [latent, isEos, newCaches] = runFlowLMPrefillFusedJit(
+    { inputLinear, transformer, outNorm, outEos, flowNet },
+    kvCaches,
+    sequence,
+    embeds,
+    offsetArr,
+    kvCacheLenArr,
+    noise,
+    eosThreshold,
+    lsdDecodeSteps,
+  );
+
+  return {
+    latent,
+    isEos,
+    state: { kvCaches: newCaches, kvCacheLen: kvCacheLen + seqLen },
   };
 }
 

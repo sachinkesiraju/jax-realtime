@@ -131,27 +131,42 @@ export const TUNABLES = {
    *
    * Numerically the fused path runs the identical math in the identical order
    * (the inline helpers are verbatim copies of the jitted originals with the
-   * inner jit calls inlined to avoid nested-jit boundaries). Since cycle 10 the
-   * flag covers BOTH the step-0 prefill (`runFlowLMPrefillFused` — one jit
-   * whose trace keys on the sentence length, so a NEW length costs 1 compile
-   * instead of ~7 layer re-traces) AND the steady-state decode; one flag
-   * because both fusions share the same verbatim-inline construction and the
-   * same equivalence gate (benchPrefillFusedEquivalence in tts/inference.ts),
-   * and a decoupled prefill would just add an untested 4th config. A/B with
-   * `window.__pipeline().tts.benchSynth(sentence, {fused})`.
+   * inner jit calls inlined to avoid nested-jit boundaries); the flow-LM prefill
+   * (step 0) has its own lever, ttsFusedPrefill below. A/B with `window.__pipeline().tts.benchSynth(sentence, {fused})`.
    * Shipped on: bench (fixed seed) showed 1291→1010 ms gen (~22%), realtime
    * factor 0.40→0.31, with identical frame count both paths (same EOS decision,
    * same audio duration) — equivalent output, fewer dispatches.
    */
   ttsFusedStep: true,
+  /**
+   * Fuse the flow-LM STEP-0 PREFILL (conditioning embeds concat + input proj
+   * of the BOS latent + 6 layers + out-norm + EOS head + LSD decode) into one
+   * jitted dispatch (`runFlowLMPrefillFused`) — the cycle-7 open lever, built
+   * in cycle 10 and equivalence-gated (benchPrefillFusedEquivalence in
+   * tts/inference.ts: identical frame count, first-audio max|Δ| ≤ 2e-5 fp16
+   * noise, across 9 sentences / 3 seeds). DEFAULT OFF because the measured
+   * numbers refute the diagnosis's premise: the unfused prefill's 6 layer
+   * calls all hit ONE jit cache entry (identical avals — jit keys on
+   * shapes, not weight values), so a NEW sentence length was never "~7
+   * re-traces"; measured cold cost at a new length is ~+15–50 ms unfused vs
+   * ~+90–160 ms for the fused trace's own (bigger) compile, with warm at
+   * parity (±10%, both ~30–90 ms quiet). The recorded ~90–380 ms first-audio
+   * variance is dominated by per-shape GPU pipeline/kernel creation SHARED by
+   * both paths (either path warms the other at the same length), which fusion
+   * cannot remove. Kept as a lever (not deleted) since it is the only
+   * remaining candidate structure for that variance if the shared-kernel cost
+   * ever moves; flipping it on is safe (equivalent output), just not faster.
+   */
+  ttsFusedPrefill: false,
   // NOTE (cycle 7): a ttsPrefillBucket lever (pad the flow-LM prefill text to
   // 16-token multiples, llmPrefillBucket's twin) lived here and was REJECTED
   // at MAP: the padded prompt made warm prefills SLOWER (~150 ms vs ~30-60 ms)
   // and the turn bench's tts stage regressed 115 -> 221 ms median. The step-0
   // re-trace variance it targeted is real (benchTtsPrefill shows it); the
   // open lever is fusing the step-0 prefill, not padding it.
-  // (cycle 10): that lever is now built — the step-0 prefill fuses under
-  // ttsFusedStep above; see runFlowLMPrefillFused in tts/pocket-tts.ts.
+  // (cycle 10): that lever is now built and measured — see ttsFusedPrefill
+  // above: cold is dominated by shared per-shape kernel compiles, so the
+  // fusion is equivalence-clean but NOT a win; stays default-off.
 
   // region: tts-onset
   /**
