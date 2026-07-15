@@ -459,20 +459,28 @@ export class DuplexSession {
       //     Same onset detector as the listening phase (level > START_LEVEL,
       //     sustained), on a dedicated counter so a stale aboveTicks streak
       //     from before the endpoint can never trip it.
-      if (this.mergeWindowOpen) {
+      //     SILENT phase only (!audioActive): once the onset filler is
+      //     audible its speaker echo would trip a raw START_LEVEL detector,
+      //     so during audible playback the resume detection is owned by the
+      //     echo-calibrated BARGE path below — handleBargeIn re-routes to the
+      //     merge while the window is open (see its first branch). The first
+      //     midpause bench proved this split necessary: closing the window AT
+      //     the onset made merges unreachable (onset fires ~0 ms after the
+      //     endpoint), and raw-level detection during the onset false-fired.
+      if (this.mergeWindowOpen && !this.audioActive()) {
         if (level > START_LEVEL) this.mergeResumeTicks++;
         else this.mergeResumeTicks = 0;
         if (this.mergeResumeTicks >= MERGE_RESUME_TICKS) {
           this.handleContinuationMerge();
           return;
         }
-        // Barge-in echo-floor calibration is DEFERRED while the window is
-        // open: the floor must measure the reply's playback echo, and nothing
-        // is audible yet — calibrating on window silence would bake in a
-        // too-low floor. bargeFloorTicks starts counting the tick after the
-        // window closes, i.e. from the first audible audio, which is exactly
-        // when the echo exists. (With continuationMerge off the window never
-        // opens and calibration starts at respond() dispatch, as shipped.)
+        // Barge-in echo-floor calibration is DEFERRED while nothing is
+        // audible: the floor must measure the reply's playback echo, and
+        // calibrating on window silence would bake in a too-low floor.
+        // bargeFloorTicks starts counting from the first audible audio
+        // (onset filler included), which is exactly when the echo exists.
+        // (With continuationMerge off the window never opens and calibration
+        // starts at respond() dispatch, as shipped.)
       } else if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
         // Calibration window: the loudest thing the mic hears now is our own
         // echo, so take the max as the floor to beat.
@@ -857,24 +865,21 @@ export class DuplexSession {
           onOnset: (text) => {
             this.onsetPrefix = text;
             this.currentTtsText = text;
-            // MERGE WINDOW CLOSES AT THE ONSET, not at first synth audio.
-            // The spec's window is "before the reply speaks" — and the onset
-            // IS the reply speaking: real sound from the speakers (~0.5 s
-            // in), so a resume after the user heard "So," is the user
-            // talking OVER the assistant, i.e. a normal barge-in. Yes, that
-            // makes the window short (~0.5 s) on onset-filler turns — that's
-            // the honest reading of the spec; the alternative (merging after
-            // an audible "So,") would rescind a reply the user already
-            // responded to. The cycle-3 one-stream/one-clock law guarantees
-            // onset ≤ first synth audio, so closing here is always the
-            // earlier of the two. currentTtsText is set above BEFORE closing
-            // so the echo filter is armed the instant closeMergeWindow's
-            // transcriber.reset() opens the fresh window.
-            this.closeMergeWindow();
+            // The merge window SURVIVES the onset. First design closed it
+            // here ("the onset is the reply speaking") and the midpause bench
+            // falsified that instantly: with the filler on (default), the
+            // onset plays ~0 ms after the endpoint, so the window was
+            // millisecond-wide and merges never happened. Conversationally
+            // the onset is a turn-taking cue, not content — a human who says
+            // "So—" as you resume mid-thought yields and listens, which is
+            // exactly what routing an onset-phase barge to the merge gives
+            // us. The window now closes only at the first SYNTHESIZED chunk
+            // (below); during the audible onset the resume detection runs at
+            // barge threshold (see the tick), so filler echo can't fake it.
           },
-          // No-onset replies (onsetFiller off / no cached voice): the window
-          // closes at the first synthesized chunk instead — the first moment
-          // the reply is audible.
+          // The window closes at the first synthesized chunk — the first
+          // moment actual reply CONTENT is audible. After this, a resume is
+          // a real barge-in.
           onFirstAudio: () => this.closeMergeWindow(),
         },
       );
@@ -1151,6 +1156,19 @@ export class DuplexSession {
   // --- Barge-in ----------------------------------------------------------
 
   private handleBargeIn(now: number): void {
+    // Onset-phase resume → CONTINUATION MERGE, not barge-in. If the merge
+    // window is still open, the only thing that has played is the onset
+    // filler ("So,") — no reply content — so speech that cleared the barge
+    // threshold is the user resuming their utterance, not interrupting an
+    // answer. handleContinuationMerge aborts the pipeline (stopping the
+    // filler mid-word, which is exactly the human "So— ...go on" yield) and
+    // re-opens the utterance. No buffer trim (the whole utterance must
+    // survive for the merged transcript) — the ~1 s of filler echo between
+    // the halves is small and the echo filter is armed (currentTtsText).
+    if (this.mergeWindowOpen && TUNABLES.continuationMerge) {
+      this.handleContinuationMerge();
+      return;
+    }
     this.bargeAt = now;
     this.assistant?.controller.abort();
     this.cb.onEvent("barge-in · stopping");
