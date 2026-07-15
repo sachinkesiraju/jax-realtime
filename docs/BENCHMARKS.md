@@ -743,17 +743,31 @@ pre-roll with a fresh stream state. This is also the honest answer to the
 echo-filter question: the kyutai lane skips reply-period audio instead of
 filtering it.
 
-**Verdict: default stays "whisper" for now.** The kyutai ear is correct and
+**Phase D (semantic VAD) — built, measured on a second machine (M4 Mac
+mini), and the flip-gate did NOT clear.** The extra-heads port works exactly
+as reverse-engineered from Kyutai's Rust server (P(done) ≤0.06 mid-speech,
+crosses 0.6 within ~240 ms of a true end, instant revocation when speech
+resumes) and VAD endpoints fire at median ~450 ms with one at 149 ms. But
+the delayed text stream gives the win right back: reading the transcript at
+VAD-fire truncates it ("…hobby to do on the"), and settling until the text
+stops growing costs ~650 ms (measured `asr` stage), landing vad+settle at
+1809 ms vs whisper's 1529/1557 on the same box — plus 2/8 turns showed
+premature mid-sentence VAD cuts (ep=0) that settle can't repair. Full M4
+matrix: whisper 1529/1557 · ky-timers 1780 · ky-vad-no-settle 1410 (6/8
+truncated) · ky-vad+settle 1809 (2/8 truncated). The ~0.5 s trained-in text
+delay is architectural; no smaller-delay Kyutai STT exists to port around
+it.
+
+**Verdict: default stays "whisper".** The kyutai ear is correct and
 stable but +254 ms median: punct-endpointing waits for punctuation that the
 delayed stream delivers ~0.5 s late — a texture the timer knobs cannot fix
 (tried: shrinking endpointPunctMs just re-routes turns to the silence path).
-The flip-gate is **Phase D: the semantic-VAD head** (extra_heads in the
-checkpoint, currently implemented only in Kyutai's Rust server) — replace
-punct+silence timers with the model's own end-of-turn probability, which
-fires WITHOUT waiting for delayed punctuation and adapts to content (the
-patience mechanism cycle 5 proved impossible from the outside). If Phase D
-lands under ~500 ms effective endpoint, the kyutai ear wins on every axis
-and deletes streaming.ts entirely.
+The kyutai ear stays a
+correct, memory-heavier, GPU-lighter alternative behind `asrEngine`; what
+would change the verdict is a delayed-streams STT with a materially smaller
+text delay (or a distilled variant), not more endpoint engineering — every
+timer/VAD/settle combination on top of a 0.5 s-late stream has now been
+measured against that delay and lost to it.
 
 ## Hill-climb levers (ordered by expected payoff)
 
