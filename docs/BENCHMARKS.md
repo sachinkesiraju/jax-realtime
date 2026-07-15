@@ -698,6 +698,31 @@ above). Still open, ranked by impact/effort:
    **tool-context memory** ("what about tomorrow?" follow-ups) — gated on a
    labeled routing test set first.
 
+## Considered: TML Inkling as the brain (NOT VIABLE in-browser — recorded Jul 2026)
+
+Thinking Machines released Inkling (Jul 15, 2026): open-weights MoE, 975B
+total / 41B active, 1M context, native text+image+AUDIO input (encoder-free
+dMel spectrograms — the same interaction-model lineage this project chases),
+plus an Inkling-Small preview (276B total / 12B active, weights not yet
+released). Evaluated as a replacement brain/ear/eye:
+
+- **Memory math kills it outright for this app**: 975B ≈ 0.5 TB even at
+  int4; Inkling-Small ≈ 69 GB at int4 — 20–200× past the ~2-3 GB browser
+  WebGPU budget this entire codebase is built around. MoE "active params"
+  don't help residency: all experts must be resident to route.
+- **No speech output** — it reasons over audio but does not speak, so even
+  hypothetically it consolidates Ear+Brain+Eye only; Pocket TTS stays.
+- **Cloud-brain hybrid** (CerebrasChatModel-style, via Tinker's API) is the
+  only technically-possible integration, and it breaks the product's first
+  line ("runs entirely in your browser; nothing is sent to a server") while
+  adding network RTT + audio upload to every turn and per-token cost.
+
+What IS worth tracking: the Inkling family will grow ("first in a family of
+models of different sizes"), and TML's encoder-free discrete-audio-input
+design is exactly the shape a future browser-scale omni model would take. A
+sub-3B dense Inkling with audio-in would be the strongest consolidation
+candidate yet; none exists today.
+
 ## Hill-climb levers (ordered by expected payoff)
 
 Critical path after skip-finalize ≈ **LLM first-token + TTS first-audio**
