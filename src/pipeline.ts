@@ -526,10 +526,10 @@ const SMOLLM_GARBLE_CLAUSE =
   "catch that and ask them to say it again.";
 // MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
 // doesn't follow the instruction). Small models imitate demonstrations far
-// better than they follow rules, so the tunable also injects ONE few-shot
-// exemplar exchange (the conversation-quality diagnosis's Tier-2 design:
-// "system-prompt repair clause + 1 few-shot exemplar") ahead of the real
-// history. Kept to a single pair: every exemplar token is prefill cost on
+// better than they follow rules, so the tunable also injects two few-shot
+// exemplar exchanges (the conversation-quality diagnosis's Tier-2 design:
+// "system-prompt repair clause + few-shot exemplars") ahead of the real
+// history. Kept to two pairs: every exemplar token is prefill cost on
 // every turn.
 const SMOLLM_GARBLE_EXEMPLAR: ChatMessage[] = [
   { role: "user", content: "the it about when for Tuesday the", t: 0 },
@@ -538,8 +538,16 @@ const SMOLLM_GARBLE_EXEMPLAR: ChatMessage[] = [
     content: "Sorry, I didn't catch that — could you say it again?",
     t: 0,
   },
+  // Second demonstration (cycle 11): a second clarify pair gives the model
+  // more exposure to the target pattern and improves asksClarify on garbled
+  // holdout items without adding a context/brevity exemplar.
+  { role: "user", content: "and then the weather brick soon over it", t: 0 },
+  {
+    role: "assistant",
+    content: "Hmm, that didn't come through clearly — mind repeating it?",
+    t: 0,
+  },
 ];
-
 type SmolLmTokenizerData = {
   encoder: Record<string, number>;
   special: Record<string, number>;
