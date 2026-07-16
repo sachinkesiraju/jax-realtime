@@ -97,7 +97,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~790&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~710&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
@@ -110,14 +110,11 @@ app.innerHTML = `
         <button id="load-btn" class="load-btn">Load models</button>
         <div class="dock-side">
           <span id="backend-chip" class="backend-chip">WebGPU</span>
-          <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
-            <!-- checked (Eye defaults ON) and NOT disabled: the toggle must be
-                 usable BEFORE "Load models", because D-FINE is loaded lazily —
-                 unchecking here means its 42 MB download + GPU residency never
-                 happen (handleLoad only auto-enables when still checked).
-                 Toggling pre-load is safe: enableVision no-ops without a
-                 pipeline, disableVision is idempotent. -->
-            <input type="checkbox" id="eye-toggle" checked />
+          <label class="field eye-toggle" title="Optional webcam object detection (D-FINE).">
+            <!-- The toggle is usable before "Load models" because D-FINE is
+                 loaded lazily. Enabling it opts into the separate 42 MB model;
+                 leaving it off avoids that download and GPU residency. -->
+            <input type="checkbox" id="eye-toggle" />
             <span>Eye &middot; webcam</span>
           </label>
           <label class="field">
@@ -372,16 +369,7 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
-    // Eye is ON by default: start it here, in parallel with the TTS
-    // pre-render below, so the webcam is already detecting on the standby
-    // screen when "ready" appears (the pre-Eye-lazy-load behavior). It is
-    // still CONDITIONAL — toggleVision(true) drives enableVision's lazy
-    // path, which asks for the camera FIRST and only then downloads + warms
-    // D-FINE — so an unchecked toggle or a denied camera still means the
-    // 42 MB detector never touches the network or the GPU, and "ready"
-    // itself never blocks on it (not awaited). Must run AFTER loadPipeline:
-    // enableVision constructs the ONNX detector, and doing that before
-    // initDevice() has set up the WebGPU backend breaks detection silently.
+    // Respect a pre-load Eye opt-in after WebGPU initialization.
     if (el.eyeToggle.checked) void toggleVision(true);
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
