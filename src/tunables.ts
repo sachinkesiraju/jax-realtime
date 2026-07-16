@@ -7,6 +7,14 @@ export const TUNABLES = {
   // region: engine
   /** Micro-turn policy tick. Read at session start. */
   tickMs: 150,
+  /**
+   * While the assistant is replying, retain only this much recent microphone
+   * PCM for a possible barge-in. The energy detector needs two ticks (~300 ms)
+   * to fire; 1200 ms preserves the interruption onset with ample margin while
+   * continuously evicting older reply-period echo/ambient audio. 0 keeps the
+   * previous unbounded-within-the-normal-32-s-cap behavior for paired benches.
+   */
+  bargePreRollMs: 1200,
 
   // region: endpoint
   /** Silence to end a turn whose committed text ends in . ! ? */

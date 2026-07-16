@@ -701,9 +701,15 @@ export class DuplexSession {
     this.history.push({ role: "user", content, t: this.elapsed() });
     this.maybeScheduleTimer(text);
 
-    // Fresh audio window for the response phase: barge-in detection must see
-    // only NEW committed words (spoken over the reply), not this turn's.
-    this.capture.clear();
+    // Fresh response-phase capture: ASR must see only NEW speech over this
+    // reply, not the completed turn. With pre-roll enabled the mic buffer is a
+    // strict rolling tail for the whole reply period; a barge-in hands that
+    // tail to the next growing utterance instead of retaining old reply echo.
+    if (TUNABLES.bargePreRollMs > 0) {
+      this.capture.startPreRoll(TUNABLES.bargePreRollMs);
+    } else {
+      this.capture.clear();
+    }
     transcriber.reset();
     this.resetUtterance();
 
@@ -978,9 +984,17 @@ export class DuplexSession {
     this.bargeAt = now;
     this.assistant?.controller.abort();
     this.cb.onEvent("barge-in · stopping");
-    // The interrupting speech is already being captured & transcribed (echo
-    // cancellation keeps our own playback out of the buffer), so treat it as a
-    // fresh user utterance already in progress — don't clear it.
+    // The interrupting speech is already in the bounded response pre-roll.
+    // Hand that exact tail to the normal growing utterance buffer: this keeps
+    // the words spoken during the detector's two-tick reaction time but old
+    // reply-period capture has already rolled off continuously. Reset ASR too,
+    // invalidating any in-flight pass over the pre-handoff response window and
+    // discarding stale echo-filtered commit state before teardown disarms the
+    // assistant-text echo filter. With 0, preserve the old behavior for A/B.
+    if (TUNABLES.bargePreRollMs > 0) {
+      this.capture.handoffPreRoll();
+      this.transcriber?.reset();
+    }
     this.phase = "listening";
     this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
     this.silenceStart = 0;
