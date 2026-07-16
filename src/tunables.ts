@@ -212,6 +212,8 @@ export const TUNABLES = {
    * worth more than the brevity win); recorded so 0.5 isn't retried blind.
    */
   qualityTemperature: 0.7,
+  qualityVlmTemperature: 0.5,
+  qualityTypedMemory: true,
 };
 
 export type Tunables = typeof TUNABLES;

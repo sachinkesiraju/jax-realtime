@@ -3,7 +3,14 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/600.css";
 import "./style.css";
 
-import { DuplexSession } from "./duplex";
+import { DuplexSession, isGarbledTranscript } from "./duplex";
+import {
+  type ConversationalMemory,
+  directMemoryAnswer,
+  injectMemoryTag,
+  relevantMemoryFacts,
+  rememberUserFacts,
+} from "./memory";
 import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
@@ -222,6 +229,18 @@ if (import.meta.env.DEV) {
   dev.__turnLog = TURN_LOG;
   dev.__pipeline = () => pipeline;
   dev.__detectTool = detectTool;
+  dev.__garbleProbe = isGarbledTranscript;
+  dev.__memoryProbe = (turns: string[], query: string) => {
+    let memory: ConversationalMemory = {};
+    turns.forEach((turn, index) => {
+      memory = rememberUserFacts(memory, turn, index + 1);
+    });
+    const facts = relevantMemoryFacts(memory, query, turns.length + 1);
+    return {
+      prompt: injectMemoryTag(query, facts),
+      answer: directMemoryAnswer(facts, query),
+    };
+  };
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {
@@ -352,6 +371,10 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
+    if (pipeline.llm.multimodal) {
+      el.llmLabel.innerHTML =
+        '<a href="https://huggingface.co/HuggingFaceTB/SmolVLM-500M-Instruct" target="_blank">SmolVLM 500M</a>';
+    }
     // Eye is ON by default: start it here, in parallel with the TTS
     // pre-render below, so the webcam is already detecting on the standby
     // screen when "ready" appears (the pre-Eye-lazy-load behavior). It is
@@ -505,6 +528,7 @@ async function enableVision(): Promise<void> {
   vision.video.className = "pip-video";
   el.pip.insertBefore(vision.video, el.pipOverlay);
   await vision.start();
+  pipeline.llm.setVisionSource?.(vision.video);
   el.pip.hidden = false;
   el.stageEye.classList.add("is-active");
   if (visionRaf === null) drawPreview();
@@ -515,6 +539,7 @@ async function enableVision(): Promise<void> {
 
 function disableVision(): void {
   duplex?.setVision(null);
+  pipeline?.llm.setVisionSource?.(null);
   vision?.stop();
   if (vision?.video.parentElement) vision.video.remove();
   vision = null;

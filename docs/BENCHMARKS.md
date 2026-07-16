@@ -695,6 +695,69 @@ sister-Maria flow items. Net: `correct` and `staysOnTopic` regress enough that
 the simpler 2-garble clarify pair is the safer baseline. `qualityBrevityExemplar`
 and `qualityContextExemplar` were removed; the 2-garble pair was kept.
 
+## Cycle 12 — typed memory and native multimodal vision
+
+Pre-registered gates required at least 55% visual accuracy, +15 points over
+D-FINE + SmolLM, no text regression, warm visual turns under 2.2 s, renderer
+RSS under 2.4 GB, and default downloads under 1.2 GB. Oracle MAP established
+the model-family ceiling:
+
+| candidate | visual | text | median visual |
+| --- | ---: | ---: | ---: |
+| D-FINE scene text + SmolLM | 6/24 | — | — |
+| SmolVLM-500M | 13/24 | 6/6 after removing the mismatched system prompt | 4.6–4.9 s |
+| Qwen3.5-0.8B | **16/24** | 5/6 | 13.86 s |
+| FastVLM-0.5B | 12/24 | 3/6 | **1.19 s** |
+
+The stock SmolVLM ONNX encoder used `GatherND`, `NonZero`, and `ScatterND`,
+which `@jax-js/onnx` does not implement. A fixed 512×512 single-image export
+removes those dynamic padding-mask operations while preserving the trained
+SigLIP encoder, factor-4 pixel shuffle, and projector. Its output matches the
+Hugging Face path exactly (`[1,64,960]`, max absolute difference 0.0). The
+SmolLM prefill now accepts mixed embeddings, and the independent 49,280-row
+VLM output head is supported. Browser inference remains entirely local through
+jax-js; published artifacts are a 411 MB per-row-int8 text checkpoint, 197 MB
+fp16 vision encoder/projector, and 1.1 MB tokenizer.
+
+The fixed single-image path was much faster than the default oracle's 17-crop
+processor while retaining its MAP quality:
+
+| split | visual | text | median visual | median first token | renderer / GPU RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MAP selection | **14/24** | 5/6 | **679 ms** | **379 ms** | 474 / 402 MB |
+| MAP confirmation (temperature 0.3) | **13/24** | — | **696 ms** | **390 ms** | 506 / 379 MB |
+| holdout | **18/24** | **6/6** | **673 ms** | **379 ms** | 665 / 496 MB |
+
+Typed conversational memory stores only bounded, explicitly stated facts,
+retrieves only query-relevant kinds, and injects them ephemerally; deterministic
+answers cover exact recall. Its eight-run holdout scored **45/48**, with all
+sister, dog, and dinner flow items passing. Fused with SmolVLM it scored 6/6 on
+both MAP and holdout text sets, repairing SmolVLM's lone name-recall miss. The
+final conversation-first default (SmolLM + typed memory + garble gate), over two
+runs, scored MAP `asksClarify` 6/6, `noFalseClarify` 18/18, flow 11/12, and
+format 40/40; holdout scored `asksClarify` 3/4, `noFalseClarify` 10/10, flow 6/6,
+and format 23/24.
+
+A final direct-model sweep exposed two VLM text regressions hidden by the small
+oracle set: 0/3 garble clarifications and numbered-list output. The shipped
+fusion handles these at the correct deterministic boundaries instead of adding
+more leaky prompt examples: a structural/repetition ASR-text gate caught all
+three garbles and rejected none of five clean controls, and the expanded output
+token mask plus VLM-specific 0.5 sampling restored flow retention to 6/6.
+Exact memory follow-ups bypass the model; the remaining
+direct-model miss was the scene-text fixture, which the multimodal path now
+answers from pixels instead.
+
+Kept by default: the conversation-tuned SmolLM brain and typed memory. The
+validated SmolVLM port remains available behind `?brain=smolvlm`, but its direct
+text regressions reject it as the default despite the visual win. Rejected: rich
+D-FINE scene text (deterministic scene tests 7/7, but no semantic gain: 6/24
+either way), projector-only alignment
+(one-step smoke loss 3.4693 but incoherent output and substantial training still
+required), Qwen3.5 (best oracle accuracy but a 3:1 Gated DeltaNet/full-attention
+port and latency far outside the gate), and FastVLM (latency win but weaker
+quality and an Apple model license).
+
 ## Open conversation-quality roadmap
 
 Distilled from the five-agent conversation-quality diagnosis (previously

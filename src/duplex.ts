@@ -5,6 +5,14 @@
 // wasm (when available) so it can transcribe while the assistant speaks.
 
 import { StreamingTranscriber, type StreamingUpdate } from "./asr/streaming";
+import {
+  directMemoryAnswer,
+  injectMemoryTag,
+  type ConversationalMemory,
+  type MemoryFact,
+  relevantMemoryFacts,
+  rememberUserFacts,
+} from "./memory";
 import { VoiceCapture } from "./mic";
 import { analyserLevel } from "./orb";
 import type {
@@ -221,6 +229,10 @@ export class DuplexSession {
   private running = false;
 
   readonly history: ChatMessage[] = [];
+
+  private conversationalMemory: ConversationalMemory = {};
+  private memoryTurn = 0;
+  private pendingMemoryFacts: MemoryFact[] = [];
 
   private phase: Phase = "listening";
   private respondingSince = 0; // perf.now() when the current reply began (watchdog)
@@ -607,16 +619,45 @@ export class DuplexSession {
       this.startFreshListening();
       return;
     }
-    if (isDegenerateTranscript(text)) {
+    if (isGarbledTranscript(text)) {
       // Whisper repetition loop ("All in all. All in all. …") — a decoder
       // artifact, not something the user said. Never answer it.
-      this.cb.onEvent("asr · garbled, discarded");
+      this.cb.onEvent("asr · garbled, asking for a repeat");
       this.startFreshListening();
+      void this.speakProactive("Sorry, I didn't catch that — could you say it again?");
       return;
     }
 
     this.cb.onMetric({ asrLagMs });
     this.cb.onUserTurn(text);
+
+    this.memoryTurn++;
+    if (TUNABLES.qualityTypedMemory) {
+      this.pendingMemoryFacts = relevantMemoryFacts(
+        this.conversationalMemory,
+        text,
+        this.memoryTurn,
+      );
+      this.conversationalMemory = rememberUserFacts(
+        this.conversationalMemory,
+        text,
+        this.memoryTurn,
+      );
+    } else {
+      this.pendingMemoryFacts = [];
+    }
+
+    const rememberedReply = directMemoryAnswer(this.pendingMemoryFacts, text);
+    if (rememberedReply) {
+      this.cb.onEvent("memory · answering from explicit user facts");
+      this.history.push({ role: "user", content: text, t: this.elapsed() });
+      this.capture.clear();
+      transcriber.reset();
+      this.resetUtterance();
+      this.startFreshListening();
+      void this.speakProactive(rememberedReply);
+      return;
+    }
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
     // questions (count, colour, "what do you see") are answered directly from
@@ -624,7 +665,12 @@ export class DuplexSession {
     // interpretive visual questions ("what am I doing", "does my room look
     // tidy") are handed to the LLM with the measured scene as grounding, so the
     // model reasons rather than us templating a reply.
-    if (this.vision?.active && this.vision.matchesQuestion(text)) {
+    const visualModel = this.getModel().multimodal === true;
+    if (
+      this.vision?.active &&
+      this.vision.matchesQuestion(text) &&
+      !visualModel
+    ) {
       const reply = this.vision.answer(text);
       this.cb.onEvent("eye · answering from the camera");
       this.history.push({ role: "user", content: text, t: this.elapsed() });
@@ -637,9 +683,17 @@ export class DuplexSession {
     }
 
     let content = text;
-    if (this.vision?.active && this.vision.referencesVision(text)) {
+    if (
+      this.vision?.active &&
+      (this.vision.referencesVision(text) ||
+        (visualModel && this.vision.matchesQuestion(text)))
+    ) {
       const facts = this.vision.sceneFacts();
-      content = facts ? `[scene: ${facts}] ${text}` : text;
+      content = facts
+        ? `[scene: ${facts}] ${text}`
+        : visualModel
+          ? `[scene: camera] ${text}`
+          : text;
       this.cb.onEvent("eye · grounding from the camera");
     }
     this.history.push({ role: "user", content, t: this.elapsed() });
@@ -654,7 +708,10 @@ export class DuplexSession {
     // Two-tier path: a tool intent runs as a background task while the fast
     // model stays present. Only one background task at a time; if one is
     // already running, fall through to a normal reply.
-    let tool = this.backgroundTask ? null : detectTool(text);
+    let tool =
+      this.backgroundTask || this.pendingMemoryFacts.length
+        ? null
+        : detectTool(text);
     // Eye-as-oracle for lookups: when the lookup subject names something the
     // camera can currently see ("what is the person doing"), the turn is about
     // the scene, not the web — drop the tool so the scene-grounded LLM answers.
@@ -729,7 +786,18 @@ export class DuplexSession {
 
     try {
       const model = this.getModel();
-      const stream = model.generateStream(this.history);
+      const promptHistory = this.history.map((message, index) =>
+        TUNABLES.qualityTypedMemory &&
+        this.pendingMemoryFacts.length > 0 &&
+        index === this.history.length - 1 &&
+        message.role === "user"
+          ? {
+              ...message,
+              content: injectMemoryTag(message.content, this.pendingMemoryFacts),
+            }
+          : message,
+      );
+      const stream = model.generateStream(promptHistory);
       const sentences = this.sentenceStream(stream, state);
 
       this.cb.onStageActivity("tts", true);
@@ -1130,15 +1198,37 @@ function displayWordCount(text: string): number {
  * is a decode artifact, not speech — a real utterance of ≥6 words has far more
  * lexical variety. Signal-based (a repetition statistic), no phrase lists.
  */
-function isDegenerateTranscript(text: string): boolean {
-  const tokens = text
+function transcriptTokens(text: string): string[] {
+  return text
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, "")
     .split(/\s+/)
     .filter(Boolean);
+}
+
+function isDegenerateTranscript(text: string): boolean {
+  const tokens = transcriptTokens(text);
   if (tokens.length < 6) return false;
   const unique = new Set(tokens).size;
   return unique / tokens.length < 0.4;
+}
+
+export function isGarbledTranscript(text: string): boolean {
+  if (isDegenerateTranscript(text)) return true;
+  const tokens = transcriptTokens(text);
+  if (tokens.length < 6) return false;
+  for (let i = 1; i < tokens.length; i++) {
+    if (tokens[i] === tokens[i - 1]) return true;
+  }
+  const trigrams = new Set<string>();
+  for (let i = 0; i <= tokens.length - 3; i++) {
+    const trigram = tokens.slice(i, i + 3).join(" ");
+    if (trigrams.has(trigram)) return true;
+    trigrams.add(trigram);
+  }
+  return /\b(?:the|a|an)\s+(?:with|about|for|to)\s+(?:about|with|for|to)\b/i.test(
+    text,
+  );
 }
 
 function findSentenceEnd(buffer: string): number {
