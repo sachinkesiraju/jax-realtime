@@ -596,12 +596,12 @@ export class DuplexSession {
     // utterance incrementally, so prefer its result and skip the extra
     // multi-second Whisper finalize pass that used to dominate turn latency.
     // Only fall back to finalize() when streaming hasn't caught up (short/empty).
-    let text = transcriber.bestText();
+    let { text, confidence } = transcriber.bestResult();
     if (displayWordCount(text) < 3) {
       this.turnMarks.usedBestText = false;
       this.cb.onStageActivity("asr", true);
       try {
-        text = await transcriber.finalize();
+        ({ text, confidence } = await transcriber.finalizeResult());
       } catch (error) {
         this.cb.onError(error);
       } finally {
@@ -610,6 +610,7 @@ export class DuplexSession {
     }
     this.turnMarks.transcriptReady = performance.now();
     this.turnMarks.transcript = text;
+    this.turnMarks.asrAvgLogProb = confidence?.avgLogProb ?? undefined;
     const asrLagMs = performance.now() - endOfSpeechAt;
 
     if (!this.running) return;
@@ -617,6 +618,20 @@ export class DuplexSession {
     if (!text.trim()) {
       // Empty/noise turn: discard and go back to listening.
       this.startFreshListening();
+      return;
+    }
+    const confidenceThreshold = TUNABLES.asrConfidenceThreshold;
+    if (
+      confidenceThreshold !== null &&
+      confidence?.avgLogProb !== null &&
+      confidence?.avgLogProb !== undefined &&
+      confidence.avgLogProb < confidenceThreshold
+    ) {
+      this.cb.onEvent(
+        `asr · low confidence ${confidence.avgLogProb.toFixed(2)}, asking for a repeat`,
+      );
+      this.startFreshListening();
+      void this.speakProactive("Sorry, I didn't catch that — could you say it again?");
       return;
     }
     if (isGarbledTranscript(text)) {
@@ -837,6 +852,7 @@ export class DuplexSession {
         fired: this.turnMarks.fired ?? 0,
         transcriptReady: this.turnMarks.transcriptReady ?? 0,
         usedBestText: this.turnMarks.usedBestText ?? true,
+        asrAvgLogProb: this.turnMarks.asrAvgLogProb,
         firstDelta: this.turnMarks.firstDelta ?? 0,
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,

@@ -18,7 +18,7 @@ import { TUNABLES } from "./tunables";
 
 import {
   decodeTranscriptTokens,
-  sampleGreedy,
+  sampleGreedyWithScore,
 } from "./asr/decoding";
 import { whisperLogMel } from "./asr/features";
 import {
@@ -68,6 +68,22 @@ export type DownloadProgress = {
 };
 
 export type ProgressFn = (progress: DownloadProgress) => void;
+
+export type ASRConfidence = {
+  /** Mean top-two normalized log probability for decoded text tokens only. */
+  avgLogProb: number | null;
+  /** Lowest top-two text-token log probability in the hypothesis. */
+  minLogProb: number | null;
+  /** Mean top-two log probability including timestamps and EOS. */
+  avgAllLogProb: number | null;
+  textTokenCount: number;
+  sampledTokenCount: number;
+};
+
+export type ASRResult = {
+  text: string;
+  confidence: ASRConfidence;
+};
 
 // base.en over tiny.en: tiny is the most hallucination-prone Whisper size (it
 // invents "thank you" / repeats on near-silence and garbles fast speech), and
@@ -275,8 +291,20 @@ export class SpeechRecognizer {
     };
   }
 
-  /** Transcribe 16 kHz mono PCM samples to text. */
+  /** Transcribe 16 kHz mono PCM samples to text (compatibility wrapper). */
   async transcribe(samples: Float32Array, duration: number): Promise<string> {
+    return (await this.transcribeWithConfidence(samples, duration)).text;
+  }
+
+  /**
+   * Transcribe and expose confidence from the decoder's selected-token logits.
+   * The clarification policy is controlled separately by
+   * `asrConfidenceThreshold`; this method never changes decoded text.
+   */
+  async transcribeWithConfidence(
+    samples: Float32Array,
+    duration: number,
+  ): Promise<ASRResult> {
     if (this.busy) {
       throw new Error("SpeechRecognizer is already transcribing");
     }
@@ -323,29 +351,46 @@ export class SpeechRecognizer {
       }
 
       const generated: number[] = [];
+      const textLogProbs: number[] = [];
+      const allLogProbs: number[] = [];
       for (let i = 0; i < ASR_MAX_NEW_TOKENS; i++) {
         const sampledLogits = logits;
         if (!sampledLogits) throw new Error("Decoder logits were not ready");
         logits = null;
-        const next = await sampleGreedy(
+        const sample = await sampleGreedyWithScore(
           sampledLogits,
           generated,
           duration,
           config,
         );
-        if (next === config.eosToken) break;
-        generated.push(next);
+        allLogProbs.push(sample.logProb);
+        if (sample.token < config.eosToken) textLogProbs.push(sample.logProb);
+        if (sample.token === config.eosToken) break;
+        generated.push(sample.token);
         logits = runWhisperDecoderStep(
           this.model.decoder,
           crossKV,
           state,
-          next,
+          sample.token,
           config,
           device,
         );
       }
 
-      return decodeTranscriptTokens(generated, this.tokenizer, config).trim();
+      const mean = (values: number[]): number | null =>
+        values.length
+          ? values.reduce((total, value) => total + value, 0) / values.length
+          : null;
+      return {
+        text: decodeTranscriptTokens(generated, this.tokenizer, config).trim(),
+        confidence: {
+          avgLogProb: mean(textLogProbs),
+          minLogProb: textLogProbs.length ? Math.min(...textLogProbs) : null,
+          avgAllLogProb: mean(allLogProbs),
+          textTokenCount: textLogProbs.length,
+          sampledTokenCount: allLogProbs.length,
+        },
+      };
     } finally {
       logits?.dispose();
       encoded?.dispose();

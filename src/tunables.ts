@@ -32,6 +32,15 @@ export const TUNABLES = {
    * gating is never approximated silently.
    */
   asrSampler: "js" as "js" | "gpu",
+  /**
+   * Candidate signal-side clarification gate. The score is the mean top-two
+   * normalized decoder log probability of selected text tokens (not a text
+   * heuristic). `null` disables the gate for paired A/Bs. Cycle-13 paired MAP
+   * put clean/correct decodes at -0.097..-0.018 and failed garbled decodes at
+   * -0.691..-0.627; -0.3 preserved that gap on holdout (-0.685 failed vs
+   * -0.013..-0.007 correct) with zero clean false clarifications.
+   */
+  asrConfidenceThreshold: -0.3 as number | null,
 
   // region: llm
   /**
@@ -227,6 +236,8 @@ export type TurnRecord = {
   transcriptReady: number;
   /** Whether the fast bestText path was used (vs a full finalize pass). */
   usedBestText: boolean;
+  /** Mean top-two normalized decoder log probability for ASR text tokens. */
+  asrAvgLogProb?: number;
   /** Which endpoint rule fired the turn (campaign-1 diagnosis). */
   endCause?: "punct" | "silence" | "max";
   /** First LLM text delta arrived. */
