@@ -723,6 +723,49 @@ Richer scene tracking passed deterministic scene tests 7/7 but did not improve
 semantic scene answers, so it was removed. The retained changes improve
 conversation while reducing model downloads and GPU residency.
 
+## Cycle 13 — signal confidence, interruption hygiene, and compact ears
+
+Six candidates were isolated against pre-registered paired gates. Four survived:
+
+| candidate | MAP result | holdout / cost guard | verdict |
+| --- | --- | --- | --- |
+| ASR confidence | failed-audio clarifications 0/2 → **2/2**; 0/6 false clarifications | 0/1 → **1/1** failed-audio clarification; 0/2 false clarifications; pooled latency −4.05% | **keep** |
+| 1.2 s barge pre-roll | old reply markers removed; all interruption markers retained | exact-bound probe passed; bound-transition overhead far below 50 ms | **keep** |
+| correction-turn tag | correction accuracy **3/6 → 3/6** | 1/2 → 2/2, but MAP did not improve and meta-language leaked | reject |
+| Whisper per-row int8 | paired transcripts and WER unchanged | paired holdout transcripts unchanged; worst median latency delta +3.35% | **keep** |
+| FlowLM per-row int8 | saved 89.6 MB | one fixed-seed phrase lost 3 frames / 240 ms | reject |
+| Eye off by default | no detector request on default load | pre-load opt-in remained one click | **keep** |
+
+The ASR gate averages selected-token top-two normalized log probabilities and
+clarifies below −0.3 before text reaches the brain. Synthetic noisy,
+band-limited, and speed-distorted MAP audio separated correct decodes
+(−0.097…−0.018) from failures (−0.691…−0.627); the disjoint holdout preserved
+the gap (−0.013…−0.007 correct, −0.685 failed). A final fused holdout with the
+quantized Whisper artifact kept clean and distorted-correct speech below the
+false-clarification boundary while rejecting the failed decode at −0.668. Real
+speaker garble should be added to future calibration; the current audio failure
+fixtures are synthetic.
+
+Barge-in capture now rolls over a strict 1.2 s response-phase tail, then hands
+that PCM to the normal utterance buffer without clearing the interruption. The
+paired probe changed `[10…17]` (old reply markers 10–11 included) to `[12…17]`
+while retaining every interruption marker. The fake-mic harness mutes playback,
+so this proves buffer hygiene but cannot measure real speaker-to-microphone
+leakage; an audible loopback fixture remains the release-grade follow-up.
+
+Whisper quantizes 98 two-dimensional tensors (70,823,936 parameters) and
+restores the configured fp16/fp32 runtime dtype at load. The artifact shrank
+from 143,675,684 to **73,341,440 bytes** (−70,334,244; −49%). Across three runs
+of clean, quiet, and distorted MAP/holdout clips, every compact-model transcript
+matched fp16; ambient-noise and typing hallucinations were also identical, not
+increased. The hosted compact file has an automatic fp16 fallback.
+
+The all-FlowLM TTS candidate shrank 200,506,740 → 110,951,612 bytes and retained
+high spectral similarity, but its short fixed-seed phrase changed 48 → 45 codec
+frames. The deterministic duration gate correctly rejected that 44.7% saving.
+With compact Whisper and the Eye now opt-in, the default first load falls from
+~710 MB to **~640 MB**; enabling the Eye adds its measured 41,754,112-byte model.
+
 ## Open conversation-quality roadmap
 
 Distilled from the five-agent conversation-quality diagnosis (previously
@@ -731,22 +774,14 @@ format, humanized tool-failure lines, the reachable backchannel window, the
 garble repair clause + exemplar — are recorded in the campaign sections
 above). Still open, ranked by impact/effort:
 
-1. **ASR confidence gate** — average decoder logprob is nearly free (logits
-   already on CPU in asr/decoding.ts); below a threshold, speak "sorry,
-   could you say that again?" instead of handing garble to the brain.
-   Complements the shipped prompt-side exemplar with a signal-side gate.
-2. **Barge-in buffer hygiene** — at barge-in the capture buffer spans the
-   whole reply period, so reply words + ambient leak into the next turn.
-   Trim to ~1.2 s of pre-roll; keep echo-filtering the aborted reply text.
-3. **Post-fire continuation-merge** — speech resuming <700 ms before first
+1. **Post-fire continuation-merge** — speech resuming <700 ms before first
    reply audio should abort the reply and re-open the utterance (append,
    don't restart). The cycle-5 law says this is the only patience design
    compatible with a lagging cascade ASR.
-4. **Correction-turn tagging** — a rapid "No, …" after a reply gets a
-   "(the user is correcting your previous answer)" prompt prefix.
-5. **Whisper small.en** (144→481 MB, ~3× FLOPs) — better ears, gated on a
-   WER fixture; the int8 brain savings roughly cover the size.
-6. **LLM-emitted tool markers** replacing the lookup/weather regexes, and
+2. **Whisper small.en** — better ears, gated on a substantially broader
+   real-speaker WER fixture and runtime budget. Per-row int8 should cut its
+   original 481 MB checkpoint roughly in half, but its ~3× FLOPs remain.
+3. **LLM-emitted tool markers** replacing the lookup/weather regexes, and
    **tool-context memory** ("what about tomorrow?" follow-ups) — gated on a
    labeled routing test set first.
 
