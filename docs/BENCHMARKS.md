@@ -671,6 +671,30 @@ of garbled input, and went 0-for-6 on the holdout factual/scene items. The
 branch's only regression axis: GPU weight residency (SmolLM fp16 724 MB vs
 Gemma 536 MB, +188 MB) — the cost of the bigger brain.
 
+## Cycle 11 — prompt exemplars for brevity and coreference (REVERTED)
+
+Tested two few-shot exemplars on top of the shipped 2-garble clarify pair:
+`SMOLLM_BREVITY_EXEMPLAR` (a short answer to "What are some good ways to relax
+after work?") and `SMOLLM_CONTEXT_EXEMPLAR` (a cat-named-Mochi coreference
+exchange). MAP (n=8 runs) looked good — `shortSpoken` 24/24 and `staysOnTopic`
+36/48 — but holdout (n=8 runs) rejected the combination:
+
+| axis | base holdout (2-garble only) | G8 holdout (+ brevity/context) |
+| --- | --- | --- |
+| noMarkdown | 93/96 | **96/96** |
+| asksClarify (garbled) | 7/16 | **9/16** |
+| noFalseClarify | 38/40 | **39/40** |
+| shortSpoken | 15/16 | **16/16** |
+| staysOnTopic (flow) | **17/24** | 10/24 |
+| correct (factual/scene) | **8/16** | 4/16 |
+
+The brevity/context examples leak: the "Mochi" cat name bleeds into unrelated
+name-memory flow items, the "relax" example leaks onto garbled/factual
+single-turns, and the model produces generic non-answers on the holdout food and
+sister-Maria flow items. Net: `correct` and `staysOnTopic` regress enough that
+the simpler 2-garble clarify pair is the safer baseline. `qualityBrevityExemplar`
+and `qualityContextExemplar` were removed; the 2-garble pair was kept.
+
 ## Open conversation-quality roadmap
 
 Distilled from the five-agent conversation-quality diagnosis (previously
