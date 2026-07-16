@@ -67,21 +67,7 @@ assistant stops.
 The turn-latency floor is set by the single GPU, so the work went into cutting
 GPU cost per token/frame rather than overlapping stages (which a single device
 can't do — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
-map-reduce campaign log, including the negative results).
-
-Fresh paired checks against `main` on the same machine:
-
-| Metric | `main` | Current |
-| --- | ---: | ---: |
-| MAP quality checks | 146/160 (91.3%) | **156/160 (97.5%)** |
-| Holdout quality checks | 100/108 (92.6%) | **104/108 (96.3%)** |
-| ASR median | 257.5 ms | **239–244 ms (5–7% faster)** |
-| ASR exact transcripts | 21/21 | **21/21** |
-| Failed-audio clarification | 0/3 | **3/3** |
-| Default model download | ~790 MB | **~640 MB (19% smaller)** |
-
-The primary JavaScript bundle grows by 3.74 kB gzip (143.72 → 147.46 kB) for
-the memory, confidence, and interruption logic.
+map-reduce campaign log, including the negative results):
 
 - **Fused decode** — the LLM decode step is fused from dozens of per-layer jit
   dispatches into one, and Pocket TTS from ~11 into two, cutting the
