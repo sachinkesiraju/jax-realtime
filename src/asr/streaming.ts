@@ -4,7 +4,11 @@
 // "tentative" tail. Also filters the assistant's own TTS out of the hypothesis
 // (self-echo) so barge-in detection only fires on real user speech.
 
-import type { SpeechRecognizer } from "../pipeline";
+import type {
+  ASRConfidence,
+  ASRResult,
+  SpeechRecognizer,
+} from "../pipeline";
 import { TUNABLES } from "../tunables";
 
 const SAMPLE_RATE = 16_000;
@@ -64,6 +68,7 @@ export class StreamingTranscriber {
   private prevWords: string[] = [];
   private committedWords: string[] = [];
   private tentativeText = "";
+  private latestConfidence: ASRConfidence | null = null;
   private lastChangeAt = 0;
   // Bumped by reset(); passes started under an older generation are discarded
   // so a stale hypothesis can't repopulate freshly-cleared commit state.
@@ -94,14 +99,12 @@ export class StreamingTranscriber {
     return this.tentativeText;
   }
 
-  /**
-   * The best available transcript right now — committed words plus the live
-   * tentative tail — WITHOUT running another Whisper pass. The streaming loop
-   * has already transcribed the utterance incrementally, so this is what the
-   * turn-end path uses to skip a redundant multi-second finalize.
-   */
-  bestText(): string {
-    return `${this.committed} ${this.tentativeText}`.trim();
+  /** Best streaming hypothesis paired with the decoder scores that produced it. */
+  bestResult(): { text: string; confidence: ASRConfidence | null } {
+    return {
+      text: `${this.committed} ${this.tentativeText}`.trim(),
+      confidence: this.latestConfidence,
+    };
   }
 
   get lastChange(): number {
@@ -133,31 +136,36 @@ export class StreamingTranscriber {
     this.prevWords = [];
     this.committedWords = [];
     this.tentativeText = "";
+    this.latestConfidence = null;
     this.lastChangeAt = performance.now();
   }
 
-  /**
-   * One final pass over the whole current window, returning the best text.
-   * Used when the policy closes a user turn.
-   */
-  async finalize(): Promise<string> {
+  /** One final pass over the whole current window. */
+  async finalize(): Promise<{
+    text: string;
+    confidence: ASRConfidence | null;
+  }> {
+    const fallback = this.bestResult();
     const samples = this.windowSamples();
     if (samples.length < SAMPLE_RATE * (this.opts.minWindowSec ?? 0.2)) {
-      return this.committed.trim();
+      return fallback;
     }
     // Wait out any in-flight streaming pass so the final pass actually runs
     // (the recognizer allows one transcription at a time).
     for (let waited = 0; this.asr.isBusy && waited < 2_000; waited += 50) {
       await sleep(50);
     }
-    let hyp = "";
+    let result: ASRResult;
     try {
-      hyp = await this.asr.transcribe(samples, samples.length / SAMPLE_RATE);
+      result = await this.asr.transcribeWithConfidence(
+        samples,
+        samples.length / SAMPLE_RATE,
+      );
     } catch {
-      return this.committed.trim();
+      return fallback;
     }
-    const filtered = this.filterEcho(hyp);
-    return filtered.trim() || this.committed.trim();
+    const filtered = this.filterEcho(result.text).trim();
+    return filtered ? { text: filtered, confidence: result.confidence } : fallback;
   }
 
   private windowSamples(): Float32Array {
@@ -188,9 +196,12 @@ export class StreamingTranscriber {
         continue;
       }
 
-      let hyp = "";
+      let result: ASRResult;
       try {
-        hyp = await this.asr.transcribe(samples, samples.length / SAMPLE_RATE);
+        result = await this.asr.transcribeWithConfidence(
+          samples,
+          samples.length / SAMPLE_RATE,
+        );
       } catch {
         // Busy or transient error; back off and retry.
         await sleep(minInterval);
@@ -200,15 +211,15 @@ export class StreamingTranscriber {
       // Discard results from a pass over a window that has since been reset.
       if (passGeneration !== this.generation) continue;
 
-      this.ingest(hyp);
+      this.ingest(result);
 
       const elapsed = performance.now() - passStart;
       if (elapsed < minInterval) await sleep(minInterval - elapsed);
     }
   }
 
-  private ingest(hypothesis: string): void {
-    const filtered = this.filterEcho(hypothesis);
+  private ingest(result: ASRResult): void {
+    const filtered = this.filterEcho(result.text);
     const words = displayWords(filtered);
 
     // LocalAgreement-2: the longest common word-prefix of the previous and
@@ -225,6 +236,7 @@ export class StreamingTranscriber {
 
     this.committedWords = committedWords;
     this.tentativeText = tentative;
+    this.latestConfidence = result.confidence;
     this.prevWords = words;
 
     this.onUpdate({

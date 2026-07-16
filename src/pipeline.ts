@@ -18,7 +18,7 @@ import { TUNABLES } from "./tunables";
 
 import {
   decodeTranscriptTokens,
-  sampleGreedy,
+  sampleGreedyWithScore,
 } from "./asr/decoding";
 import { whisperLogMel } from "./asr/features";
 import {
@@ -69,6 +69,16 @@ export type DownloadProgress = {
 
 export type ProgressFn = (progress: DownloadProgress) => void;
 
+export type ASRConfidence = {
+  /** Mean top-two normalized log probability for decoded text tokens only. */
+  avgLogProb: number | null;
+};
+
+export type ASRResult = {
+  text: string;
+  confidence: ASRConfidence;
+};
+
 // base.en over tiny.en: tiny is the most hallucination-prone Whisper size (it
 // invents "thank you" / repeats on near-silence and garbles fast speech), and
 // base is markedly more accurate for ~+70 MB. On WebGPU a pass is still well
@@ -79,9 +89,11 @@ const WHISPER_CONFIG: WhisperConfig = WHISPER_MODELS.find(
 const ASR_MAX_NEW_TOKENS = 96;
 
 const TTS_WEIGHTS_URL =
-  "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/pocket-tts-decode-fp16.safetensors";
 const TTS_HF_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
+const WHISPER_Q8_URL =
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/whisper-base.en-q8r.safetensors";
 
 export const TTS_VOICES = [
   "alba",
@@ -103,6 +115,9 @@ const SYSTEM_HINT =
   "You are a warm, helpful voice assistant. Answer the user's question or " +
   "message directly in one or two short spoken sentences. A [scene: …] tag " +
   "tells you what the camera sees. Do not read any bracketed tag aloud.";
+const MEMORY_HINT =
+  "A [memory: …] tag contains relevant facts the user explicitly shared earlier. " +
+  "Use those facts to answer the current message and do not read the tag aloud.";
 
 export async function fetchWithProgress(
   name: string,
@@ -157,11 +172,21 @@ export class SpeechRecognizer {
     // at the download. Null both locals so this async frame (long-lived: the
     // three model loads run concurrently under Promise.all) can't keep the
     // buffer reachable a moment longer than model construction.
-    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
-      `Whisper ${WHISPER_CONFIG.label} weights`,
-      hfWhisperUrl("model.safetensors"),
-      onProgress,
-    );
+    let data: Uint8Array<ArrayBuffer> | null;
+    try {
+      data = await fetchWithProgress(
+        `Whisper ${WHISPER_CONFIG.label} weights (int8)`,
+        WHISPER_Q8_URL,
+        onProgress,
+      );
+    } catch (error) {
+      console.warn("int8 Whisper download failed, falling back to fp16", error);
+      data = await fetchWithProgress(
+        `Whisper ${WHISPER_CONFIG.label} weights`,
+        hfWhisperUrl("model.safetensors"),
+        onProgress,
+      );
+    }
     let weights: safetensors.File | null = safetensors.parse(data);
     data = null; // views inside `weights` keep the buffer alive until upload
     const model = await whisperFromSafetensors(
@@ -187,7 +212,7 @@ export class SpeechRecognizer {
    */
   async warmup(): Promise<void> {
     try {
-      await this.transcribe(new Float32Array(16_000), 1);
+      await this.transcribeWithConfidence(new Float32Array(16_000), 1);
     } catch {
       // Warmup is best-effort; a failure here just means the first real pass
       // pays the compilation cost.
@@ -272,8 +297,15 @@ export class SpeechRecognizer {
     };
   }
 
-  /** Transcribe 16 kHz mono PCM samples to text. */
-  async transcribe(samples: Float32Array, duration: number): Promise<string> {
+  /**
+   * Transcribe and expose confidence from the decoder's selected-token logits.
+   * The clarification policy is controlled separately by
+   * `asrConfidenceThreshold`; this method never changes decoded text.
+   */
+  async transcribeWithConfidence(
+    samples: Float32Array,
+    duration: number,
+  ): Promise<ASRResult> {
     if (this.busy) {
       throw new Error("SpeechRecognizer is already transcribing");
     }
@@ -320,29 +352,43 @@ export class SpeechRecognizer {
       }
 
       const generated: number[] = [];
+      let textLogProbTotal = 0;
+      let textTokenCount = 0;
       for (let i = 0; i < ASR_MAX_NEW_TOKENS; i++) {
         const sampledLogits = logits;
         if (!sampledLogits) throw new Error("Decoder logits were not ready");
         logits = null;
-        const next = await sampleGreedy(
+        const sample = await sampleGreedyWithScore(
           sampledLogits,
           generated,
           duration,
           config,
         );
-        if (next === config.eosToken) break;
-        generated.push(next);
+        sampledLogits.dispose();
+        if (sample.token < config.eosToken) {
+          textLogProbTotal += sample.logProb;
+          textTokenCount++;
+        }
+        if (sample.token === config.eosToken) break;
+        generated.push(sample.token);
         logits = runWhisperDecoderStep(
           this.model.decoder,
           crossKV,
           state,
-          next,
+          sample.token,
           config,
           device,
         );
       }
 
-      return decodeTranscriptTokens(generated, this.tokenizer, config).trim();
+      return {
+        text: decodeTranscriptTokens(generated, this.tokenizer, config).trim(),
+        confidence: {
+          avgLogProb: textTokenCount
+            ? textLogProbTotal / textTokenCount
+            : null,
+        },
+      };
     } finally {
       logits?.dispose();
       encoded?.dispose();
@@ -492,6 +538,18 @@ const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
 const SMOLLM_Q8_URL = `${SMOLLM_BASE}/smollm2-360m-it-q8r.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
 const SMOLLM_REPEAT_PENALTY = 1.3;
+// KV capacity every turn's state is created with. jax-js traces key on
+// shapes, and the KV capacity is one of them: with the default 512-block
+// growth, the first prompt to cross 512 tokens re-traced all 32 prefill
+// layer jits AND the big fused decode jit mid-conversation — a one-time
+// multi-second stall (observed up to 8-16 s) exactly when history gets
+// long. 1536 covers the windowed prompt (llmMaxHistoryTurns caps it well
+// under this) + a full reply, so a session only ever sees ONE capacity
+// shape, and warmup() pre-traces it at load. Cost: ~126 MB KV vs ~42 MB at
+// 512 — one state exists at a time and is disposed per turn.
+// ensureSmolLmStateCapacity still guards the pathological over-1536 prompt
+// (it grows and pays a re-trace rather than crashing).
+const SMOLLM_KV_CAPACITY = 1536;
 const EMPTY_SET: ReadonlySet<number> = new Set<number>();
 const SMOLLM_IM_START = 1; // <|im_start|>
 const SMOLLM_IM_END = 2; // <|im_end|> — ends the assistant turn
@@ -514,10 +572,10 @@ const SMOLLM_GARBLE_CLAUSE =
   "catch that and ask them to say it again.";
 // MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
 // doesn't follow the instruction). Small models imitate demonstrations far
-// better than they follow rules, so the tunable also injects ONE few-shot
-// exemplar exchange (the conversation-quality diagnosis's Tier-2 design:
-// "system-prompt repair clause + 1 few-shot exemplar") ahead of the real
-// history. Kept to a single pair: every exemplar token is prefill cost on
+// better than they follow rules, so the tunable also injects two few-shot
+// exemplar exchanges (the conversation-quality diagnosis's Tier-2 design:
+// "system-prompt repair clause + few-shot exemplars") ahead of the real
+// history. Kept to two pairs: every exemplar token is prefill cost on
 // every turn.
 const SMOLLM_GARBLE_EXEMPLAR: ChatMessage[] = [
   { role: "user", content: "the it about when for Tuesday the", t: 0 },
@@ -526,8 +584,16 @@ const SMOLLM_GARBLE_EXEMPLAR: ChatMessage[] = [
     content: "Sorry, I didn't catch that — could you say it again?",
     t: 0,
   },
+  // Second demonstration (cycle 11): a second clarify pair gives the model
+  // more exposure to the target pattern and improves asksClarify on garbled
+  // holdout items without adding a context/brevity exemplar.
+  { role: "user", content: "and then the weather brick soon over it", t: 0 },
+  {
+    role: "assistant",
+    content: "Hmm, that didn't come through clearly — mind repeating it?",
+    t: 0,
+  },
 ];
-
 type SmolLmTokenizerData = {
   encoder: Record<string, number>;
   special: Record<string, number>;
@@ -596,10 +662,36 @@ export class SmolLmChatModel implements ChatModel {
 
   async warmup(): Promise<void> {
     try {
+      // One real (tiny) generation first: traces the decode step at the
+      // session's single KV capacity plus the smallest prefill bucket.
       const stream = this.generateStream([{ role: "user", content: "Hi" }], 2);
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       for await (const _ of stream) {
         /* drain */
+      }
+      // Pre-trace the prefill shapes a session actually reaches as history
+      // grows (T = one bucket, two, three). Without this, each new bucket's
+      // first encounter re-traced 32 layer jits mid-conversation (~0.5-1 s
+      // added to that turn — the "delays grow with history" report). ~2-3 s
+      // of one-time load cost buys re-trace-free conversations.
+      const bucket = TUNABLES.llmPrefillBucket;
+      if (bucket > 0) {
+        const filler = this.tokenizer.encode(
+          " tell me a little more about the ocean and the weather today",
+        );
+        for (const target of [bucket * 2, bucket * 3]) {
+          const tokens = this.encodePrompt([{ role: "user", content: "Hi" }]);
+          while (tokens.length < target) tokens.push(...filler);
+          tokens.length = target - 1; // bucket pad brings it to `target`
+          const state = createSmolLmState({
+            dtype: np.float16,
+            capacity: SMOLLM_KV_CAPACITY,
+          });
+          const logits = this.runBucketedPrefill(tokens, state);
+          await blockUntilReady(logits.ref);
+          logits.dispose();
+          tree.dispose(state);
+        }
       }
     } catch {
       // Best-effort; a failure just means the first real turn pays JIT cost.
@@ -621,12 +713,20 @@ export class SmolLmChatModel implements ChatModel {
     // System string is assembled HERE (not at module scope) so the garble
     // clause reflects the tunable's value at generation time — the quality
     // bench flips it per-session without reloading the model.
-    turn(
-      "system",
-      TUNABLES.qualityGarbleClause
-        ? `${SMOLLM_SYSTEM} ${SMOLLM_GARBLE_CLAUSE}`
-        : SMOLLM_SYSTEM,
-    );
+    const hasMemory =
+      TUNABLES.qualityTypedMemory &&
+      history.some(
+        (message) =>
+          message.role === "user" && message.content.includes("[memory:"),
+      );
+    const system = [
+      SMOLLM_SYSTEM,
+      TUNABLES.qualityGarbleClause ? SMOLLM_GARBLE_CLAUSE : "",
+      hasMemory ? MEMORY_HINT : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    turn("system", system);
     // One demonstrated clarify exchange (see SMOLLM_GARBLE_EXEMPLAR): the
     // clause alone was inert on this model size; the exemplar is what
     // actually teaches the behavior. Injected before the real history so
@@ -635,7 +735,11 @@ export class SmolLmChatModel implements ChatModel {
     // showed the exemplar can leak a clarify onto them ("What am I sitting
     // on?" → "couldn't quite follow").
     const lastUser = [...history].reverse().find((m) => m.role === "user");
-    if (TUNABLES.qualityGarbleClause && !lastUser?.content.includes("[scene:")) {
+    if (
+      TUNABLES.qualityGarbleClause &&
+      !lastUser?.content.includes("[scene:") &&
+      !lastUser?.content.includes("[memory:")
+    ) {
       for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
     }
     for (const message of windowHistory(history)) {
@@ -667,7 +771,7 @@ export class SmolLmChatModel implements ChatModel {
 
   private getBannedFormatIds(): Set<number> {
     if (this.bannedFormatIds) return this.bannedFormatIds;
-    const junk = /[[\]*#`]/;
+    const junk = /[[\]*#`•\r\n]|^\s*\d+[.)]\s*$/;
     const banned = new Set<number>();
     for (const id of this.tokenizer.decoder.keys()) {
       if (junk.test(this.tokenizer.decode([id]))) banned.add(id);
@@ -843,7 +947,7 @@ export class SmolLmChatModel implements ChatModel {
 
     const times: number[] = [];
     for (let r = 0; r < runs; r++) {
-      const state = createSmolLmState({ dtype: np.float16 });
+      const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
       const t0 = performance.now();
       const logits = this.runBucketedPrefill(tokens, state, bucket);
       await blockUntilReady(logits.ref);
@@ -881,7 +985,7 @@ export class SmolLmChatModel implements ChatModel {
     tokens.length = nTokens;
 
     const readLogits = async (b: number): Promise<Float32Array> => {
-      const state = createSmolLmState({ dtype: np.float16 });
+      const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
       const logits = this.runBucketedPrefill(tokens, state, b);
       // astype consumes `logits` (move semantics); data() drains the result.
       const data = new Float32Array(await logits.astype(np.float32).data());
@@ -933,7 +1037,7 @@ export class SmolLmChatModel implements ChatModel {
     let firstTokenMs = 0;
     let emitted = "";
 
-    const state = createSmolLmState({ dtype: np.float16 });
+    const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
     let pending: np.Array | null = this.runBucketedPrefill(promptTokens, state);
     let pendingIsCombined = false;
 
@@ -1014,7 +1118,18 @@ export class CerebrasChatModel implements ChatModel {
         body: JSON.stringify({
           model: this.modelName,
           messages: [
-            { role: "system", content: SYSTEM_HINT },
+            {
+              role: "system",
+              content:
+                TUNABLES.qualityTypedMemory &&
+                history.some(
+                  (message) =>
+                    message.role === "user" &&
+                    message.content.includes("[memory:"),
+                )
+                  ? `${SYSTEM_HINT} ${MEMORY_HINT}`
+                  : SYSTEM_HINT,
+            },
             ...history.map((m) => ({
               role: m.role,
               content:

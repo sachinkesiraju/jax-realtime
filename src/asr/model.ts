@@ -586,7 +586,32 @@ function tensorToArray(
   tensor: safetensors.Tensor,
   dtype: np.DType,
   device?: Device,
+  scale?: safetensors.Tensor,
 ): np.Array {
+  if (tensor.dtype === "I8") {
+    if (
+      tensor.shape.length !== 2 ||
+      scale?.dtype !== "F32" ||
+      scale.shape.length !== 1 ||
+      scale.shape[0] !== tensor.shape[0]
+    ) {
+      throw new Error("Invalid quantized Whisper tensor");
+    }
+    const [rows, cols] = tensor.shape;
+    const quantized = tensor.data as Int8Array<ArrayBuffer>;
+    const scales = scale.data as Float32Array<ArrayBuffer>;
+    const values = dtype === np.float32
+      ? new Float32Array(quantized.length)
+      : new Float16Array(quantized.length);
+    for (let row = 0; row < rows; row++) {
+      const rowScale = scales[row];
+      const offset = row * cols;
+      for (let col = 0; col < cols; col++) {
+        values[offset + col] = quantized[offset + col] * rowScale;
+      }
+    }
+    return np.array(values, { shape: tensor.shape, dtype, device });
+  }
   if (tensor.dtype === "F16") {
     if (dtype === np.float32) {
       return np.array(
@@ -624,7 +649,13 @@ export async function fromSafetensors(
 ): Promise<WhisperModel> {
   const hydrated: Record<string, np.Array> = {};
   for (const [key, tensor] of Object.entries(file.tensors)) {
-    hydrated[mapper.mapKey(key)] = tensorToArray(tensor, dtype, device);
+    if (key.endsWith(".scale")) continue;
+    hydrated[mapper.mapKey(key)] = tensorToArray(
+      tensor,
+      dtype,
+      device,
+      file.tensors[`${key}.scale`],
+    );
   }
 
   const model = safetensors.toNested(hydrated) as WhisperModel;

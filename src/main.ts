@@ -3,7 +3,14 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/600.css";
 import "./style.css";
 
-import { DuplexSession } from "./duplex";
+import { DuplexSession, isGarbledTranscript } from "./duplex";
+import {
+  type ConversationalMemory,
+  directMemoryAnswer,
+  injectMemoryTag,
+  relevantMemoryFacts,
+  rememberUserFacts,
+} from "./memory";
 import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
@@ -90,7 +97,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~790&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~640&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
@@ -103,14 +110,11 @@ app.innerHTML = `
         <button id="load-btn" class="load-btn">Load models</button>
         <div class="dock-side">
           <span id="backend-chip" class="backend-chip">WebGPU</span>
-          <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
-            <!-- checked (Eye defaults ON) and NOT disabled: the toggle must be
-                 usable BEFORE "Load models", because D-FINE is loaded lazily —
-                 unchecking here means its 42 MB download + GPU residency never
-                 happen (handleLoad only auto-enables when still checked).
-                 Toggling pre-load is safe: enableVision no-ops without a
-                 pipeline, disableVision is idempotent. -->
-            <input type="checkbox" id="eye-toggle" checked />
+          <label class="field eye-toggle" title="Optional webcam object detection (D-FINE).">
+            <!-- The toggle is usable before "Load models" because D-FINE is
+                 loaded lazily. Enabling it opts into the separate 42 MB model;
+                 leaving it off avoids that download and GPU residency. -->
+            <input type="checkbox" id="eye-toggle" />
             <span>Eye &middot; webcam</span>
           </label>
           <label class="field">
@@ -222,6 +226,18 @@ if (import.meta.env.DEV) {
   dev.__turnLog = TURN_LOG;
   dev.__pipeline = () => pipeline;
   dev.__detectTool = detectTool;
+  dev.__garbleProbe = isGarbledTranscript;
+  dev.__memoryProbe = (turns: string[], query: string) => {
+    let memory: ConversationalMemory = {};
+    turns.forEach((turn, index) => {
+      memory = rememberUserFacts(memory, turn, index + 1);
+    });
+    const facts = relevantMemoryFacts(memory, query, turns.length + 1);
+    return {
+      prompt: injectMemoryTag(query, facts),
+      answer: directMemoryAnswer(facts, query),
+    };
+  };
 }
 
 function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idle") {
@@ -352,13 +368,8 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
-    // NOTE: D-FINE is deliberately NOT preloaded here anymore. The old
-    // unconditional preload meant the 42 MB download + GPU residency happened
-    // even when the user had already unchecked the Eye or the camera would be
-    // denied — pure waste for a stage that enableVision() can lazy-load on
-    // demand anyway. The auto-enable at the bottom of this function (fires
-    // only while the toggle is still checked) drives that existing lazy path,
-    // which shows the same progress rows + "loading D-FINE detector" status.
+    // Respect a pre-load Eye opt-in after WebGPU initialization.
+    if (el.eyeToggle.checked) void toggleVision(true);
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
@@ -377,16 +388,6 @@ async function handleLoad() {
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
-    // Auto-enable the Eye (default ON) — but only if the user hasn't already
-    // unchecked it, and NOT awaited: "ready" must never block on the detector.
-    // toggleVision(true) drives enableVision's lazy path, which asks for the
-    // camera FIRST and only then downloads + warms D-FINE (with its own
-    // progress rows), so a denied camera or an unchecked toggle means the
-    // 42 MB detector never touches the network or the GPU. This must run
-    // AFTER loadPipeline: enableVision constructs the ONNX detector, and
-    // doing that before initDevice() has set up the WebGPU backend breaks
-    // detection silently.
-    if (el.eyeToggle.checked) void toggleVision(true);
   } catch (error) {
     console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");

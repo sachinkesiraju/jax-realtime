@@ -5,6 +5,14 @@
 // wasm (when available) so it can transcribe while the assistant speaks.
 
 import { StreamingTranscriber, type StreamingUpdate } from "./asr/streaming";
+import {
+  directMemoryAnswer,
+  injectMemoryTag,
+  type ConversationalMemory,
+  type MemoryFact,
+  relevantMemoryFacts,
+  rememberUserFacts,
+} from "./memory";
 import { VoiceCapture } from "./mic";
 import { analyserLevel } from "./orb";
 import type {
@@ -221,6 +229,10 @@ export class DuplexSession {
   private running = false;
 
   readonly history: ChatMessage[] = [];
+
+  private conversationalMemory: ConversationalMemory = {};
+  private memoryTurn = 0;
+  private pendingMemoryFacts: MemoryFact[] = [];
 
   private phase: Phase = "listening";
   private respondingSince = 0; // perf.now() when the current reply began (watchdog)
@@ -584,12 +596,12 @@ export class DuplexSession {
     // utterance incrementally, so prefer its result and skip the extra
     // multi-second Whisper finalize pass that used to dominate turn latency.
     // Only fall back to finalize() when streaming hasn't caught up (short/empty).
-    let text = transcriber.bestText();
+    let { text, confidence } = transcriber.bestResult();
     if (displayWordCount(text) < 3) {
       this.turnMarks.usedBestText = false;
       this.cb.onStageActivity("asr", true);
       try {
-        text = await transcriber.finalize();
+        ({ text, confidence } = await transcriber.finalize());
       } catch (error) {
         this.cb.onError(error);
       } finally {
@@ -598,6 +610,7 @@ export class DuplexSession {
     }
     this.turnMarks.transcriptReady = performance.now();
     this.turnMarks.transcript = text;
+    this.turnMarks.asrAvgLogProb = confidence?.avgLogProb ?? undefined;
     const asrLagMs = performance.now() - endOfSpeechAt;
 
     if (!this.running) return;
@@ -607,16 +620,59 @@ export class DuplexSession {
       this.startFreshListening();
       return;
     }
-    if (isDegenerateTranscript(text)) {
+    const confidenceThreshold = TUNABLES.asrConfidenceThreshold;
+    if (
+      confidenceThreshold !== null &&
+      confidence?.avgLogProb !== null &&
+      confidence?.avgLogProb !== undefined &&
+      confidence.avgLogProb < confidenceThreshold
+    ) {
+      this.cb.onEvent(
+        `asr · low confidence ${confidence.avgLogProb.toFixed(2)}, asking for a repeat`,
+      );
+      this.startFreshListening();
+      void this.speakProactive("Sorry, I didn't catch that — could you say it again?");
+      return;
+    }
+    if (isGarbledTranscript(text)) {
       // Whisper repetition loop ("All in all. All in all. …") — a decoder
       // artifact, not something the user said. Never answer it.
-      this.cb.onEvent("asr · garbled, discarded");
+      this.cb.onEvent("asr · garbled, asking for a repeat");
       this.startFreshListening();
+      void this.speakProactive("Sorry, I didn't catch that — could you say it again?");
       return;
     }
 
     this.cb.onMetric({ asrLagMs });
     this.cb.onUserTurn(text);
+
+    this.memoryTurn++;
+    if (TUNABLES.qualityTypedMemory) {
+      this.pendingMemoryFacts = relevantMemoryFacts(
+        this.conversationalMemory,
+        text,
+        this.memoryTurn,
+      );
+      this.conversationalMemory = rememberUserFacts(
+        this.conversationalMemory,
+        text,
+        this.memoryTurn,
+      );
+    } else {
+      this.pendingMemoryFacts = [];
+    }
+
+    const rememberedReply = directMemoryAnswer(this.pendingMemoryFacts, text);
+    if (rememberedReply) {
+      this.cb.onEvent("memory · answering from explicit user facts");
+      this.history.push({ role: "user", content: text, t: this.elapsed() });
+      this.capture.clear();
+      transcriber.reset();
+      this.resetUtterance();
+      this.startFreshListening();
+      void this.speakProactive(rememberedReply);
+      return;
+    }
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
     // questions (count, colour, "what do you see") are answered directly from
@@ -645,16 +701,25 @@ export class DuplexSession {
     this.history.push({ role: "user", content, t: this.elapsed() });
     this.maybeScheduleTimer(text);
 
-    // Fresh audio window for the response phase: barge-in detection must see
-    // only NEW committed words (spoken over the reply), not this turn's.
-    this.capture.clear();
+    // Fresh response-phase capture: ASR must see only NEW speech over this
+    // reply, not the completed turn. With pre-roll enabled the mic buffer is a
+    // strict rolling tail for the whole reply period; a barge-in hands that
+    // tail to the next growing utterance instead of retaining old reply echo.
+    if (TUNABLES.bargePreRollMs > 0) {
+      this.capture.startPreRoll(TUNABLES.bargePreRollMs);
+    } else {
+      this.capture.clear();
+    }
     transcriber.reset();
     this.resetUtterance();
 
     // Two-tier path: a tool intent runs as a background task while the fast
     // model stays present. Only one background task at a time; if one is
     // already running, fall through to a normal reply.
-    let tool = this.backgroundTask ? null : detectTool(text);
+    let tool =
+      this.backgroundTask || this.pendingMemoryFacts.length
+        ? null
+        : detectTool(text);
     // Eye-as-oracle for lookups: when the lookup subject names something the
     // camera can currently see ("what is the person doing"), the turn is about
     // the scene, not the web — drop the tool so the scene-grounded LLM answers.
@@ -729,7 +794,18 @@ export class DuplexSession {
 
     try {
       const model = this.getModel();
-      const stream = model.generateStream(this.history);
+      const promptHistory = this.history.map((message, index) =>
+        TUNABLES.qualityTypedMemory &&
+        this.pendingMemoryFacts.length > 0 &&
+        index === this.history.length - 1 &&
+        message.role === "user"
+          ? {
+              ...message,
+              content: injectMemoryTag(message.content, this.pendingMemoryFacts),
+            }
+          : message,
+      );
+      const stream = model.generateStream(promptHistory);
       const sentences = this.sentenceStream(stream, state);
 
       this.cb.onStageActivity("tts", true);
@@ -782,6 +858,7 @@ export class DuplexSession {
         fired: this.turnMarks.fired ?? 0,
         transcriptReady: this.turnMarks.transcriptReady ?? 0,
         usedBestText: this.turnMarks.usedBestText ?? true,
+        asrAvgLogProb: this.turnMarks.asrAvgLogProb,
         firstDelta: this.turnMarks.firstDelta ?? 0,
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
@@ -907,9 +984,17 @@ export class DuplexSession {
     this.bargeAt = now;
     this.assistant?.controller.abort();
     this.cb.onEvent("barge-in · stopping");
-    // The interrupting speech is already being captured & transcribed (echo
-    // cancellation keeps our own playback out of the buffer), so treat it as a
-    // fresh user utterance already in progress — don't clear it.
+    // The interrupting speech is already in the bounded response pre-roll.
+    // Hand that exact tail to the normal growing utterance buffer: this keeps
+    // the words spoken during the detector's two-tick reaction time but old
+    // reply-period capture has already rolled off continuously. Reset ASR too,
+    // invalidating any in-flight pass over the pre-handoff response window and
+    // discarding stale echo-filtered commit state before teardown disarms the
+    // assistant-text echo filter. With 0, preserve the old behavior for A/B.
+    if (TUNABLES.bargePreRollMs > 0) {
+      this.capture.handoffPreRoll();
+      this.transcriber?.reset();
+    }
     this.phase = "listening";
     this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
     this.silenceStart = 0;
@@ -1113,11 +1198,6 @@ export class DuplexSession {
   }
 }
 
-/**
- * Index just after a sentence-ending punctuation that is followed by
- * whitespace, or -1. Requiring a trailing whitespace avoids flushing on
- * decimals like "3.14" mid-stream; the end-of-stream tail is flushed separately.
- */
 /** Count whitespace-separated word tokens in a transcript string. */
 function displayWordCount(text: string): number {
   const trimmed = text.trim();
@@ -1130,17 +1210,33 @@ function displayWordCount(text: string): number {
  * is a decode artifact, not speech — a real utterance of ≥6 words has far more
  * lexical variety. Signal-based (a repetition statistic), no phrase lists.
  */
-function isDegenerateTranscript(text: string): boolean {
-  const tokens = text
+function transcriptTokens(text: string): string[] {
+  return text
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, "")
     .split(/\s+/)
     .filter(Boolean);
-  if (tokens.length < 6) return false;
-  const unique = new Set(tokens).size;
-  return unique / tokens.length < 0.4;
 }
 
+export function isGarbledTranscript(text: string): boolean {
+  const tokens = transcriptTokens(text);
+  if (tokens.length < 6) return false;
+  if (new Set(tokens).size / tokens.length < 0.4) return true;
+  for (let i = 1; i < tokens.length; i++) {
+    if (tokens[i] === tokens[i - 1]) return true;
+  }
+  const trigrams = new Set<string>();
+  for (let i = 0; i <= tokens.length - 3; i++) {
+    const trigram = tokens.slice(i, i + 3).join(" ");
+    if (trigrams.has(trigram)) return true;
+    trigrams.add(trigram);
+  }
+  return /\b(?:the|a|an)\s+(?:with|about|for|to)\s+(?:about|with|for|to)\b/i.test(
+    text,
+  );
+}
+
+/** Sentence-ending punctuation followed by whitespace; skips decimals. */
 function findSentenceEnd(buffer: string): number {
   for (let i = 0; i < buffer.length - 1; i++) {
     const c = buffer[i];

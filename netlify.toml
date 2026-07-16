@@ -1,0 +1,18 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 8 requires a modern Node; pin it so builds don't fall back to an older default.
+  NODE_VERSION = "22"
+
+# jax-js's wasm backend multithreads via SharedArrayBuffer, which browsers only
+# expose when the document is cross-origin isolated. Serve every response with
+# COOP/COEP so the deployed site is isolated the same way the dev server is.
+# HuggingFace weight downloads are CORS-enabled, so they keep working under
+# require-corp.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"

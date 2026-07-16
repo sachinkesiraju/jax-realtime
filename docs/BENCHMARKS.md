@@ -606,6 +606,37 @@ Mac sleeps — CoreAudio wedges (`AudioQueueStart -66681`, even `afplay`
 fails) and `sudo killall coreaudiod` revives it. A wedged run is detectable
 by zero turns AND zero discards on a clip that should produce either.
 
+## Cycle 8 — growing-history delays, realtime feel, reply brevity
+
+Field report: "weird delays, especially as message history grows — one turn
+hit 8 s", plus "convos feel low quality / voice responses don't feel
+realtime". Reproduced (14-turn defaults session): llmFirst oscillated
+300 → 1036 ms with history growth. Two re-trace mechanisms:
+1. **KV capacity crossing** — the first prompt past 512 tokens grew the KV
+   cache 512 → 1024, re-tracing all 32 prefill layer jits (capacity is a
+   static trace key) AND the big fused decode jit mid-conversation: the
+   multi-second (~8 s observed) one-time stall.
+2. **Bucket churn** — 64-token prefill buckets meant a new shape (~0.5–1 s
+   first-encounter re-trace) every couple of turns while history grew.
+
+Shipped fixes, all validated on a 14-turn defaults session:
+- `SMOLLM_KV_CAPACITY = 1536` — one KV shape for the whole session (no
+  crossing; ensureSmolLmStateCapacity still guards pathological prompts).
+  Cost ~126 MB vs ~42 MB, one state at a time.
+- `llmPrefillBucket` 64 → 256 — at most ~5 prefill shapes/session; warmup()
+  now pre-traces the first three buckets + the decode shape at load (~2-3 s
+  one-time).
+- Result: llmFirst flat (288–689 ms, no spikes), warm turnLat median
+  1511 ms, max 1768 ms across 14 turns.
+- `onsetFiller` ON — first sound now lands 435–602 ms after end of speech,
+  every turn (the "doesn't feel realtime" fix). The cycle-3 ears gate moves
+  to production listening: flip off if the filler-then-pause cadence sounds
+  worse than silence.
+- `llmMaxNewTokens` 96 → 64 — reply brevity: quality bench shortSpoken
+  3/9 → **8/9** MAP, 3/6 → **5/6** holdout, with every other axis flat or
+  better (asksClarify 7/9, noFalseClarify 9/9, format 42/42, correct 8/9 on
+  MAP; holdout `correct` wobble is the known spider-legs item noise).
+
 ## Branch-vs-main head-to-head (pre-merge verification)
 
 Shipped-vs-shipped comparison of this branch against `main` (Gemma-era,
@@ -640,6 +671,101 @@ of garbled input, and went 0-for-6 on the holdout factual/scene items. The
 branch's only regression axis: GPU weight residency (SmolLM fp16 724 MB vs
 Gemma 536 MB, +188 MB) — the cost of the bigger brain.
 
+## Cycle 11 — prompt exemplars for brevity and coreference (REVERTED)
+
+Tested two few-shot exemplars on top of the shipped 2-garble clarify pair:
+`SMOLLM_BREVITY_EXEMPLAR` (a short answer to "What are some good ways to relax
+after work?") and `SMOLLM_CONTEXT_EXEMPLAR` (a cat-named-Mochi coreference
+exchange). MAP (n=8 runs) looked good — `shortSpoken` 24/24 and `staysOnTopic`
+36/48 — but holdout (n=8 runs) rejected the combination:
+
+| axis | base holdout (2-garble only) | G8 holdout (+ brevity/context) |
+| --- | --- | --- |
+| noMarkdown | 93/96 | **96/96** |
+| asksClarify (garbled) | 7/16 | **9/16** |
+| noFalseClarify | 38/40 | **39/40** |
+| shortSpoken | 15/16 | **16/16** |
+| staysOnTopic (flow) | **17/24** | 10/24 |
+| correct (factual/scene) | **8/16** | 4/16 |
+
+The brevity/context examples leak: the "Mochi" cat name bleeds into unrelated
+name-memory flow items, the "relax" example leaks onto garbled/factual
+single-turns, and the model produces generic non-answers on the holdout food and
+sister-Maria flow items. Net: `correct` and `staysOnTopic` regress enough that
+the simpler 2-garble clarify pair is the safer baseline. `qualityBrevityExemplar`
+and `qualityContextExemplar` were removed; the 2-garble pair was kept.
+
+## Cycle 12 — conversation memory and deterministic garble handling
+
+Typed conversational memory stores only bounded, explicitly stated facts,
+retrieves only query-relevant kinds, and injects them ephemerally. Exact recall
+questions bypass small-model guessing. The eight-run holdout scored **45/48**;
+all sister, dog, and dinner flow items passed, with the three misses confined to
+unrelated stochastic factual baselines.
+
+A structural/repetition transcript gate moved garble handling to the correct
+deterministic boundary. It caught all three MAP garbles and rejected none of
+five clean controls. Unlike another prompt example, it adds no prefill tokens
+and cannot leak a clarification style into unrelated answers.
+
+The final conversation-first configuration (SmolLM + typed memory + garble
+gate), over two runs, scored MAP `asksClarify` 6/6, `noFalseClarify` 18/18,
+and format 40/40. Adding bounded trip-food and new-instrument follow-ups raised
+MAP flow from 8/12 to **12/12**; holdout flow remained **6/6**.
+
+The Pocket TTS artifact included a Mimi audio encoder, encoder transformer, and
+downsampler that synthesis never reads and previously disposed on every decode.
+Removing only those tensors reduced the checkpoint from 235.7 MB to **200.5 MB**
+(−35.2 MB). All 170 retained tensors are bit-identical, and the remote-backed
+browser synthesis probe completed at 0.29× realtime with the same fixed seed.
+
+Richer scene tracking passed deterministic scene tests 7/7 but did not improve
+semantic scene answers, so it was removed. The retained changes improve
+conversation while reducing model downloads and GPU residency.
+
+## Cycle 13 — signal confidence, interruption hygiene, and compact ears
+
+Six candidates were isolated against pre-registered paired gates. Four survived:
+
+| candidate | MAP result | holdout / cost guard | verdict |
+| --- | --- | --- | --- |
+| ASR confidence | failed-audio clarifications 0/2 → **2/2**; 0/6 false clarifications | 0/1 → **1/1** failed-audio clarification; 0/2 false clarifications; pooled latency −4.05% | **keep** |
+| 1.2 s barge pre-roll | old reply markers removed; all interruption markers retained | exact-bound probe passed; bound-transition overhead far below 50 ms | **keep** |
+| correction-turn tag | correction accuracy **3/6 → 3/6** | 1/2 → 2/2, but MAP did not improve and meta-language leaked | reject |
+| Whisper per-row int8 | paired transcripts and WER unchanged | paired holdout transcripts unchanged; worst median latency delta +3.35% | **keep** |
+| FlowLM per-row int8 | saved 89.6 MB | one fixed-seed phrase lost 3 frames / 240 ms | reject |
+| Eye off by default | no detector request on default load | pre-load opt-in remained one click | **keep** |
+
+The ASR gate averages selected-token top-two normalized log probabilities and
+clarifies below −0.3 before text reaches the brain. Synthetic noisy,
+band-limited, and speed-distorted MAP audio separated correct decodes
+(−0.097…−0.018) from failures (−0.691…−0.627); the disjoint holdout preserved
+the gap (−0.013…−0.007 correct, −0.685 failed). A final fused holdout with the
+quantized Whisper artifact kept clean and distorted-correct speech below the
+false-clarification boundary while rejecting the failed decode at −0.668. Real
+speaker garble should be added to future calibration; the current audio failure
+fixtures are synthetic.
+
+Barge-in capture now rolls over a strict 1.2 s response-phase tail, then hands
+that PCM to the normal utterance buffer without clearing the interruption. The
+paired probe changed `[10…17]` (old reply markers 10–11 included) to `[12…17]`
+while retaining every interruption marker. The fake-mic harness mutes playback,
+so this proves buffer hygiene but cannot measure real speaker-to-microphone
+leakage; an audible loopback fixture remains the release-grade follow-up.
+
+Whisper quantizes 98 two-dimensional tensors (70,823,936 parameters) and
+restores the configured fp16/fp32 runtime dtype at load. The artifact shrank
+from 143,675,684 to **73,341,440 bytes** (−70,334,244; −49%). Across three runs
+of clean, quiet, and distorted MAP/holdout clips, every compact-model transcript
+matched fp16; ambient-noise and typing hallucinations were also identical, not
+increased. The hosted compact file has an automatic fp16 fallback.
+
+The all-FlowLM TTS candidate shrank 200,506,740 → 110,951,612 bytes and retained
+high spectral similarity, but its short fixed-seed phrase changed 48 → 45 codec
+frames. The deterministic duration gate correctly rejected that 44.7% saving.
+With compact Whisper and the Eye now opt-in, the default first load falls from
+~710 MB to **~640 MB**; enabling the Eye adds its measured 41,754,112-byte model.
+
 ## Open conversation-quality roadmap
 
 Distilled from the five-agent conversation-quality diagnosis (previously
@@ -648,22 +774,14 @@ format, humanized tool-failure lines, the reachable backchannel window, the
 garble repair clause + exemplar — are recorded in the campaign sections
 above). Still open, ranked by impact/effort:
 
-1. **ASR confidence gate** — average decoder logprob is nearly free (logits
-   already on CPU in asr/decoding.ts); below a threshold, speak "sorry,
-   could you say that again?" instead of handing garble to the brain.
-   Complements the shipped prompt-side exemplar with a signal-side gate.
-2. **Barge-in buffer hygiene** — at barge-in the capture buffer spans the
-   whole reply period, so reply words + ambient leak into the next turn.
-   Trim to ~1.2 s of pre-roll; keep echo-filtering the aborted reply text.
-3. **Post-fire continuation-merge** — speech resuming <700 ms before first
+1. **Post-fire continuation-merge** — speech resuming <700 ms before first
    reply audio should abort the reply and re-open the utterance (append,
    don't restart). The cycle-5 law says this is the only patience design
    compatible with a lagging cascade ASR.
-4. **Correction-turn tagging** — a rapid "No, …" after a reply gets a
-   "(the user is correcting your previous answer)" prompt prefix.
-5. **Whisper small.en** (144→481 MB, ~3× FLOPs) — better ears, gated on a
-   WER fixture; the int8 brain savings roughly cover the size.
-6. **LLM-emitted tool markers** replacing the lookup/weather regexes, and
+2. **Whisper small.en** — better ears, gated on a substantially broader
+   real-speaker WER fixture and runtime budget. Per-row int8 should cut its
+   original 481 MB checkpoint roughly in half, but its ~3× FLOPs remain.
+3. **LLM-emitted tool markers** replacing the lookup/weather regexes, and
    **tool-context memory** ("what about tomorrow?" follow-ups) — gated on a
    labeled routing test set first.
 

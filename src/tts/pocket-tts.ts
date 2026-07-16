@@ -549,54 +549,13 @@ export const runSEANetDecoder = jit(function runSEANetDecoder(
 });
 
 export type MimiModel = {
-  encoder: SEANetEncoder;
   decoder: SEANetDecoder;
-  encoderTransformer: StreamingTransformerLayer[];
   decoderTransformer: StreamingTransformerLayer[];
   quantizer: {
     outputProj: { weight: np.Array }; // DummyQuantizer, plain conv1d [512, 32, 1], kernel size 1
   };
-  downsample: StreamingConv1d;
   upsample: StreamingConvTranspose1d; // note: depthwise
 };
-
-export function runMimiEncode(
-  {
-    encoder,
-    encoderTransformer,
-    decoder,
-    decoderTransformer,
-    quantizer,
-    downsample,
-    upsample,
-  }: MimiModel,
-  x: np.Array, // [C, T] - audio waveform at 24kHz
-): np.Array {
-  tree.dispose([decoder, decoderTransformer, quantizer, upsample]);
-  x = runSEANetEncoder(encoder, x);
-
-  // Encoder transformer (with transpose for [T, D] format)
-  x = x.transpose([1, 0]); // [C, T] -> [T, C]
-  const offset = np.array(0, { dtype: np.int32, device: x.device });
-  for (const layer of encoderTransformer) {
-    let kvCache = emptyKVCache();
-    [x, kvCache] = runStreamingTransformerLayer(
-      layer,
-      kvCache,
-      x,
-      offset.ref,
-      0,
-      { context: 250, numHeads: 8 },
-    );
-    tree.dispose(kvCache);
-  }
-  offset.dispose();
-  x = x.transpose([1, 0]); // back to [C, T]
-
-  // Downsample (stride 16)
-  [x] = runConv1d(downsample.conv, null, x, 16);
-  return x;
-}
 
 export type MimiDecodeState = {
   kvCaches: KVCache[];
@@ -627,12 +586,9 @@ export function createMimiDecodeState(mimi: MimiModel): MimiDecodeState {
 
 export function runMimiDecode(
   {
-    encoder,
-    encoderTransformer,
     decoder,
     decoderTransformer,
     quantizer,
-    downsample,
     upsample,
   }: MimiModel,
   {
@@ -644,8 +600,6 @@ export function runMimiDecode(
   }: MimiDecodeState,
   latent: np.Array, // [T, 32] - bottleneck representation
 ): [np.Array, MimiDecodeState] {
-  tree.dispose([encoder, encoderTransformer, downsample]);
-
   // Run through "dummy quantizer"
   latent = np.expandDims(latent.transpose([1, 0]), 0); // [1, 32, T]
   latent = lax.conv(latent, quantizer.outputProj.weight, [1], "VALID"); // [1, 512, T]
@@ -1385,12 +1339,9 @@ const runMimiDecodeStepFused = jit(function runMimiDecodeStepFused(
  */
 export function runMimiDecodeFused(
   {
-    encoder,
-    encoderTransformer,
     decoder,
     decoderTransformer,
     quantizer,
-    downsample,
     upsample,
   }: MimiModel,
   {
@@ -1402,8 +1353,6 @@ export function runMimiDecodeFused(
   }: MimiDecodeState,
   latent: np.Array, // [T, 32]
 ): [np.Array, MimiDecodeState] {
-  tree.dispose([encoder, encoderTransformer, downsample]);
-
   const offsetArr = np.array(offset, { dtype: np.int32 });
   const kvCacheLenArr = np.array(kvCacheLen, { dtype: np.int32 });
 
@@ -1455,7 +1404,6 @@ const weightMapper = new WeightMapper({
   prefix: {
     "flow_lm.": "flowLM.",
     "mimi.decoder_transformer.transformer.layers": "mimi.decoderTransformer",
-    "mimi.encoder_transformer.transformer.layers": "mimi.encoderTransformer",
   },
   suffix: {
     ".conditioner.embed.weight": ".conditionerEmbed",

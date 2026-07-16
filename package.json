@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "probe:pcm": "node --experimental-strip-types --input-type=module -e \"const { runPcmBufferProbe } = await import('./src/mic.ts'); console.log(JSON.stringify(runPcmBufferProbe()))\""
   },
   "dependencies": {
     "@fontsource-variable/instrument-sans": "^5.2.8",

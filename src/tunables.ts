@@ -7,6 +7,14 @@ export const TUNABLES = {
   // region: engine
   /** Micro-turn policy tick. Read at session start. */
   tickMs: 150,
+  /**
+   * While the assistant is replying, retain only this much recent microphone
+   * PCM for a possible barge-in. The energy detector needs two ticks (~300 ms)
+   * to fire; 1200 ms preserves the interruption onset with ample margin while
+   * continuously evicting older reply-period echo/ambient audio. 0 keeps the
+   * previous unbounded-within-the-normal-32-s-cap behavior for paired benches.
+   */
+  bargePreRollMs: 1200,
 
   // region: endpoint
   /** Silence to end a turn whose committed text ends in . ! ? */
@@ -32,10 +40,26 @@ export const TUNABLES = {
    * gating is never approximated silently.
    */
   asrSampler: "js" as "js" | "gpu",
+  /**
+   * Candidate signal-side clarification gate. The score is the mean top-two
+   * normalized decoder log probability of selected text tokens (not a text
+   * heuristic). `null` disables the gate for paired A/Bs. Cycle-13 paired MAP
+   * put clean/correct decodes at -0.097..-0.018 and failed garbled decodes at
+   * -0.691..-0.627; -0.3 preserved that gap on holdout (-0.685 failed vs
+   * -0.013..-0.007 correct) with zero clean false clarifications.
+   */
+  asrConfidenceThreshold: -0.3 as number | null,
 
   // region: llm
-  /** Cap on generated tokens per reply (keeps spoken replies short). */
-  llmMaxNewTokens: 96,
+  /**
+   * Cap on generated tokens per reply (keeps spoken replies short). 96 -> 64
+   * in cycle 8: the quality bench's shortSpoken axis kept failing on 60+
+   * word open-ended answers ("low quality convo" reports — a voice reply
+   * should be a breath or two, and long tails also delay the next turn).
+   * 64 tokens ≈ 45 spoken words; replies usually hit their stop token well
+   * before it, and sentenceStream only speaks complete sentences either way.
+   */
+  llmMaxNewTokens: 64,
   /**
    * Bucket size (tokens) for padding the SmolLM full prefill; 0 = off
    * (shipped behavior). jax-js trace caches key on avals (shapes), and every
@@ -53,9 +77,14 @@ export const TUNABLES = {
    * reversal (turn 1713 → 1191 ms fused, llmFirst flat ~250 ms instead of
    * growing past 1 s). Equivalence-gated on-device: bucketed vs unbucketed
    * logits argmax identical, max |Δ| 3.6e-5 (fp16 reduction-order noise) —
-   * benchPrefillEquivalence(250, 64).
+   * benchPrefillEquivalence(250, 64). Raised 64 -> 256 in the cycle-8
+   * delay fix: 64-token buckets still churned a new prefill shape every
+   * couple of turns as history grew (each first encounter re-traces 32
+   * layer jits, ~0.5-1 s on that turn); 256 gives at most ~5 shapes per
+   * session and warmup() pre-traces the first three, so conversations run
+   * re-trace-free. The pad FLOPs are trivial next to the dispatch overhead.
    */
-  llmPrefillBucket: 64,
+  llmPrefillBucket: 256,
   /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
    * (whole user/assistant pairs). 0 = unlimited. Shipped at 16 (8 exchanges):
@@ -125,9 +154,13 @@ export const TUNABLES = {
    * of user speech vs ~1.2–1.8 s for the real reply, with real-reply latency
    * unchanged within noise. The EARS half of the gate is still open — flip
    * this on and listen for whether "So, … <pause> …reply" beats silence
-   * before it defaults on.
+   * before it defaults on. Flipped ON in cycle 8 ("voice responses don't
+   * feel realtime"): first sound lands ~0.5-0.8 s after end of speech with
+   * real-reply latency unchanged. The ears gate is now live-in-production —
+   * if the filler-then-pause cadence sounds worse than silence, flip this
+   * back off; the bench numbers will not miss it.
    */
-  onsetFiller: false,
+  onsetFiller: true,
 
   // region: tools (campaign 2 — delegation)
   /**
@@ -196,6 +229,7 @@ export const TUNABLES = {
    * worth more than the brevity win); recorded so 0.5 isn't retried blind.
    */
   qualityTemperature: 0.7,
+  qualityTypedMemory: true,
 };
 
 export type Tunables = typeof TUNABLES;
@@ -210,6 +244,8 @@ export type TurnRecord = {
   transcriptReady: number;
   /** Whether the fast bestText path was used (vs a full finalize pass). */
   usedBestText: boolean;
+  /** Mean top-two normalized decoder log probability for ASR text tokens. */
+  asrAvgLogProb?: number;
   /** Which endpoint rule fired the turn (campaign-1 diagnosis). */
   endCause?: "punct" | "silence" | "max";
   /** First LLM text delta arrived. */

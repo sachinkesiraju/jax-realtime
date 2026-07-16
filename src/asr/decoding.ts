@@ -17,12 +17,19 @@ type Gate = {
   forceTimestamp: boolean;
 };
 
-export async function sampleGreedy(
+type DecoderSample = {
+  token: number;
+  /** Selected-token log probability normalized over the top two candidates. */
+  logProb: number;
+};
+
+/** Greedy sample plus its top-two normalized decoder log probability. */
+export async function sampleGreedyWithScore(
   logits: np.Array,
   tokens: readonly number[],
   duration: number,
   config: WhisperConfig,
-): Promise<number> {
+): Promise<DecoderSample> {
   // TUNABLES.asrSampler exists for the bench harness, but only the "js" path
   // preserves the gate semantics exactly. The gating needs two full-vocab
   // reductions (a logSumExp over the admissible timestamp range vs a masked max
@@ -36,19 +43,25 @@ export async function sampleGreedy(
   void TUNABLES.asrSampler;
   const values = (await logits.data()) as ArrayLike<number>;
   const gate = { tokens, duration, forceTimestamp: false };
-  gate.forceTimestamp =
-    timestampScore(values, gate, config) > textScore(values, gate, config);
+  const timestamps = timestampCandidates(values, gate, config);
+  const text = textCandidates(values, gate, config);
+  gate.forceTimestamp = timestamps.logSumExp > text.bestValue;
 
-  let best: number = config.eosToken;
-  let bestValue = -Infinity;
-  for (let token = 0; token < values.length; token++) {
-    if (!canSample(token, gate, config)) continue;
-    if (values[token] > bestValue) {
-      best = token;
-      bestValue = values[token];
-    }
-  }
-  return best;
+  // If timestamp mass beats the best text logit, the gate admits timestamps
+  // only. Otherwise no individual timestamp can beat the text winner because
+  // each is <= their logSumExp. Reusing those reduction winners avoids the old
+  // redundant full-vocabulary argmax scan while preserving its exact choice.
+  const selected = gate.forceTimestamp ? timestamps : text;
+  const otherRunner = gate.forceTimestamp
+    ? -Infinity
+    : timestamps.bestValue;
+  const secondValue = Math.max(selected.secondValue, otherRunner);
+  // Top-two normalization is monotonic with the decoder margin and uses only
+  // actual admissible-token logits. Full softmax regressed ASR latency >5%.
+  const logProb = secondValue === -Infinity
+    ? 0
+    : -Math.log1p(Math.exp(secondValue - selected.bestValue));
+  return { token: selected.bestToken, logProb };
 }
 
 export function decodeTranscriptTokens(
@@ -142,45 +155,68 @@ function timestampPhase(tokens: readonly number[], config: WhisperConfig) {
     : "timestamp-or-eos";
 }
 
-function timestampScore(
+type CandidateSet = {
+  bestToken: number;
+  bestValue: number;
+  secondValue: number;
+};
+
+function timestampCandidates(
   values: ArrayLike<number>,
   gate: Gate,
   config: WhisperConfig,
-): number {
-  return logSumExp(values, config.timestampBeginToken, values.length, (token) =>
-    canTimestamp(token, gate, config),
-  );
-}
-
-function textScore(
-  values: ArrayLike<number>,
-  gate: Gate,
-  config: WhisperConfig,
-): number {
-  let best = -Infinity;
-  for (let token = 0; token < config.timestampBeginToken; token++) {
-    if (canSample(token, gate, config)) best = Math.max(best, values[token]);
+): CandidateSet & { logSumExp: number } {
+  let bestToken = config.timestampBeginToken;
+  let bestValue = -Infinity;
+  let secondValue = -Infinity;
+  for (let token = config.timestampBeginToken; token < values.length; token++) {
+    if (!canTimestamp(token, gate, config)) continue;
+    const value = values[token];
+    if (value > bestValue) {
+      secondValue = bestValue;
+      bestToken = token;
+      bestValue = value;
+    } else if (value > secondValue) {
+      secondValue = value;
+    }
   }
-  return best;
-}
-
-function logSumExp(
-  values: ArrayLike<number>,
-  start: number,
-  end: number,
-  include: (token: number) => boolean,
-): number {
-  let max = -Infinity;
-  for (let token = start; token < end; token++) {
-    if (include(token)) max = Math.max(max, values[token]);
+  if (bestValue === -Infinity) {
+    return { bestToken, bestValue, secondValue, logSumExp: -Infinity };
   }
-  if (max === -Infinity) return max;
-
   let sum = 0;
-  for (let token = start; token < end; token++) {
-    if (include(token)) sum += Math.exp(values[token] - max);
+  for (let token = config.timestampBeginToken; token < values.length; token++) {
+    if (canTimestamp(token, gate, config)) {
+      sum += Math.exp(values[token] - bestValue);
+    }
   }
-  return max + Math.log(sum);
+  return {
+    bestToken,
+    bestValue,
+    secondValue,
+    logSumExp: bestValue + Math.log(sum),
+  };
+}
+
+function textCandidates(
+  values: ArrayLike<number>,
+  gate: Gate,
+  config: WhisperConfig,
+): CandidateSet {
+  let bestToken = config.eosToken;
+  let bestValue = -Infinity;
+  let secondValue = -Infinity;
+  for (let token = 0; token < config.timestampBeginToken; token++) {
+    if (!canSample(token, gate, config)) continue;
+    const value = values[token];
+    if (value > bestValue) {
+      secondValue = bestValue;
+      bestToken = token;
+      bestValue = value;
+    } else if (value > secondValue) {
+      secondValue = value;
+    }
+  }
+  return { bestToken, bestValue, secondValue };
 }
 
 function isTimestampToken(
