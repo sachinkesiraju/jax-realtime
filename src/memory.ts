@@ -8,6 +8,7 @@ export const MEMORY_KINDS = [
   "interview",
   "relation",
   "event",
+  "activity",
 ] as const;
 
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
@@ -116,6 +117,11 @@ export function extractExplicitUserFacts(text: string, turn: number): MemoryFact
   );
   if (match) addFact(facts, "event", `${match[1]} ${match[2]}`, turn);
 
+  match = normalized.match(
+    /\bi(?:'ve| have) been\s+(learning|practicing|practising|playing|training)\s+([^.!?]+)/i,
+  );
+  if (match) addFact(facts, "activity", `${match[1]} ${match[2]}`, turn);
+
   return facts;
 }
 
@@ -157,6 +163,12 @@ export function relevantMemoryFacts(
   if (recent(memory, "favorite", turn) && /\b(?:what|which)\s+(?:color|colour)\b/.test(s)) wanted.add("favorite");
   if (recent(memory, "relation", turn) && /\b(?:we|us|her|him|together)\b/.test(s)) wanted.add("relation");
   if (recent(memory, "event", turn) && /\b(?:it|instead|now|what should i do|should i)\b/.test(s)) wanted.add("event");
+  if (
+    recent(memory, "activity", turn) &&
+    /\b(?:finger|fingers|hand|hands|hurt|sore|pain|normal|practice|practicing|practising)\b/.test(s)
+  ) {
+    wanted.add("activity");
+  }
 
   if (/\b(?:any advice|what should i do|how should i prepare|can you help me prepare|what do you think)\b/.test(s)) {
     if (recent(memory, "interview", turn)) wanted.add("interview");
@@ -193,6 +205,8 @@ function factSentence(fact: MemoryFact): string {
       return `The user mentioned their ${fact.value}.`;
     case "event":
       return `The user ${fact.value}.`;
+    case "activity":
+      return `The user has been ${fact.value}.`;
   }
 }
 
@@ -223,6 +237,10 @@ export function directMemoryAnswer(
       return `Since ${favorite.value.slice(6).trim()} is your favorite color, that would be a natural choice.`;
     }
   }
+  if (/\b(?:what food should i try|what should i (?:eat|try)|food should i try)\b/.test(s)) {
+    const trip = fact("trip");
+    if (trip) return `For your trip to ${trip.value}, try local specialties such as sushi, ramen, tempura, and street food.`;
+  }
   if (/\bwhat should i wear\b/.test(s)) {
     const interview = fact("interview");
     if (interview) return `For your ${interview.value}, choose polished business attire.`;
@@ -247,6 +265,12 @@ export function directMemoryAnswer(
   if (/\bshould i (?:just )?order takeout instead\b/.test(s)) {
     const event = fact("event");
     if (event) return `Since you ${event.value}, ordering takeout is a reasonable backup.`;
+  }
+  if (/\b(?:finger|fingers|hand|hands)\b.*\b(?:hurt|sore|pain|normal)\b|\b(?:hurt|sore|pain|normal)\b.*\b(?:finger|fingers|hand|hands)\b/.test(s)) {
+    const activity = fact("activity");
+    if (activity && /\b(?:guitar|ukulele|violin|cello|bass|piano)\b/i.test(activity.value)) {
+      return "Sore fingers are common when you're new to an instrument; take breaks, and stop if the pain is sharp or persistent.";
+    }
   }
   return null;
 }

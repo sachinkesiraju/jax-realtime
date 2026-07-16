@@ -371,10 +371,6 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
-    if (pipeline.llm.multimodal) {
-      el.llmLabel.innerHTML =
-        '<a href="https://huggingface.co/HuggingFaceTB/SmolVLM-500M-Instruct" target="_blank">SmolVLM 500M</a>';
-    }
     // Eye is ON by default: start it here, in parallel with the TTS
     // pre-render below, so the webcam is already detecting on the standby
     // screen when "ready" appears (the pre-Eye-lazy-load behavior). It is
@@ -528,7 +524,6 @@ async function enableVision(): Promise<void> {
   vision.video.className = "pip-video";
   el.pip.insertBefore(vision.video, el.pipOverlay);
   await vision.start();
-  pipeline.llm.setVisionSource?.(vision.video);
   el.pip.hidden = false;
   el.stageEye.classList.add("is-active");
   if (visionRaf === null) drawPreview();
@@ -539,7 +534,6 @@ async function enableVision(): Promise<void> {
 
 function disableVision(): void {
   duplex?.setVision(null);
-  pipeline?.llm.setVisionSource?.(null);
   vision?.stop();
   if (vision?.video.parentElement) vision.video.remove();
   vision = null;

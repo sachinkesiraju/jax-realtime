@@ -665,12 +665,7 @@ export class DuplexSession {
     // interpretive visual questions ("what am I doing", "does my room look
     // tidy") are handed to the LLM with the measured scene as grounding, so the
     // model reasons rather than us templating a reply.
-    const visualModel = this.getModel().multimodal === true;
-    if (
-      this.vision?.active &&
-      this.vision.matchesQuestion(text) &&
-      !visualModel
-    ) {
+    if (this.vision?.active && this.vision.matchesQuestion(text)) {
       const reply = this.vision.answer(text);
       this.cb.onEvent("eye · answering from the camera");
       this.history.push({ role: "user", content: text, t: this.elapsed() });
@@ -683,17 +678,9 @@ export class DuplexSession {
     }
 
     let content = text;
-    if (
-      this.vision?.active &&
-      (this.vision.referencesVision(text) ||
-        (visualModel && this.vision.matchesQuestion(text)))
-    ) {
+    if (this.vision?.active && this.vision.referencesVision(text)) {
       const facts = this.vision.sceneFacts();
-      content = facts
-        ? `[scene: ${facts}] ${text}`
-        : visualModel
-          ? `[scene: camera] ${text}`
-          : text;
+      content = facts ? `[scene: ${facts}] ${text}` : text;
       this.cb.onEvent("eye · grounding from the camera");
     }
     this.history.push({ role: "user", content, t: this.elapsed() });

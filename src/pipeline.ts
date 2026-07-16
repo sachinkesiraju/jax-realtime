@@ -38,7 +38,6 @@ import {
   createSmolLmState,
   fromSafetensors as smolLmFromSafetensors,
   runSmolLmPrefill,
-  runSmolLmPrefillEmbeddings,
   runSmolLmStepFusedTopK,
   SMOLLM_TOPK,
   type SmolLmModel,
@@ -46,10 +45,6 @@ import {
 } from "./llm/smollm";
 import { type AudioPlayer, createStreamingPlayer } from "./tts/audio";
 import { playTTS } from "./tts/inference";
-import {
-  type SmolVlmImageSource,
-  SmolVlmVisionEncoder,
-} from "./vision/smolvlm";
 import {
   createFlowLMState,
   fromSafetensors as ttsFromSafetensors,
@@ -84,7 +79,7 @@ const WHISPER_CONFIG: WhisperConfig = WHISPER_MODELS.find(
 const ASR_MAX_NEW_TOKENS = 96;
 
 const TTS_WEIGHTS_URL =
-  "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/pocket-tts-decode-fp16.safetensors";
 const TTS_HF_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
 
@@ -464,7 +459,6 @@ export type GenerateStats = {
  * tokens arrive and returns final stats; `generate` is the buffered form.
  */
 export interface ChatModel {
-  readonly multimodal?: boolean;
   generate(
     history: ChatMessage[],
     onText: (partial: string) => void,
@@ -472,7 +466,6 @@ export interface ChatModel {
   generateStream(
     history: ChatMessage[],
   ): AsyncGenerator<string, GenerateStats, void>;
-  setVisionSource?(source: SmolVlmImageSource | null): void;
 }
 
 /**
@@ -501,9 +494,6 @@ const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
 // load so runtime is unchanged. Campaign-validated near-lossless (ppl +0.7%).
 const SMOLLM_Q8_URL = `${SMOLLM_BASE}/smollm2-360m-it-q8r.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
-const SMOLVLM_WEIGHTS_URL = `${SMOLLM_BASE}/smolvlm-500m-text-q8r.safetensors`;
-const SMOLVLM_TOKENIZER_URL = `${SMOLLM_BASE}/smolvlm-500m-tokenizer.json`;
-const SMOLVLM_VISION_URL = `${SMOLLM_BASE}/smolvlm-vision-fixed-fp16.onnx`;
 const SMOLLM_REPEAT_PENALTY = 1.3;
 // KV capacity every turn's state is created with. jax-js traces key on
 // shapes, and the KV capacity is one of them: with the default 512-block
@@ -573,13 +563,10 @@ type SmolLmTokenizerData = {
  * jit with the top-k reduction folded in (one small readback per token).
  */
 export class SmolLmChatModel implements ChatModel {
-  private visionSource: SmolVlmImageSource | null = null;
-
   private constructor(
     private model: SmolLmModel,
     private tokenizer: tokenizers.BpeEncoding,
     private specialIds: Set<number>,
-    private visionEncoder: SmolVlmVisionEncoder | null = null,
   ) {}
 
   static async load(onProgress: ProgressFn): Promise<SmolLmChatModel> {
@@ -630,35 +617,6 @@ export class SmolLmChatModel implements ChatModel {
     return new SmolLmChatModel(model, tokenizer, specialIds);
   }
 
-  static async loadVlm(onProgress: ProgressFn): Promise<SmolLmChatModel> {
-    const [tokData, textData, visionData] = await Promise.all([
-      fetchWithProgress("SmolVLM tokenizer", SMOLVLM_TOKENIZER_URL, onProgress),
-      fetchWithProgress("SmolVLM text weights", SMOLVLM_WEIGHTS_URL, onProgress),
-      fetchWithProgress("SmolVLM vision encoder", SMOLVLM_VISION_URL, onProgress),
-    ]);
-    const spec = JSON.parse(
-      new TextDecoder().decode(tokData),
-    ) as SmolLmTokenizerData;
-    const tokenizer = new tokenizers.BpeEncoding(
-      new Map(Object.entries(spec.encoder)),
-      spec.special,
-      new RegExp(spec.pattern, "gu"),
-    );
-    const specialIds = new Set(Object.values(spec.special));
-    const weights = safetensors.parse(textData);
-    const model = await smolLmFromSafetensors(weights, np.float16);
-    const visionEncoder = SmolVlmVisionEncoder.fromBytes(visionData, "webgpu");
-    return new SmolLmChatModel(model, tokenizer, specialIds, visionEncoder);
-  }
-
-  get multimodal(): boolean {
-    return this.visionEncoder !== null;
-  }
-
-  setVisionSource(source: SmolVlmImageSource | null): void {
-    this.visionSource = source;
-  }
-
   async warmup(): Promise<void> {
     try {
       // One real (tiny) generation first: traces the decode step at the
@@ -702,48 +660,7 @@ export class SmolLmChatModel implements ChatModel {
   // mis-advances past special tokens (uses RegExpExecArray.length === 1 instead
   // of the matched string length), re-tokenizing them as ordinary text. Instead
   // we encode special-token-free segments and splice the known ids in.
-  private encodeVlmPrompt(history: ChatMessage[]): {
-    tokens: number[];
-    imageStart: number;
-  } {
-    const enc = (s: string) => this.tokenizer.encode(s);
-    const tokens = [SMOLLM_IM_START];
-    let imageStart = -1;
-    const messages = windowHistory(history).filter((message) =>
-      message.content.trim(),
-    );
-    for (let index = 0; index < messages.length; index++) {
-      const message = messages[index];
-      const isVisual =
-        message.role === "user" &&
-        index === messages.length - 1 &&
-        this.visionSource !== null &&
-        message.content.includes("[scene:");
-      const memory = message.content.match(/\[memory:\s*([^\]]+)\]/)?.[1];
-      const content = message.content
-        .replace(/^\s*(?:\[(?:scene|memory):[^\]]*\]\s*)+/, "")
-        .trim();
-      tokens.push(
-        ...enc(
-          message.role === "assistant"
-            ? "Assistant: "
-            : `User:${isVisual ? "" : " "}`,
-        ),
-      );
-      if (isVisual) {
-        tokens.push(49189, 49152);
-        imageStart = tokens.length;
-        tokens.push(...new Array<number>(64).fill(49190), 49189);
-      }
-      if (memory) tokens.push(...enc(`Earlier, the user said: ${memory} `));
-      tokens.push(...enc(content), 49279, ...enc("\n"));
-    }
-    tokens.push(...enc("Assistant:"));
-    return { tokens, imageStart };
-  }
-
   private encodePrompt(history: ChatMessage[]): number[] {
-    if (this.visionEncoder) return this.encodeVlmPrompt(history).tokens;
     const enc = (s: string) => this.tokenizer.encode(s);
     const nl = enc("\n");
     const tokens: number[] = [];
@@ -930,7 +847,6 @@ export class SmolLmChatModel implements ChatModel {
     promptTokens: number[],
     state: SmolLmState,
     bucket = TUNABLES.llmPrefillBucket,
-    imageStart = -1,
   ): np.Array {
     const realLength = promptTokens.length;
     let ids = promptTokens;
@@ -940,29 +856,9 @@ export class SmolLmChatModel implements ChatModel {
         new Array<number>(paddedLen - realLength).fill(SMOLLM_IM_END),
       );
     }
-    const tokenIds = np.array(ids, { dtype: np.uint32 });
-    if (imageStart >= 0 && this.visionEncoder && this.visionSource) {
-      const embeddings = this.model.embedTokens.weight.ref
-        .slice(tokenIds)
-        .astype(np.float32);
-      const imageFeatures = this.visionEncoder
-        .encode(this.visionSource)
-        .astype(np.float32);
-      const mixed = np.concatenate([
-        embeddings.ref.slice([0, imageStart]),
-        imageFeatures,
-        embeddings.slice([imageStart + 64]),
-      ]);
-      return runSmolLmPrefillEmbeddings(
-        tree.ref(this.model),
-        mixed,
-        state,
-        realLength,
-      );
-    }
     return runSmolLmPrefill(
       tree.ref(this.model),
-      tokenIds,
+      np.array(ids, { dtype: np.uint32 }),
       state,
       realLength,
     );
@@ -1078,16 +974,13 @@ export class SmolLmChatModel implements ChatModel {
     history: ChatMessage[],
     maxNewTokens = TUNABLES.llmMaxNewTokens,
   ): AsyncGenerator<string, GenerateStats, void> {
-    const vlmPrompt = this.visionEncoder ? this.encodeVlmPrompt(history) : null;
-    const promptTokens = vlmPrompt?.tokens ?? this.encodePrompt(history);
+    const promptTokens = this.encodePrompt(history);
     const generatedTokens: number[] = [];
     // Read per-generation (not hoisted to a const) so the quality bench can
     // A/B temperature between turns without reloading the model. Shipped 0.7;
     // lower values are a candidate fix for observed rambling, traded against
     // verbatim-repeat and dull-answer risk (see tunables.ts).
-    const temperature = this.visionEncoder
-      ? TUNABLES.qualityVlmTemperature
-      : TUNABLES.qualityTemperature;
+    const temperature = TUNABLES.qualityTemperature;
     // Seed the repetition penalty with the previous assistant turn's tokens so a
     // "say it differently" follow-up can't echo the same reply verbatim; each
     // freshly generated token is added below.
@@ -1102,18 +995,11 @@ export class SmolLmChatModel implements ChatModel {
     let emitted = "";
 
     const state = createSmolLmState({ dtype: np.float16, capacity: SMOLLM_KV_CAPACITY });
-    let pending: np.Array | null = this.runBucketedPrefill(
-      promptTokens,
-      state,
-      TUNABLES.llmPrefillBucket,
-      vlmPrompt?.imageStart ?? -1,
-    );
+    let pending: np.Array | null = this.runBucketedPrefill(promptTokens, state);
     let pendingIsCombined = false;
 
     try {
-      const stopTokens = this.visionEncoder
-        ? [49279, SMOLLM_IM_END, SMOLLM_EOS, ...this.tokenizer.encode("\n")]
-        : [SMOLLM_IM_END, SMOLLM_EOS];
+      const stopTokens = [SMOLLM_IM_END, SMOLLM_EOS];
       for (let i = 0; i < maxNewTokens; i++) {
         const sampleable = pending!;
         pending = null;
@@ -1831,9 +1717,6 @@ export async function loadPipeline(
   onProgress: ProgressFn,
 ): Promise<VoicePipeline> {
   const setup = await initDevice();
-  const useVlm =
-    new URLSearchParams(globalThis.location?.search ?? "").get("brain") ===
-    "smolvlm";
   // All three weight downloads run in parallel (they were sequential; HTTP/2
   // multiplexes them over one connection, so wall-clock ≈ the largest file).
   const [asr, llm, tts] = await Promise.all([
@@ -1841,12 +1724,7 @@ export async function loadPipeline(
       device: setup.asrDevice,
       dtype: setup.asrDtype,
     }),
-    useVlm
-      ? SmolLmChatModel.loadVlm(onProgress).catch((error) => {
-          console.warn("SmolVLM download failed, falling back to SmolLM", error);
-          return SmolLmChatModel.load(onProgress);
-        })
-      : SmolLmChatModel.load(onProgress),
+    SmolLmChatModel.load(onProgress),
     SpeechSynthesizer.load(onProgress),
   ]);
   // Compile the ASR + LLM kernels now (esp. slow to JIT on wasm) so the first

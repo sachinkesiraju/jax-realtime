@@ -61,7 +61,6 @@ export type SmolLmDecoderLayer = {
 
 export type SmolLmModel = {
   embedTokens: Linear;
-  lmHead?: Linear;
   layers: SmolLmDecoderLayer[];
   norm: RMSNorm;
 };
@@ -376,21 +375,11 @@ export function runSmolLmPrefill(
   state: SmolLmState,
   realLength: number = tokenIds.shape[0],
 ): np.Array {
-  const embeddings = runEmbedding({ weight: model.embedTokens.weight.ref }, tokenIds);
-  return runSmolLmPrefillEmbeddings(model, embeddings, state, realLength);
-}
-
-export function runSmolLmPrefillEmbeddings(
-  model: SmolLmModel,
-  embeddings: np.Array,
-  state: SmolLmState,
-  realLength: number = embeddings.shape[0],
-): np.Array {
   // Capacity must cover the PADDED length — the pad rows' KV slots are
   // written (then later overwritten) even though they are never attended.
-  ensureSmolLmStateCapacity(state, embeddings.shape[0]);
+  ensureSmolLmStateCapacity(state, tokenIds.shape[0]);
 
-  let x = embeddings;
+  let x = runEmbedding({ weight: model.embedTokens.weight.ref }, tokenIds);
 
   for (let i = 0; i < SMOLLM_CONFIG.numHiddenLayers; i++) {
     state.caches[i].key.dispose();
@@ -404,8 +393,9 @@ export function runSmolLmPrefillEmbeddings(
 
   x = runSmolLmRMSNorm(model.norm, x);
   x = x.slice([realLength - 1, realLength]);
-  const head = model.lmHead ?? model.embedTokens;
-  const logits = runLinear(head, x).reshape([head.weight.shape[0]]);
+  const logits = runLinear(model.embedTokens, x).reshape([
+    SMOLLM_CONFIG.vocabSize,
+  ]);
   state.position = realLength;
   return logits;
 }
@@ -435,8 +425,9 @@ export function runSmolLmStep(
   }
 
   x = runSmolLmRMSNorm(model.norm, x);
-  const head = model.lmHead ?? model.embedTokens;
-  const logits = runLinear(head, x).reshape([head.weight.shape[0]]);
+  const logits = runLinear(model.embedTokens, x).reshape([
+    SMOLLM_CONFIG.vocabSize,
+  ]);
   state.position++;
   return logits;
 }
@@ -586,8 +577,9 @@ function smolLmDecodeStepBody(
   position.dispose();
 
   x = rmsNormInline(model.norm, x);
-  const head = model.lmHead ?? model.embedTokens;
-  const logits = linearInline(head, x).reshape([head.weight.shape[0]]);
+  const logits = linearInline(model.embedTokens, x).reshape([
+    SMOLLM_CONFIG.vocabSize,
+  ]);
   return [logits, newCaches];
 }
 
@@ -743,20 +735,19 @@ export async function fromSafetensors(
   dtype: np.DType = np.float16,
 ): Promise<SmolLmModel> {
   const hydrated: Record<string, np.Array> = {};
-  const embeddingRows = file.tensors["model.embed_tokens.weight"]?.shape[0];
   for (const [key, tensor] of Object.entries(file.tensors)) {
     if (key.endsWith(".scale")) continue; // companion of a quantized tensor
-    if (key === "lm_head.weight" && embeddingRows === SMOLLM_CONFIG.vocabSize) continue;
-    const mappedKey = key === "lm_head.weight" ? "lmHead.weight" : mapper.mapKey(key);
+    // lm_head is tied to embed_tokens; ignore a materialized copy if present.
+    if (key === "lm_head.weight") continue;
     if (tensor.dtype === "I8") {
       const scale = file.tensors[`${key}.scale`];
       if (!scale) {
         throw new Error(`Quantized tensor ${key} is missing its .scale`);
       }
-      hydrated[mappedKey] = dequantizeI8(tensor, scale, dtype);
+      hydrated[mapper.mapKey(key)] = dequantizeI8(tensor, scale, dtype);
       continue;
     }
-    hydrated[mappedKey] = tensorToArray(tensor, dtype);
+    hydrated[mapper.mapKey(key)] = tensorToArray(tensor, dtype);
   }
 
   const model = safetensors.toNested(hydrated) as SmolLmModel;
