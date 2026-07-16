@@ -48,10 +48,6 @@ assistant stops.
   directly from the measurements. Proactive interjections (stepped away,
   phone spotted, slouching) are best-effort rule heuristics. The webcam shows
   as a corner PiP with detection boxes.
-- **Voice-clean replies** — markdown/bracket tokens are unsampleable at the
-  logit level (a voice never needs "**" or "[placeholder]"), and structurally
-  garbled or low-confidence transcripts get a deterministic request to repeat
-  instead of a confidently wrong answer.
 - **Typed conversation memory** — bounded facts the user explicitly states
   (name, trip, pet, favorite, plans, relationships) are retained and injected
   only when relevant; exact recall bypasses small-model guessing.
