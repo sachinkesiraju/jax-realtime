@@ -16,4 +16,6 @@ public/weights/
 # docs/BENCHMARKS.md "Method" for what it does)
 bench/
 .worktrees/
+
+# Local Netlify folder (site link + cache)
 .netlify/
