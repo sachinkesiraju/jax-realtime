@@ -25,60 +25,6 @@ export const TUNABLES = {
   minSpeechMs: 350,
 
   // region: asr
-  /**
-   * Which ASR "ear" the session runs. Read ONCE, at LOAD time (loadPipeline) —
-   * the two engines download disjoint weights, so flipping it mid-session does
-   * nothing; changing it requires a page reload.
-   *
-   * "whisper" (default, shipped): Whisper base.en (~150 MB) re-transcribing
-   * the growing utterance window every asrPassIntervalMs, with the
-   * LocalAgreement-2 commit policy, self-echo filtering against
-   * currentTtsText, and a full-window finalize() pass as the short-utterance
-   * fallback (src/asr/streaming.ts).
-   *
-   * "kyutai": Kyutai's delayed-streams stt-1b-en_fr — a TRUE streaming
-   * transcriber. The mic PCM is resampled 16→24 kHz, encoded to 32 Mimi RVQ
-   * codes per 80 ms frame (streaming encoder, src/asr/mimi-encode.ts), and a
-   * 1B temporal transformer emits one text token per frame
-   * (src/asr/kyutai-stt.ts); text arrives monotonically ~0.5 s behind the
-   * audio (a trained-in delay) and is NEVER revised, so there is no
-   * tentative-tail / LocalAgreement machinery and no re-transcription — each
-   * frame is encoded and decoded exactly once (~45 ms of GPU per 80 ms of
-   * audio). finalize() only needs to drain the frame backlog plus ~1 s of
-   * synthetic silence to flush the trained-in delay, instead of re-running the
-   * whole window. Cost: a 991 MB int8 decoder + 112 MB fp16 encoder download
-   * (vs Whisper's ~150 MB) and no self-echo word filter (the Kyutai lane
-   * relies on pauseWhile — no frames are processed while the assistant is
-   * audible — plus the energy barge-in; see src/asr/kyutai-stream.ts).
-   * DEFAULT stays "whisper" until the live bench (turn bench + observe suite)
-   * shows the Kyutai lane winning; flip only after benching.
-   */
-  asrEngine: "whisper" as "whisper" | "kyutai",
-  /**
-   * Semantic-VAD endpointing for the Kyutai lane. Only active when
-   * asrEngine === "kyutai" AND the loaded weights carry the model's
-   * "extra heads" (pauseProb() non-null; older cached weight files lack
-   * them and the tick falls back to the punct/silence timers). stt-1b was
-   * trained to predict the probability the user is DONE TALKING alongside
-   * the text (kyutai.org/stt; heads reverse-engineered from Kyutai's Rust
-   * server — see src/asr/kyutai-stt.ts). When active, the endpoint decision
-   * REPLACES the punct/silence trailing-silence timers: the turn ends the
-   * moment the latest frame's pauseProb clears kyutaiVadThreshold (with the
-   * same minSpeechMs floor and the max-utterance cap). This attacks the
-   * live-bench verdict on the Kyutai lane (+254 ms vs Whisper): punct
-   * endpointing waits for text the delayed stream delivers ~0.5 s late,
-   * while the VAD head reads the AUDIO — its pause prediction adapts to
-   * content and intonation instead of a fixed silence window.
-   */
-  kyutaiVadEndpoint: true,
-  /**
-   * pauseProb threshold that ends the turn. 0.6 is the decision rule
-   * Kyutai's own consumer ships (unmute/unmute_handler.py determine_pause:
-   * `stt.pause_prediction.value > 0.6`, on the same prs[2] head this port
-   * exposes, smoothed by an EMA so fast — half-life 10 ms vs the 80 ms
-   * frame — that it is effectively the raw per-frame value we use).
-   */
-  kyutaiVadThreshold: 0.6,
   /** Minimum time between the starts of two streaming Whisper passes. */
   asrPassIntervalMs: 150,
   /** Max utterance window fed to Whisper, seconds. */
@@ -300,9 +246,8 @@ export type TurnRecord = {
   usedBestText: boolean;
   /** Mean top-two normalized decoder log probability for ASR text tokens. */
   asrAvgLogProb?: number;
-  /** Which endpoint rule fired the turn (campaign-1 diagnosis). "vad" =
-   *  the Kyutai semantic-VAD head (kyutaiVadEndpoint). */
-  endCause?: "punct" | "silence" | "max" | "vad";
+  /** Which endpoint rule fired the turn (campaign-1 diagnosis). */
+  endCause?: "punct" | "silence" | "max";
   /** First LLM text delta arrived. */
   firstDelta: number;
   /** First sentence/clause handed to TTS. */

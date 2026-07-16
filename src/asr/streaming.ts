@@ -10,12 +10,14 @@ import type {
   SpeechRecognizer,
 } from "../pipeline";
 import { TUNABLES } from "../tunables";
-import type { StreamingUpdate, Transcriber } from "./transcriber";
-
-// Re-export so existing importers (duplex.ts) keep a single import site.
-export type { StreamingUpdate } from "./transcriber";
 
 const SAMPLE_RATE = 16_000;
+
+export type StreamingUpdate = {
+  committed: string;
+  tentative: string;
+  lastChangeAt: number;
+};
 
 export type StreamingOptions = {
   /** Minimum time between the starts of two transcribe passes. */
@@ -60,7 +62,7 @@ function commonPrefixLen(a: string[], b: string[]): number {
   return i;
 }
 
-export class StreamingTranscriber implements Transcriber {
+export class StreamingTranscriber {
   private active = false;
   private loopPromise: Promise<void> | null = null;
   private prevWords: string[] = [];
