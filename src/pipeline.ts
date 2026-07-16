@@ -72,12 +72,6 @@ export type ProgressFn = (progress: DownloadProgress) => void;
 export type ASRConfidence = {
   /** Mean top-two normalized log probability for decoded text tokens only. */
   avgLogProb: number | null;
-  /** Lowest top-two text-token log probability in the hypothesis. */
-  minLogProb: number | null;
-  /** Mean top-two log probability including timestamps and EOS. */
-  avgAllLogProb: number | null;
-  textTokenCount: number;
-  sampledTokenCount: number;
 };
 
 export type ASRResult = {
@@ -218,7 +212,7 @@ export class SpeechRecognizer {
    */
   async warmup(): Promise<void> {
     try {
-      await this.transcribe(new Float32Array(16_000), 1);
+      await this.transcribeWithConfidence(new Float32Array(16_000), 1);
     } catch {
       // Warmup is best-effort; a failure here just means the first real pass
       // pays the compilation cost.
@@ -303,11 +297,6 @@ export class SpeechRecognizer {
     };
   }
 
-  /** Transcribe 16 kHz mono PCM samples to text (compatibility wrapper). */
-  async transcribe(samples: Float32Array, duration: number): Promise<string> {
-    return (await this.transcribeWithConfidence(samples, duration)).text;
-  }
-
   /**
    * Transcribe and expose confidence from the decoder's selected-token logits.
    * The clarification policy is controlled separately by
@@ -363,8 +352,8 @@ export class SpeechRecognizer {
       }
 
       const generated: number[] = [];
-      const textLogProbs: number[] = [];
-      const allLogProbs: number[] = [];
+      let textLogProbTotal = 0;
+      let textTokenCount = 0;
       for (let i = 0; i < ASR_MAX_NEW_TOKENS; i++) {
         const sampledLogits = logits;
         if (!sampledLogits) throw new Error("Decoder logits were not ready");
@@ -375,8 +364,11 @@ export class SpeechRecognizer {
           duration,
           config,
         );
-        allLogProbs.push(sample.logProb);
-        if (sample.token < config.eosToken) textLogProbs.push(sample.logProb);
+        sampledLogits.dispose();
+        if (sample.token < config.eosToken) {
+          textLogProbTotal += sample.logProb;
+          textTokenCount++;
+        }
         if (sample.token === config.eosToken) break;
         generated.push(sample.token);
         logits = runWhisperDecoderStep(
@@ -389,18 +381,12 @@ export class SpeechRecognizer {
         );
       }
 
-      const mean = (values: number[]): number | null =>
-        values.length
-          ? values.reduce((total, value) => total + value, 0) / values.length
-          : null;
       return {
         text: decodeTranscriptTokens(generated, this.tokenizer, config).trim(),
         confidence: {
-          avgLogProb: mean(textLogProbs),
-          minLogProb: textLogProbs.length ? Math.min(...textLogProbs) : null,
-          avgAllLogProb: mean(allLogProbs),
-          textTokenCount: textLogProbs.length,
-          sampledTokenCount: allLogProbs.length,
+          avgLogProb: textTokenCount
+            ? textLogProbTotal / textTokenCount
+            : null,
         },
       };
     } finally {

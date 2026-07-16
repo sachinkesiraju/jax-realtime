@@ -601,7 +601,7 @@ export class DuplexSession {
       this.turnMarks.usedBestText = false;
       this.cb.onStageActivity("asr", true);
       try {
-        ({ text, confidence } = await transcriber.finalizeResult());
+        ({ text, confidence } = await transcriber.finalize());
       } catch (error) {
         this.cb.onError(error);
       } finally {
@@ -1198,11 +1198,6 @@ export class DuplexSession {
   }
 }
 
-/**
- * Index just after a sentence-ending punctuation that is followed by
- * whitespace, or -1. Requiring a trailing whitespace avoids flushing on
- * decimals like "3.14" mid-stream; the end-of-stream tail is flushed separately.
- */
 /** Count whitespace-separated word tokens in a transcript string. */
 function displayWordCount(text: string): number {
   const trimmed = text.trim();
@@ -1223,17 +1218,10 @@ function transcriptTokens(text: string): string[] {
     .filter(Boolean);
 }
 
-function isDegenerateTranscript(text: string): boolean {
-  const tokens = transcriptTokens(text);
-  if (tokens.length < 6) return false;
-  const unique = new Set(tokens).size;
-  return unique / tokens.length < 0.4;
-}
-
 export function isGarbledTranscript(text: string): boolean {
-  if (isDegenerateTranscript(text)) return true;
   const tokens = transcriptTokens(text);
   if (tokens.length < 6) return false;
+  if (new Set(tokens).size / tokens.length < 0.4) return true;
   for (let i = 1; i < tokens.length; i++) {
     if (tokens[i] === tokens[i - 1]) return true;
   }
@@ -1248,6 +1236,7 @@ export function isGarbledTranscript(text: string): boolean {
   );
 }
 
+/** Sentence-ending punctuation followed by whitespace; skips decimals. */
 function findSentenceEnd(buffer: string): number {
   for (let i = 0; i < buffer.length - 1; i++) {
     const c = buffer[i];

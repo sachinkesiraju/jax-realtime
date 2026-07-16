@@ -17,20 +17,11 @@ type Gate = {
   forceTimestamp: boolean;
 };
 
-export type DecoderSample = {
+type DecoderSample = {
   token: number;
   /** Selected-token log probability normalized over the top two candidates. */
   logProb: number;
 };
-
-export async function sampleGreedy(
-  logits: np.Array,
-  tokens: readonly number[],
-  duration: number,
-  config: WhisperConfig,
-): Promise<number> {
-  return (await sampleGreedyWithScore(logits, tokens, duration, config)).token;
-}
 
 /** Greedy sample plus its top-two normalized decoder log probability. */
 export async function sampleGreedyWithScore(

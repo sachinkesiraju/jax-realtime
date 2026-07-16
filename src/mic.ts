@@ -12,7 +12,7 @@ const MAX_CAPTURE_SAMPLES = SAMPLE_RATE * 32;
  * old reply-period audio must not survive merely because it shares a chunk
  * with the retained tail.
  */
-export class BoundedPcmBuffer {
+class BoundedPcmBuffer {
   private chunks: Float32Array[] = [];
   private totalSamples = 0;
   private maxSamples: number;
@@ -80,20 +80,8 @@ function sampleLimit(value: number): number {
   return Math.floor(value);
 }
 
-export type PcmBufferProbeResult = {
-  passed: boolean;
-  rollingTail: number[];
-  zeroBoundLength: number;
-  unboundedTail: number[];
-  handoffTail: number[];
-};
-
-/**
- * Deterministic, device-free probe for the exact-bound and pre-roll handoff
- * invariants. Exposed as window.__pcmBufferProbe in DEV so it can run without
- * microphone permission, model downloads, timing, or WebAudio scheduling.
- */
-export function runPcmBufferProbe(): PcmBufferProbeResult {
+/** Device-free probe for exact bounds and pre-roll handoff. */
+export function runPcmBufferProbe() {
   const buffer = new BoundedPcmBuffer(5);
   buffer.append(Float32Array.from([0, 1, 2, 3]));
   buffer.append(Float32Array.from([4, 5, 6, 7]));

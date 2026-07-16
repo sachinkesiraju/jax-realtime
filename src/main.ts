@@ -11,7 +11,7 @@ import {
   relevantMemoryFacts,
   rememberUserFacts,
 } from "./memory";
-import { runPcmBufferProbe, VoiceCapture } from "./mic";
+import { VoiceCapture } from "./mic";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
 import { detectTool, type ToolKind, type UiCard } from "./tools/tools";
@@ -227,7 +227,6 @@ if (import.meta.env.DEV) {
   dev.__pipeline = () => pipeline;
   dev.__detectTool = detectTool;
   dev.__garbleProbe = isGarbledTranscript;
-  dev.__pcmBufferProbe = runPcmBufferProbe;
   dev.__memoryProbe = (turns: string[], query: string) => {
     let memory: ConversationalMemory = {};
     turns.forEach((turn, index) => {

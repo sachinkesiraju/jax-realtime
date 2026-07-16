@@ -99,16 +99,6 @@ export class StreamingTranscriber {
     return this.tentativeText;
   }
 
-  /**
-   * The best available transcript right now — committed words plus the live
-   * tentative tail — WITHOUT running another Whisper pass. The streaming loop
-   * has already transcribed the utterance incrementally, so this is what the
-   * turn-end path uses to skip a redundant multi-second finalize.
-   */
-  bestText(): string {
-    return this.bestResult().text;
-  }
-
   /** Best streaming hypothesis paired with the decoder scores that produced it. */
   bestResult(): { text: string; confidence: ASRConfidence | null } {
     return {
@@ -150,15 +140,8 @@ export class StreamingTranscriber {
     this.lastChangeAt = performance.now();
   }
 
-  /**
-   * One final pass over the whole current window, returning the best text.
-   * Used when the policy closes a user turn.
-   */
-  async finalize(): Promise<string> {
-    return (await this.finalizeResult()).text;
-  }
-
-  async finalizeResult(): Promise<{
+  /** One final pass over the whole current window. */
+  async finalize(): Promise<{
     text: string;
     confidence: ASRConfidence | null;
   }> {

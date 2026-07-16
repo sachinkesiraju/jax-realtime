@@ -1,4 +1,4 @@
-export const MEMORY_KINDS = [
+const MEMORY_KINDS = [
   "name",
   "location",
   "trip",
@@ -11,7 +11,7 @@ export const MEMORY_KINDS = [
   "activity",
 ] as const;
 
-export type MemoryKind = (typeof MEMORY_KINDS)[number];
+type MemoryKind = (typeof MEMORY_KINDS)[number];
 
 export type MemoryFact = {
   kind: MemoryKind;
@@ -45,7 +45,7 @@ function addFact(
   facts.push({ kind, value: cleaned, turn });
 }
 
-export function extractExplicitUserFacts(text: string, turn: number): MemoryFact[] {
+function extractExplicitUserFacts(text: string, turn: number): MemoryFact[] {
   const normalized = text.replace(/[’]/g, "'").replace(/\s+/g, " ").trim();
   const facts: MemoryFact[] = [];
   let match: RegExpMatchArray | null;
@@ -275,12 +275,8 @@ export function directMemoryAnswer(
   return null;
 }
 
-export function memoryTag(facts: readonly MemoryFact[]): string {
-  if (facts.length === 0) return "";
-  return `[memory: ${facts.map(factSentence).join(" ")}]`;
-}
-
 export function injectMemoryTag(content: string, facts: readonly MemoryFact[]): string {
-  const tag = memoryTag(facts);
-  return tag ? `${tag} ${content}` : content;
+  return facts.length
+    ? `[memory: ${facts.map(factSentence).join(" ")}] ${content}`
+    : content;
 }
