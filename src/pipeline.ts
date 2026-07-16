@@ -98,6 +98,8 @@ const TTS_WEIGHTS_URL =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/pocket-tts-decode-fp16.safetensors";
 const TTS_HF_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
+const WHISPER_Q8_URL =
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/whisper-base.en-q8r.safetensors";
 
 export const TTS_VOICES = [
   "alba",
@@ -176,11 +178,21 @@ export class SpeechRecognizer {
     // at the download. Null both locals so this async frame (long-lived: the
     // three model loads run concurrently under Promise.all) can't keep the
     // buffer reachable a moment longer than model construction.
-    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
-      `Whisper ${WHISPER_CONFIG.label} weights`,
-      hfWhisperUrl("model.safetensors"),
-      onProgress,
-    );
+    let data: Uint8Array<ArrayBuffer> | null;
+    try {
+      data = await fetchWithProgress(
+        `Whisper ${WHISPER_CONFIG.label} weights (int8)`,
+        WHISPER_Q8_URL,
+        onProgress,
+      );
+    } catch (error) {
+      console.warn("int8 Whisper download failed, falling back to fp16", error);
+      data = await fetchWithProgress(
+        `Whisper ${WHISPER_CONFIG.label} weights`,
+        hfWhisperUrl("model.safetensors"),
+        onProgress,
+      );
+    }
     let weights: safetensors.File | null = safetensors.parse(data);
     data = null; // views inside `weights` keep the buffer alive until upload
     const model = await whisperFromSafetensors(
