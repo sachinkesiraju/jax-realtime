@@ -48,10 +48,6 @@ assistant stops.
   directly from the measurements. Proactive interjections (stepped away,
   phone spotted, slouching) are best-effort rule heuristics. The webcam shows
   as a corner PiP with detection boxes.
-- **Voice-clean replies** — markdown/bracket tokens are unsampleable at the
-  logit level (a voice never needs "**" or "[placeholder]"), and structurally
-  garbled or low-confidence transcripts get a deterministic request to repeat
-  instead of a confidently wrong answer.
 - **Typed conversation memory** — bounded facts the user explicitly states
   (name, trip, pet, favorite, plans, relationships) are retained and injected
   only when relevant; exact recall bypasses small-model guessing.
@@ -75,11 +71,17 @@ map-reduce campaign log, including the negative results):
 - **GPU top-k sampling** — the LLM samples from a device-side top-64 (one small
   readback) instead of transferring the full vocab logits every token,
   folded into the fused step's single dispatch.
-- **Bucket-padded prefill** — jax-js re-traces its jits for every new tensor
-  shape, and every conversation turn has a new prompt length; padding the
-  prompt to 64-token buckets makes traces repeat, holding LLM first-token
-  flat (~250–350 ms) instead of growing past 1 s as history accumulates
-  (−30% turn latency on the holdout bench, exactness verified on-device).
+- **Stable prefill shapes** — every turn has a different prompt length, which
+  otherwise forces jax-js to compile new traces mid-conversation. Prompts use
+  256-token buckets, the common buckets are warmed during loading, and the KV
+  cache has one fixed capacity. A 14-turn run kept first-token latency at
+  288–689 ms with no multi-second history-growth spikes.
+- **Faster confidence-aware ASR** — timestamp-gate candidate reductions are
+  reused for confidence scoring instead of scanning the vocabulary again. ASR
+  runs 5–7% faster while preserving all 21 paired clean/quiet/distorted
+  transcripts; low-confidence failures request a repeat before invoking the LLM.
+- **Deterministic memory fast paths** — exact recall and bounded trip, pet, and
+  activity follow-ups can answer in a few milliseconds without model generation.
 - **Smaller download** — the LLM and Whisper ship per-row int8 (363 MB instead
   of 724 MB and 73 MB instead of 144 MB), while the TTS checkpoint omits 35 MB
   of audio-encoder weights never used for synthesis. The quantized artifacts
