@@ -97,7 +97,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~640&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~680&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
@@ -110,11 +110,11 @@ app.innerHTML = `
         <button id="load-btn" class="load-btn">Load models</button>
         <div class="dock-side">
           <span id="backend-chip" class="backend-chip">WebGPU</span>
-          <label class="field eye-toggle" title="Optional webcam object detection (D-FINE).">
+          <label class="field eye-toggle" title="Webcam object detection (D-FINE). On by default.">
             <!-- The toggle is usable before "Load models" because D-FINE is
                  loaded lazily. Enabling it opts into the separate 42 MB model;
                  leaving it off avoids that download and GPU residency. -->
-            <input type="checkbox" id="eye-toggle" />
+            <input type="checkbox" id="eye-toggle" checked />
             <span>Eye &middot; webcam</span>
           </label>
           <label class="field">
