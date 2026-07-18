@@ -40,10 +40,10 @@ assistant stops.
   they reach Whisper, and a repetition-degeneracy gate drops decoder loops — so
   the assistant doesn't answer "thank you"s you never said. Snappy one-word
   replies ("what?", "no") still get through.
-- **Eye (vision)** — optional and off by default, so its 42 MB model and GPU
-  residency stay out of the normal voice path. Enable it with one click when
-  you want webcam context. D-FINE runs low-priority object detection (it yields
-  the GPU to audio), smooths the person count, and answers
+- **Eye (vision)** — enabled by default for webcam context, with a pre-load
+  toggle to skip its 42 MB model, camera access, and GPU residency. D-FINE
+  runs low-priority object detection (it yields the GPU to audio), smooths the
+  person count, and answers
   "what do you see?" / "how many people?" / "tell me about the person"
   directly from the measurements. Proactive interjections (stepped away,
   phone spotted, slouching) are best-effort rule heuristics. The webcam shows
@@ -98,10 +98,10 @@ npm run dev
 ```
 
 Open http://localhost:5173 in a WebGPU-capable browser (Chrome/Edge on desktop,
-Safari 26+). Click **Load models** (~640 MB on first run — SmolLM 363 +
-Pocket TTS 201 + Whisper 73, all cached in OPFS afterwards). The optional Eye is
-off by default; enabling it adds the 42 MB D-FINE model and requests camera
-access. Then press the orb once and just talk — hands-free: turn ends are
+Safari 26+). Click **Load models** (~680 MB on first run — SmolLM 363 +
+Pocket TTS 201 + Whisper 73 + D-FINE 42, all cached in OPFS afterwards). The
+Eye is enabled by default and requests camera access; uncheck it before loading
+to skip D-FINE. Then press the orb once and just talk — hands-free: turn ends are
 detected by silence, your words stream into the transcript live, the assistant
 answers out loud and resumes listening. Press the orb again to end.
 
