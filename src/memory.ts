@@ -237,36 +237,10 @@ export function directMemoryAnswer(
       return `Since ${favorite.value.slice(6).trim()} is your favorite color, that would be a natural choice.`;
     }
   }
-  if (/\bwhat should i wear\b/.test(s)) {
-    const interview = fact("interview");
-    if (interview) return `For your ${interview.value}, choose polished business attire.`;
-  }
   if (/\bwhat(?:'s| is) my (?:pet|cat|dog)(?:'s)? name\b/.test(s)) {
     const pet = fact("pet");
     const named = pet?.value.match(/named\s+(.+)$/i)?.[1];
     if (named) return `Your pet's name is ${named}.`;
-  }
-  if (/\bwhat (?:should|can|could) i feed\b/.test(s)) {
-    const pet = fact("pet");
-    if (pet) return `Feed your ${pet.value} a balanced, age-appropriate pet food and fresh water.`;
-  }
-  if (/\bwhat tricks? could i teach\b/.test(s)) {
-    const pet = fact("pet");
-    if (pet) return `You could teach your ${pet.value} to sit, stay, and fetch.`;
-  }
-  if (/\bwhat could we do together\b/.test(s)) {
-    const relation = fact("relation");
-    if (relation) return `You and your ${relation.value} could take a walk, share a meal, or visit somewhere new.`;
-  }
-  if (/\bshould i (?:just )?order takeout instead\b/.test(s)) {
-    const event = fact("event");
-    if (event) return `Since you ${event.value}, ordering takeout is a reasonable backup.`;
-  }
-  if (/\b(?:finger|fingers|hand|hands)\b.*\b(?:hurt|sore|pain|normal)\b|\b(?:hurt|sore|pain|normal)\b.*\b(?:finger|fingers|hand|hands)\b/.test(s)) {
-    const activity = fact("activity");
-    if (activity && /\b(?:guitar|ukulele|violin|cello|bass|piano)\b/i.test(activity.value)) {
-      return "Sore fingers are common when you're new to an instrument; take breaks, and stop if the pain is sharp or persistent.";
-    }
   }
   return null;
 }
