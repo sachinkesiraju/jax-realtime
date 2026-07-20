@@ -231,12 +231,6 @@ export function directMemoryAnswer(
       return `Your favorite ${topic} is ${value.join(":").trim()}.`;
     }
   }
-  if (/\b(?:what|which)\s+(?:color|colour)\b/.test(s)) {
-    const favorite = fact("favorite");
-    if (favorite?.value.toLowerCase().startsWith("color:")) {
-      return `Since ${favorite.value.slice(6).trim()} is your favorite color, that would be a natural choice.`;
-    }
-  }
   if (/\bwhat(?:'s| is) my (?:pet|cat|dog)(?:'s)? name\b/.test(s)) {
     const pet = fact("pet");
     const named = pet?.value.match(/named\s+(.+)$/i)?.[1];
