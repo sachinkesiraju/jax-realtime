@@ -18,7 +18,7 @@ that fits in a browser.
 | Stage | Model | Runs on |
 | --- | --- | --- |
 | Ear (ASR) | Whisper base.en (fp16) | WebGPU via jax-js |
-| Brain (LLM) | SmolLM2-360M-Instruct (int8 download, fp16 runtime) | WebGPU via jax-js |
+| Brain (LLM) | SmolLM2-360M-Instruct (fp16) | WebGPU via jax-js |
 | Voice (TTS) | Kyutai Pocket TTS + Mimi codec (fp16) | WebGPU via jax-js |
 | Eye (vision) | D-FINE small (COCO-80) | WebGPU via `@jax-js/onnx` |
 
@@ -40,10 +40,10 @@ assistant stops.
   they reach Whisper, and a repetition-degeneracy gate drops decoder loops — so
   the assistant doesn't answer "thank you"s you never said. Snappy one-word
   replies ("what?", "no") still get through.
-- **Eye (vision)** — optional and off by default, so its 42 MB model and GPU
-  residency stay out of the normal voice path. Enable it with one click when
-  you want webcam context. D-FINE runs low-priority object detection (it yields
-  the GPU to audio), smooths the person count, and answers
+- **Eye (vision)** — enabled by default for webcam context, with a pre-load
+  toggle to skip its 42 MB model, camera access, and GPU residency. D-FINE
+  runs low-priority object detection (it yields the GPU to audio), smooths the
+  person count, and answers
   "what do you see?" / "how many people?" / "tell me about the person"
   directly from the measurements. Proactive interjections (stepped away,
   phone spotted, slouching) are best-effort rule heuristics. The webcam shows
@@ -82,10 +82,9 @@ map-reduce campaign log, including the negative results):
   transcripts; low-confidence failures request a repeat before invoking the LLM.
 - **Deterministic memory fast paths** — exact recall and bounded trip, pet, and
   activity follow-ups can answer in a few milliseconds without model generation.
-- **Smaller download** — the LLM and Whisper ship per-row int8 (363 MB instead
-  of 724 MB and 73 MB instead of 144 MB), while the TTS checkpoint omits 35 MB
-  of audio-encoder weights never used for synthesis. The quantized artifacts
-  are dequantized at load, so runtime kernels stay unchanged.
+- **Smaller download** — Whisper ships a per-row int8 build (73 MB instead of
+  144 MB), while the TTS checkpoint omits 35 MB of audio-encoder weights never
+  used for synthesis. The SmolLM2 brain stays full fp16 for conversation quality.
 
 Runtime behaviour is tunable at `src/tunables.ts` (read live, so A/B
 experiments don't need a rebuild).
@@ -98,20 +97,20 @@ npm run dev
 ```
 
 Open http://localhost:5173 in a WebGPU-capable browser (Chrome/Edge on desktop,
-Safari 26+). Click **Load models** (~640 MB on first run — SmolLM 363 +
-Pocket TTS 201 + Whisper 73, all cached in OPFS afterwards). The optional Eye is
-off by default; enabling it adds the 42 MB D-FINE model and requests camera
-access. Then press the orb once and just talk — hands-free: turn ends are
+Safari 26+). Click **Load models** (~1.0 GB on first run — SmolLM 724 +
+Pocket TTS 201 + Whisper 73 + D-FINE 42, all cached in OPFS afterwards). The
+Eye is enabled by default and requests camera access; uncheck it before loading
+to skip D-FINE. Then press the orb once and just talk — hands-free: turn ends are
 detected by silence, your words stream into the transcript live, the assistant
 answers out loud and resumes listening. Press the orb again to end.
 
-> **Smaller model downloads.** By default the app fetches per-row int8 builds of
-> SmolLM2-360M and Whisper base.en from
-> [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights), then
-> dequantizes them to the normal runtime dtype during load. The LLM measured
-> perplexity +0.7%; Whisper produced identical paired MAP and holdout transcripts.
-> Either artifact falls back to its full fp16 file if the compact download is
-> unreachable.
+> **Smaller model downloads.** By default the app fetches the full fp16
+> SmolLM2-360M weights from
+> [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights); the
+> Whisper base.en weights are still fetched as a per-row int8 build and
+> dequantized to fp16 during load. Whisper produced identical paired MAP and
+> holdout transcripts; the SmolLM2 brain is kept at full precision for the best
+> conversation quality.
 
 The orb reacts in real time: it breathes when idle, swells with your voice while
 listening, shimmers while the model thinks, and pulses with the synthesized
