@@ -210,35 +210,6 @@ function factSentence(fact: MemoryFact): string {
   }
 }
 
-export function directMemoryAnswer(
-  facts: readonly MemoryFact[],
-  text: string,
-): string | null {
-  const s = text.toLowerCase().replace(/[’]/g, "'");
-  const fact = (kind: MemoryKind) => facts.find((candidate) => candidate.kind === kind);
-  if (/\b(?:what(?:'s| is| was) my name|who am i|what should you call me)\b/.test(s)) {
-    const name = fact("name");
-    if (name) return `Your name is ${name.value}.`;
-  }
-  if (/\b(?:where do i live|where am i from|what(?:'s| is) my (?:city|location))\b/.test(s)) {
-    const location = fact("location");
-    if (location) return `You said you live in or are from ${location.value}.`;
-  }
-  if (/\b(?:what(?:'s| is) my favou?rite|do you remember my favou?rite)\b/.test(s)) {
-    const favorite = fact("favorite");
-    if (favorite) {
-      const [topic, ...value] = favorite.value.split(":");
-      return `Your favorite ${topic} is ${value.join(":").trim()}.`;
-    }
-  }
-  if (/\bwhat(?:'s| is) my (?:pet|cat|dog)(?:'s)? name\b/.test(s)) {
-    const pet = fact("pet");
-    const named = pet?.value.match(/named\s+(.+)$/i)?.[1];
-    if (named) return `Your pet's name is ${named}.`;
-  }
-  return null;
-}
-
 export function injectMemoryTag(content: string, facts: readonly MemoryFact[]): string {
   return facts.length
     ? `[memory: ${facts.map(factSentence).join(" ")}] ${content}`

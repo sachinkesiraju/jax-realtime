@@ -6,7 +6,6 @@
 
 import { StreamingTranscriber, type StreamingUpdate } from "./asr/streaming";
 import {
-  directMemoryAnswer,
   injectMemoryTag,
   type ConversationalMemory,
   type MemoryFact,
@@ -671,18 +670,6 @@ export class DuplexSession {
       );
     } else {
       this.pendingMemoryFacts = [];
-    }
-
-    const rememberedReply = directMemoryAnswer(this.pendingMemoryFacts, text);
-    if (rememberedReply) {
-      this.cb.onEvent("memory · answering from explicit user facts");
-      this.history.push({ role: "user", content: text, t: this.elapsed() });
-      this.capture.clear();
-      transcriber.reset();
-      this.resetUtterance();
-      this.startFreshListening();
-      void this.speakProactive(rememberedReply);
-      return;
     }
 
     // Vision: the detector only *measures* (objects + colours). Precise factual

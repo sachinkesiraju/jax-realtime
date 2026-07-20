@@ -7,7 +7,6 @@ import "./style.css";
 import { DuplexSession, isGarbledTranscript } from "./duplex";
 import {
   type ConversationalMemory,
-  directMemoryAnswer,
   injectMemoryTag,
   relevantMemoryFacts,
   rememberUserFacts,
@@ -234,10 +233,7 @@ if (import.meta.env.DEV) {
       memory = rememberUserFacts(memory, turn, index + 1);
     });
     const facts = relevantMemoryFacts(memory, query, turns.length + 1);
-    return {
-      prompt: injectMemoryTag(query, facts),
-      answer: directMemoryAnswer(facts, query),
-    };
+    return { prompt: injectMemoryTag(query, facts) };
   };
 }
 
