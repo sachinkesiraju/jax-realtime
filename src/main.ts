@@ -1,6 +1,6 @@
 import "@fontsource-variable/instrument-sans";
-import "@fontsource/jetbrains-mono/400.css";
-import "@fontsource/jetbrains-mono/600.css";
+import "@fontsource/jetbrains-mono/latin-400.css";
+import "@fontsource/jetbrains-mono/latin-600.css";
 import "./style.css";
 
 import { DuplexSession, isGarbledTranscript } from "./duplex";
