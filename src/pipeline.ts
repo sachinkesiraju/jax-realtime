@@ -107,18 +107,6 @@ export const TTS_VOICES = [
 ] as const;
 export type TTSVoice = (typeof TTS_VOICES)[number];
 
-// System instructions for the cloud (Cerebras) brain; the local SmolLM brain
-// carries its own SMOLLM_SYSTEM. Keep this SHORT and POSITIVE: small models
-// can't follow long instructions or negation (naming a phrase to avoid just
-// primes them to say that phrase).
-const SYSTEM_HINT =
-  "You are a warm, helpful voice assistant. Answer the user's question or " +
-  "message directly in one or two short spoken sentences. A [scene: …] tag " +
-  "tells you what the camera sees. Do not read any bracketed tag aloud.";
-const MEMORY_HINT =
-  "A [memory: …] tag contains relevant facts the user explicitly shared earlier. " +
-  "Use those facts to answer the current message and do not read the tag aloud.";
-
 export async function fetchWithProgress(
   name: string,
   url: string,
@@ -355,16 +343,10 @@ export class SpeechRecognizer {
       let textLogProbTotal = 0;
       let textTokenCount = 0;
       for (let i = 0; i < ASR_MAX_NEW_TOKENS; i++) {
-        const sampledLogits = logits;
-        if (!sampledLogits) throw new Error("Decoder logits were not ready");
+        if (!logits) throw new Error("Decoder logits were not ready");
+        // sampleGreedyWithScore consumes logits via .data(); don't dispose.
+        const sample = await sampleGreedyWithScore(logits, generated, duration, config);
         logits = null;
-        const sample = await sampleGreedyWithScore(
-          sampledLogits,
-          generated,
-          duration,
-          config,
-        );
-        sampledLogits.dispose();
         if (sample.token < config.eosToken) {
           textLogProbTotal += sample.logProb;
           textTokenCount++;
@@ -499,13 +481,9 @@ export type GenerateStats = {
 
 /**
  * Common LLM interface. `generateStream` yields incremental text deltas as
- * tokens arrive and returns final stats; `generate` is the buffered form.
+ * tokens arrive and returns final stats.
  */
 export interface ChatModel {
-  generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-  ): Promise<{ text: string; stats: GenerateStats }>;
   generateStream(
     history: ChatMessage[],
   ): AsyncGenerator<string, GenerateStats, void>;
@@ -533,9 +511,6 @@ function windowHistory(history: ChatMessage[]): ChatMessage[] {
 const SMOLLM_BASE =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
 const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
-// Per-row symmetric int8 build (363 MB vs 724 MB fp16), dequantized to fp16 at
-// load so runtime is unchanged. Campaign-validated near-lossless (ppl +0.7%).
-const SMOLLM_Q8_URL = `${SMOLLM_BASE}/smollm2-360m-it-q8r.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
 const SMOLLM_REPEAT_PENALTY = 1.3;
 // KV capacity every turn's state is created with. jax-js traces key on
@@ -557,9 +532,11 @@ const SMOLLM_EOS = 0; // <|endoftext|>
 // SmolLM2 honors a real ChatML system role. A spoken-format prompt.
 const SMOLLM_SYSTEM =
   "You are a warm, helpful voice assistant. Answer directly in a natural, " +
-  "spoken style — a sentence or two, no lists, bullet points, or markdown. A " +
-  "[scene: …] tag tells you what the camera sees; never read a bracketed tag " +
-  "aloud.";
+  "spoken style — a sentence or two, no lists, bullet points, or markdown. Use " +
+  "contractions and a friendly, conversational tone. Address the user by name " +
+  "when you know it, and weave in any known facts naturally, like a friend " +
+  "would, without listing them. A [scene: …] tag tells you what the camera sees; " +
+  "never read a bracketed tag aloud.";
 // Optional clarify-on-garble instruction (TUNABLES.qualityGarbleClause).
 // Observed live failure: speech recognition sometimes hands the brain
 // gibberish ("whazzit fmm the uh...") and a 360M model answers it CONFIDENTLY
@@ -628,27 +605,13 @@ export class SmolLmChatModel implements ChatModel {
     );
     const specialIds = new Set(Object.values(spec.special));
 
-    let data: Uint8Array<ArrayBuffer> | null;
-    try {
-      data = await fetchWithProgress(
-        "SmolLM2 360M weights (int8)",
-        SMOLLM_Q8_URL,
-        onProgress,
-      );
-    } catch (err) {
-      // int8 download unreachable — fall back to the full fp16 file so the app
-      // still loads.
-      console.warn("int8 SmolLM download failed, falling back to fp16", err);
-      data = await fetchWithProgress(
-        "SmolLM2 360M weights",
-        SMOLLM_WEIGHTS_URL,
-        onProgress,
-      );
-    }
-    // Memory hygiene: `data` is 363 MB (int8) / 724 MB (fp16) and the parsed
-    // File's tensors are zero-copy views into it. smolLmFromSafetensors
-    // materializes every weight EAGERLY before its first await — int8 tensors
-    // are dequantized into a fresh Float16Array and fp16 tensors are copied
+    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
+      "SmolLM2 360M weights",
+      SMOLLM_WEIGHTS_URL,
+      onProgress,
+    );
+    // Memory hygiene: `data` is 724 MB and the parsed File's tensors are
+    // zero-copy views into it. smolLmFromSafetensors copies every fp16 weight
     // into backend memory by np.array (backend.malloc copies at call time) —
     // so after it resolves the download buffer backs nothing. Null the locals
     // so this frame (alive throughout loadPipeline's Promise.all) doesn't pin
@@ -713,16 +676,26 @@ export class SmolLmChatModel implements ChatModel {
     // System string is assembled HERE (not at module scope) so the garble
     // clause reflects the tunable's value at generation time — the quality
     // bench flips it per-session without reloading the model.
-    const hasMemory =
-      TUNABLES.qualityTypedMemory &&
-      history.some(
-        (message) =>
-          message.role === "user" && message.content.includes("[memory:"),
-      );
+    const lastUser = [...history].reverse().find((m) => m.role === "user");
+    // If the user turn was annotated with known facts, lift them out of the
+    // bracketed tag and into a separate system note so the model can reference
+    // them naturally instead of echoing the tag text.
+    let lastUserMemoryText = "";
+    let lastUserContent = lastUser?.content ?? "";
+    if (lastUser && TUNABLES.qualityTypedMemory) {
+      const match = lastUser.content.match(/^\[memory:\s*([^\]]+)\]\s*(.*)$/s);
+      if (match) {
+        lastUserMemoryText = match[1].trim();
+        lastUserContent = match[2].trim();
+      }
+    }
+    const hasMemory = lastUserMemoryText !== "";
     const system = [
       SMOLLM_SYSTEM,
       TUNABLES.qualityGarbleClause ? SMOLLM_GARBLE_CLAUSE : "",
-      hasMemory ? MEMORY_HINT : "",
+      hasMemory
+        ? `You already know: ${lastUserMemoryText} Reference these facts naturally, like a friend, without repeating them verbatim.`
+        : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -734,17 +707,17 @@ export class SmolLmChatModel implements ChatModel {
     // camera-grounded, never garble candidates, and the confirmation run
     // showed the exemplar can leak a clarify onto them ("What am I sitting
     // on?" → "couldn't quite follow").
-    const lastUser = [...history].reverse().find((m) => m.role === "user");
     if (
       TUNABLES.qualityGarbleClause &&
-      !lastUser?.content.includes("[scene:") &&
-      !lastUser?.content.includes("[memory:")
+      !lastUserContent.includes("[scene:") &&
+      !hasMemory
     ) {
       for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
     }
     for (const message of windowHistory(history)) {
-      const content = message.content.trim();
+      let content = message.content.trim();
       if (content === "") continue;
+      if (message === lastUser) content = lastUserContent;
       turn(message.role === "assistant" ? "assistant" : "user", content);
     }
     tokens.push(SMOLLM_IM_START, ...enc("assistant\n"));
@@ -1078,105 +1051,6 @@ export class SmolLmChatModel implements ChatModel {
     }
   }
 
-  async generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-    maxNewTokens = TUNABLES.llmMaxNewTokens,
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    let text = "";
-    const stream = this.generateStream(history, maxNewTokens);
-    let result = await stream.next();
-    while (!result.done) {
-      text += result.value;
-      onText(text);
-      result = await stream.next();
-    }
-    return { text: text.trim(), stats: result.value };
-  }
-
-}
-
-/** LLM stage backed by the Cerebras cloud API (as in the original blog post). */
-export class CerebrasChatModel implements ChatModel {
-  constructor(
-    private apiKey: string,
-    private modelName: string,
-  ) {}
-
-  private async fetchReply(
-    history: ChatMessage[],
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    const startTime = performance.now();
-    const response = await fetch(
-      "https://api.cerebras.ai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.modelName,
-          messages: [
-            {
-              role: "system",
-              content:
-                TUNABLES.qualityTypedMemory &&
-                history.some(
-                  (message) =>
-                    message.role === "user" &&
-                    message.content.includes("[memory:"),
-                )
-                  ? `${SYSTEM_HINT} ${MEMORY_HINT}`
-                  : SYSTEM_HINT,
-            },
-            ...history.map((m) => ({
-              role: m.role,
-              content:
-                m.role === "user" && m.t !== undefined
-                  ? `[t+${Math.round(m.t)}s] ${m.content}`
-                  : m.content,
-            })),
-          ],
-          max_tokens: 200,
-        }),
-      },
-    );
-    if (!response.ok) {
-      throw new Error(
-        `Cerebras API error ${response.status}: ${await response.text()}`,
-      );
-    }
-    const result = await response.json();
-    const text: string = result.choices?.[0]?.message?.content ?? "";
-    return {
-      text,
-      stats: {
-        promptTokens: result.usage?.prompt_tokens ?? 0,
-        newTokens: result.usage?.completion_tokens ?? 0,
-        firstTokenMs: performance.now() - startTime,
-        totalMs: performance.now() - startTime,
-      },
-    };
-  }
-
-  async generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    const reply = await this.fetchReply(history);
-    onText(reply.text);
-    return reply;
-  }
-
-  // Cerebras is non-streaming here; wrap the full reply as a one-item stream.
-  async *generateStream(
-    history: ChatMessage[],
-  ): AsyncGenerator<string, GenerateStats, void> {
-    const reply = await this.fetchReply(history);
-    if (reply.text) yield reply.text;
-    return reply.stats;
-  }
 }
 
 export type SpeakStats = {

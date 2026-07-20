@@ -1,12 +1,12 @@
+import "./float16-polyfill";
 import "@fontsource-variable/instrument-sans";
-import "@fontsource/jetbrains-mono/400.css";
-import "@fontsource/jetbrains-mono/600.css";
+import "@fontsource/jetbrains-mono/latin-400.css";
+import "@fontsource/jetbrains-mono/latin-600.css";
 import "./style.css";
 
 import { DuplexSession, isGarbledTranscript } from "./duplex";
 import {
   type ConversationalMemory,
-  directMemoryAnswer,
   injectMemoryTag,
   relevantMemoryFacts,
   rememberUserFacts,
@@ -233,10 +233,7 @@ if (import.meta.env.DEV) {
       memory = rememberUserFacts(memory, turn, index + 1);
     });
     const facts = relevantMemoryFacts(memory, query, turns.length + 1);
-    return {
-      prompt: injectMemoryTag(query, facts),
-      answer: directMemoryAnswer(facts, query),
-    };
+    return { prompt: injectMemoryTag(query, facts) };
   };
 }
 

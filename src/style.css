@@ -606,43 +606,6 @@ summary:focus-visible {
   font: 0.85rem var(--sans);
 }
 
-.cerebras {
-  position: relative;
-}
-
-.cerebras summary {
-  cursor: pointer;
-  list-style: none;
-  border: 1px solid var(--panel-edge);
-  border-radius: 7px;
-  padding: 0.35rem 0.65rem;
-}
-
-.cerebras summary:hover {
-  border-color: var(--signal-deep);
-}
-
-.cerebras-body {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 0.5rem);
-  z-index: 5;
-  width: 19rem;
-  display: grid;
-  gap: 0.5rem;
-  border: 1px solid var(--panel-edge);
-  border-radius: 10px;
-  background: var(--panel);
-  padding: 0.8rem;
-  box-shadow: 0 10px 30px oklch(10% 0.01 220 / 0.5);
-}
-
-.cerebras-body p {
-  margin: 0;
-  font-size: 0.78rem;
-  color: oklch(70% 0.02 110);
-}
-
 /* Downloads */
 .downloads {
   display: grid;

@@ -3,10 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
     "probe:pcm": "node --experimental-strip-types --input-type=module -e \"const { runPcmBufferProbe } = await import('./src/mic.ts'); console.log(JSON.stringify(runPcmBufferProbe()))\""
   },
   "dependencies": {

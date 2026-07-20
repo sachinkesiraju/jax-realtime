@@ -6,7 +6,6 @@
 
 import { StreamingTranscriber, type StreamingUpdate } from "./asr/streaming";
 import {
-  directMemoryAnswer,
   injectMemoryTag,
   type ConversationalMemory,
   type MemoryFact,
@@ -254,6 +253,7 @@ export class DuplexSession {
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
   private respondPromise: Promise<void> | null = null;
+  private proactivePromise: Promise<void> | null = null;
   private proactiveSpeaking = false;
   private currentTtsText: string | null = null;
   // Onset filler text for the current reply (e.g. "So,"). JUDGMENT CALL on the
@@ -378,6 +378,13 @@ export class DuplexSession {
         // ignore
       }
     }
+    if (this.proactivePromise) {
+      try {
+        await this.proactivePromise;
+      } catch {
+        // ignore
+      }
+    }
     await this.transcriber?.stop();
     this.transcriber = null;
     await this.capture.close();
@@ -385,10 +392,13 @@ export class DuplexSession {
     this.currentTtsText = null;
     this.assistant = null;
     this.proactiveSpeaking = false;
+    this.proactivePromise = null;
     // Drop any queued tool speech; the background fetch (if any) resolves into
     // a no-op since the queue is cleared and the session is no longer running.
     this.pendingToolSpeech = [];
     this.backgroundTask = null;
+    // Clear pending timers so a restarted session doesn't fire stale "time's up" lines.
+    this.timers = [];
   }
 
   // --- ASR callback ------------------------------------------------------
@@ -660,18 +670,6 @@ export class DuplexSession {
       );
     } else {
       this.pendingMemoryFacts = [];
-    }
-
-    const rememberedReply = directMemoryAnswer(this.pendingMemoryFacts, text);
-    if (rememberedReply) {
-      this.cb.onEvent("memory · answering from explicit user facts");
-      this.history.push({ role: "user", content: text, t: this.elapsed() });
-      this.capture.clear();
-      transcriber.reset();
-      this.resetUtterance();
-      this.startFreshListening();
-      void this.speakProactive(rememberedReply);
-      return;
     }
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
@@ -1129,8 +1127,14 @@ export class DuplexSession {
     void this.speakProactive(line);
   }
 
-  private async speakProactive(text: string): Promise<void> {
+  private speakProactive(text: string): void {
     if (this.responding() || this.proactiveSpeaking) return;
+    this.proactivePromise = this.runSpeakProactive(text).finally(() => {
+      this.proactivePromise = null;
+    });
+  }
+
+  private async runSpeakProactive(text: string): Promise<void> {
     this.proactiveSpeaking = true;
     this.currentTtsText = text;
     this.cb.onAssistantStart();

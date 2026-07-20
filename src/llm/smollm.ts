@@ -700,53 +700,14 @@ function tensorToArray(
   }
 }
 
-// Per-row symmetric int8 dequant (companion `<name>.scale` F32, one scale per
-// row), so the weights — including the tied embedding table — can ship int8.
-function dequantizeI8(
-  tensor: safetensors.Tensor,
-  scaleTensor: safetensors.Tensor,
-  dtype: np.DType,
-): np.Array {
-  if (tensor.shape.length !== 2) {
-    throw new Error(`Expected 2-D quantized tensor, got [${tensor.shape}]`);
-  }
-  const [rows, cols] = tensor.shape as [number, number];
-  const q = tensor.data as Int8Array;
-  const scales = scaleTensor.data as Float32Array;
-  if (scales.length !== rows) {
-    throw new Error(
-      `Quantization scale length ${scales.length} != rows ${rows}`,
-    );
-  }
-  const out =
-    dtype === np.float32
-      ? new Float32Array(rows * cols)
-      : new Float16Array(rows * cols);
-  for (let r = 0; r < rows; r++) {
-    const s = scales[r];
-    const base = r * cols;
-    for (let c = 0; c < cols; c++) out[base + c] = q[base + c] * s;
-  }
-  return np.array(out as Float16Array<ArrayBuffer>, { shape: tensor.shape, dtype });
-}
-
 export async function fromSafetensors(
   file: safetensors.File,
   dtype: np.DType = np.float16,
 ): Promise<SmolLmModel> {
   const hydrated: Record<string, np.Array> = {};
   for (const [key, tensor] of Object.entries(file.tensors)) {
-    if (key.endsWith(".scale")) continue; // companion of a quantized tensor
     // lm_head is tied to embed_tokens; ignore a materialized copy if present.
     if (key === "lm_head.weight") continue;
-    if (tensor.dtype === "I8") {
-      const scale = file.tensors[`${key}.scale`];
-      if (!scale) {
-        throw new Error(`Quantized tensor ${key} is missing its .scale`);
-      }
-      hydrated[mapper.mapKey(key)] = dequantizeI8(tensor, scale, dtype);
-      continue;
-    }
     hydrated[mapper.mapKey(key)] = tensorToArray(tensor, dtype);
   }
 
