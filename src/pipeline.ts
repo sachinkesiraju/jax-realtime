@@ -517,9 +517,6 @@ function windowHistory(history: ChatMessage[]): ChatMessage[] {
 const SMOLLM_BASE =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main";
 const SMOLLM_WEIGHTS_URL = `${SMOLLM_BASE}/smollm2-360m-it-fp16.safetensors`;
-// Per-row symmetric int8 build (363 MB vs 724 MB fp16), dequantized to fp16 at
-// load so runtime is unchanged. Campaign-validated near-lossless (ppl +0.7%).
-const SMOLLM_Q8_URL = `${SMOLLM_BASE}/smollm2-360m-it-q8r.safetensors`;
 const SMOLLM_TOKENIZER_URL = `${SMOLLM_BASE}/smollm2-360m-tokenizer.json`;
 const SMOLLM_REPEAT_PENALTY = 1.3;
 // KV capacity every turn's state is created with. jax-js traces key on
@@ -614,28 +611,13 @@ export class SmolLmChatModel implements ChatModel {
     );
     const specialIds = new Set(Object.values(spec.special));
 
-    // The full-precision fp16 file gives measurably warmer, less echo-prone
-    // conversation than the per-row int8 dequantization, so we load it first
-    // for the demo. The int8 file stays as a fallback for slower connections.
-    let data: Uint8Array<ArrayBuffer> | null;
-    try {
-      data = await fetchWithProgress(
-        "SmolLM2 360M weights",
-        SMOLLM_WEIGHTS_URL,
-        onProgress,
-      );
-    } catch (err) {
-      console.warn("fp16 SmolLM download failed, falling back to int8", err);
-      data = await fetchWithProgress(
-        "SmolLM2 360M weights (int8)",
-        SMOLLM_Q8_URL,
-        onProgress,
-      );
-    }
-    // Memory hygiene: `data` is 363 MB (int8) / 724 MB (fp16) and the parsed
-    // File's tensors are zero-copy views into it. smolLmFromSafetensors
-    // materializes every weight EAGERLY before its first await — int8 tensors
-    // are dequantized into a fresh Float16Array and fp16 tensors are copied
+    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
+      "SmolLM2 360M weights",
+      SMOLLM_WEIGHTS_URL,
+      onProgress,
+    );
+    // Memory hygiene: `data` is 724 MB and the parsed File's tensors are
+    // zero-copy views into it. smolLmFromSafetensors copies every fp16 weight
     // into backend memory by np.array (backend.malloc copies at call time) —
     // so after it resolves the download buffer backs nothing. Null the locals
     // so this frame (alive throughout loadPipeline's Promise.all) doesn't pin
