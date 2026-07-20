@@ -1421,17 +1421,51 @@ const weightMapper = new WeightMapper({
   autoCamelCase: true,
 });
 
+function dequantizeI8(
+  tensor: safetensors.Tensor,
+  scaleTensor: safetensors.Tensor,
+): np.Array {
+  if (tensor.shape.length !== 2) {
+    throw new Error(`Expected 2-D quantized tensor, got [${tensor.shape}]`);
+  }
+  const [rows, cols] = tensor.shape as [number, number];
+  const q = tensor.data as Int8Array;
+  const scales = scaleTensor.data as Float32Array;
+  if (scales.length !== rows) {
+    throw new Error(
+      `Quantization scale length ${scales.length} != rows ${rows}`,
+    );
+  }
+  const out = new Float16Array(rows * cols);
+  for (let r = 0; r < rows; r++) {
+    const s = scales[r];
+    const base = r * cols;
+    for (let c = 0; c < cols; c++) out[base + c] = q[base + c] * s;
+  }
+  return np.array(out as Float16Array<ArrayBuffer>, {
+    shape: tensor.shape,
+    dtype: np.float16,
+  });
+}
+
 export function fromSafetensors(file: safetensors.File): PocketTTS {
-  const mappedWeights = weightMapper.mapObject(file.tensors);
   const hydrated: Record<string, np.Array> = {};
-  for (const [key, value] of Object.entries(mappedWeights)) {
-    if (value.dtype === "F16") {
-      hydrated[key] = np.array(value.data as Float16Array<ArrayBuffer>, {
+  for (const [key, tensor] of Object.entries(file.tensors)) {
+    if (key.endsWith(".scale")) continue; // companion of a quantized tensor
+    const mappedKey = weightMapper.mapKey(key);
+    if (tensor.dtype === "F16") {
+      hydrated[mappedKey] = np.array(tensor.data as Float16Array<ArrayBuffer>, {
         dtype: np.float16,
-        shape: value.shape,
+        shape: tensor.shape,
       });
+    } else if (tensor.dtype === "I8") {
+      const scale = file.tensors[`${key}.scale`];
+      if (!scale) {
+        throw new Error(`Quantized tensor ${key} is missing its .scale`);
+      }
+      hydrated[mappedKey] = dequantizeI8(tensor, scale);
     } else {
-      throw new Error(`Unexpected dtype ${value.dtype} for weight ${key}`);
+      throw new Error(`Unexpected dtype ${tensor.dtype} for weight ${key}`);
     }
   }
   return safetensors.toNested(hydrated);

@@ -88,8 +88,10 @@ const WHISPER_CONFIG: WhisperConfig = WHISPER_MODELS.find(
 )!;
 const ASR_MAX_NEW_TOKENS = 96;
 
-const TTS_WEIGHTS_URL =
+const TTS_FP16_URL =
   "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/pocket-tts-decode-fp16.safetensors";
+const TTS_Q8_URL =
+  "https://huggingface.co/sachink98/jax-realtime-weights/resolve/main/pocket-tts-decode-q8r.safetensors";
 const TTS_HF_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
 const WHISPER_Q8_URL =
@@ -1114,11 +1116,21 @@ export class SpeechSynthesizer {
     // download backs nothing. Null the locals so this async frame (concurrent
     // with the other two loads under Promise.all) releases the buffer instead
     // of holding it next to the GPU-resident weights.
-    let data: Uint8Array<ArrayBuffer> | null = await fetchWithProgress(
-      "Pocket TTS weights",
-      TTS_WEIGHTS_URL,
-      onProgress,
-    );
+    let data: Uint8Array<ArrayBuffer> | null;
+    try {
+      data = await fetchWithProgress(
+        "Pocket TTS weights (int8)",
+        TTS_Q8_URL,
+        onProgress,
+      );
+    } catch (error) {
+      console.warn("int8 Pocket TTS download failed, falling back to fp16", error);
+      data = await fetchWithProgress(
+        "Pocket TTS weights",
+        TTS_FP16_URL,
+        onProgress,
+      );
+    }
     let weights: safetensors.File | null = safetensors.parse(data);
     data = null; // views inside `weights` keep the buffer alive until upload
     const model = ttsFromSafetensors(weights);

@@ -97,7 +97,7 @@ app.innerHTML = `
         <p class="orb-hint" id="orb-hint">
           Load the models, then press the orb once and just talk &mdash; no
           buttons between turns. Talk over it to interrupt.<br />
-          The first load downloads ~640&nbsp;MB of weights; cached afterwards.
+          The first load downloads ~943&nbsp;MB of weights; cached afterwards.
         </p>
         <p class="ticker" id="ticker"></p>
       </div>
