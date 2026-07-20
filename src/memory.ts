@@ -210,51 +210,6 @@ function factSentence(fact: MemoryFact): string {
   }
 }
 
-/** Map a trip destination to a short, destination-appropriate food suggestion. */
-function localSpecialtiesFor(destination: string): string | null {
-  const d = destination.toLowerCase();
-  if (d.includes("japan") || d.includes("tokyo") || d.includes("kyoto") || d.includes("osaka")) {
-    return "sushi, ramen, tempura, yakitori, and street food from convenience stores";
-  }
-  if (d.includes("italy") || d.includes("rome") || d.includes("milan") || d.includes("florence") || d.includes("naples")) {
-    return "regional pasta, pizza al taglio, fresh mozzarella, gelato, and local wine";
-  }
-  if (d.includes("france") || d.includes("paris") || d.includes("lyon") || d.includes("marseille")) {
-    return "baguettes, croissants, cheese from a fromagerie, and a classic bistro plat";
-  }
-  if (d.includes("mexico") || d.includes("mexico city") || d.includes("oaxaca") || d.includes("tijuana")) {
-    return "tacos, tamales, mole, fresh salsa, and churros";
-  }
-  if (d.includes("india") || d.includes("mumbai") || d.includes("delhi") || d.includes("bangalore") || d.includes("chennai")) {
-    return "local curries, dosas, biryani, chaat, and freshly baked naan";
-  }
-  if (d.includes("thailand") || d.includes("bangkok") || d.includes("chiang mai")) {
-    return "pad thai, green curry, som tam, mango sticky rice, and night-market skewers";
-  }
-  if (d.includes("vietnam") || d.includes("hanoi") || d.includes("ho chi minh")) {
-    return "phở, bánh mì, fresh spring rolls, and Vietnamese coffee";
-  }
-  if (d.includes("spain") || d.includes("barcelona") || d.includes("madrid") || d.includes("seville")) {
-    return "tapas, jamón ibérico, tortilla, churros, and regional vermouth";
-  }
-  if (d.includes("korea") || d.includes("seoul") || d.includes("busan")) {
-    return "Korean barbecue, bibimbap, tteokbokki, kimchi stew, and bingsu";
-  }
-  if (d.includes("greece") || d.includes("athens") || d.includes("santorini")) {
-    return "souvlaki, moussaka, Greek salad, tzatziki, and baklava";
-  }
-  if (d.includes("germany") || d.includes("berlin") || d.includes("munich")) {
-    return "currywurst, schnitzel, pretzels, sausages, and local beer";
-  }
-  if (d.includes("china") || d.includes("beijing") || d.includes("shanghai") || d.includes("chengdu")) {
-    return "dim sum, Peking duck, Sichuan hot pot, soup dumplings, and bubble tea";
-  }
-  if (d.includes("new york") || d.includes("nyc") || d.includes("los angeles") || d.includes("london")) {
-    return "a mix of iconic local spots and the best ethnic neighborhoods you can find";
-  }
-  return null;
-}
-
 export function directMemoryAnswer(
   facts: readonly MemoryFact[],
   text: string,
@@ -280,16 +235,6 @@ export function directMemoryAnswer(
     const favorite = fact("favorite");
     if (favorite?.value.toLowerCase().startsWith("color:")) {
       return `Since ${favorite.value.slice(6).trim()} is your favorite color, that would be a natural choice.`;
-    }
-  }
-  if (/\b(?:what food should i try|what should i (?:eat|try)|food should i try)\b/.test(s)) {
-    const trip = fact("trip");
-    if (trip) {
-      const specialties = localSpecialtiesFor(trip.value);
-      if (specialties) {
-        return `For your trip to ${trip.value}, try local specialties such as ${specialties}.`;
-      }
-      return `For your trip to ${trip.value}, try the well-known local dishes and ask locals for their favorite neighborhood spots.`;
     }
   }
   if (/\bwhat should i wear\b/.test(s)) {
