@@ -15,9 +15,10 @@ type Float16ArrayLike = {
   [Symbol.toStringTag]: "Float16Array";
 };
 
+const floatView = new Float32Array(1);
+const int32View = new Int32Array(floatView.buffer);
+
 function toHalfBits(val: number): number {
-  const floatView = new Float32Array(1);
-  const int32View = new Int32Array(floatView.buffer);
   floatView[0] = val;
   const x = int32View[0];
 
@@ -31,7 +32,7 @@ function toHalfBits(val: number): number {
   if (e > 142) {
     bits |= 0x7c00; // Inf
     // NaN if original was NaN, otherwise keep mantissa zero
-    bits |= ((e === 255 ? 0 : 1) && (x & 0x007fffff)) ? 0x200 : 0;
+    bits |= e === 255 && (x & 0x007fffff) !== 0 ? 0x200 : 0;
     return bits;
   }
   if (e < 113) {
