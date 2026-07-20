@@ -343,16 +343,10 @@ export class SpeechRecognizer {
       let textLogProbTotal = 0;
       let textTokenCount = 0;
       for (let i = 0; i < ASR_MAX_NEW_TOKENS; i++) {
-        const sampledLogits = logits;
-        if (!sampledLogits) throw new Error("Decoder logits were not ready");
+        if (!logits) throw new Error("Decoder logits were not ready");
+        // sampleGreedyWithScore consumes logits via .data(); don't dispose.
+        const sample = await sampleGreedyWithScore(logits, generated, duration, config);
         logits = null;
-        const sample = await sampleGreedyWithScore(
-          sampledLogits,
-          generated,
-          duration,
-          config,
-        );
-        sampledLogits.dispose();
         if (sample.token < config.eosToken) {
           textLogProbTotal += sample.logProb;
           textTokenCount++;
