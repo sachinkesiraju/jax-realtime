@@ -112,11 +112,13 @@ export function createStreamingPlayer(
 
   return {
     async playChunk(samples: Float32Array) {
-      chunks.push(samples.slice());
-
       // In collect-only mode we accumulate PCM without ever touching the
       // speakers — used to pre-synthesize backchannels off the audio graph.
-      if (collectPcm || stopped) return;
+      if (collectPcm) {
+        chunks.push(samples.slice());
+        return;
+      }
+      if (stopped) return;
 
       // Resume audio context if suspended, which is common on mobile after idle
       // periods or keyboard use.

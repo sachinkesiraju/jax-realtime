@@ -68,14 +68,16 @@ export function runFlowLMStep(
   noiseClamp: number | null = null,
   eosThreshold: number = -4.0,
 ): { latent: np.Array; isEos: np.Array; state: FlowLMState } {
+  // Read ldim before disposing bosEmb; ldim is required for the random-noise
+  // shape below and must be read while the array is still valid.
+  const ldim = bosEmb.shape[0];
+
   // unused fields
   bosEmb.dispose();
   conditionerEmbed.dispose();
   embMean.dispose();
   embStd.dispose();
   speakerProjWeight.dispose();
-
-  const ldim = bosEmb.shape[0];
 
   // Project input from 32 -> 1024
   let input = runLinear(inputLinear, sequence);
