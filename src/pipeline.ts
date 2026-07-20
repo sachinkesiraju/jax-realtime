@@ -107,14 +107,6 @@ export const TTS_VOICES = [
 ] as const;
 export type TTSVoice = (typeof TTS_VOICES)[number];
 
-// System instructions for the cloud (Cerebras) brain; the local SmolLM brain
-// carries its own SMOLLM_SYSTEM. Keep this SHORT and POSITIVE: small models
-// can't follow long instructions or negation (naming a phrase to avoid just
-// primes them to say that phrase).
-const SYSTEM_HINT =
-  "You are a warm, helpful voice assistant. Answer the user's question or " +
-  "message directly in one or two short spoken sentences. A [scene: …] tag " +
-  "tells you what the camera sees. Do not read any bracketed tag aloud.";
 const MEMORY_HINT =
   "A [memory: …] tag contains relevant facts the user explicitly shared earlier. " +
   "Use those facts to answer the current message and do not read the tag aloud.";
@@ -499,13 +491,9 @@ export type GenerateStats = {
 
 /**
  * Common LLM interface. `generateStream` yields incremental text deltas as
- * tokens arrive and returns final stats; `generate` is the buffered form.
+ * tokens arrive and returns final stats.
  */
 export interface ChatModel {
-  generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-  ): Promise<{ text: string; stats: GenerateStats }>;
   generateStream(
     history: ChatMessage[],
   ): AsyncGenerator<string, GenerateStats, void>;
@@ -1078,105 +1066,6 @@ export class SmolLmChatModel implements ChatModel {
     }
   }
 
-  async generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-    maxNewTokens = TUNABLES.llmMaxNewTokens,
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    let text = "";
-    const stream = this.generateStream(history, maxNewTokens);
-    let result = await stream.next();
-    while (!result.done) {
-      text += result.value;
-      onText(text);
-      result = await stream.next();
-    }
-    return { text: text.trim(), stats: result.value };
-  }
-
-}
-
-/** LLM stage backed by the Cerebras cloud API (as in the original blog post). */
-export class CerebrasChatModel implements ChatModel {
-  constructor(
-    private apiKey: string,
-    private modelName: string,
-  ) {}
-
-  private async fetchReply(
-    history: ChatMessage[],
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    const startTime = performance.now();
-    const response = await fetch(
-      "https://api.cerebras.ai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.modelName,
-          messages: [
-            {
-              role: "system",
-              content:
-                TUNABLES.qualityTypedMemory &&
-                history.some(
-                  (message) =>
-                    message.role === "user" &&
-                    message.content.includes("[memory:"),
-                )
-                  ? `${SYSTEM_HINT} ${MEMORY_HINT}`
-                  : SYSTEM_HINT,
-            },
-            ...history.map((m) => ({
-              role: m.role,
-              content:
-                m.role === "user" && m.t !== undefined
-                  ? `[t+${Math.round(m.t)}s] ${m.content}`
-                  : m.content,
-            })),
-          ],
-          max_tokens: 200,
-        }),
-      },
-    );
-    if (!response.ok) {
-      throw new Error(
-        `Cerebras API error ${response.status}: ${await response.text()}`,
-      );
-    }
-    const result = await response.json();
-    const text: string = result.choices?.[0]?.message?.content ?? "";
-    return {
-      text,
-      stats: {
-        promptTokens: result.usage?.prompt_tokens ?? 0,
-        newTokens: result.usage?.completion_tokens ?? 0,
-        firstTokenMs: performance.now() - startTime,
-        totalMs: performance.now() - startTime,
-      },
-    };
-  }
-
-  async generate(
-    history: ChatMessage[],
-    onText: (partial: string) => void,
-  ): Promise<{ text: string; stats: GenerateStats }> {
-    const reply = await this.fetchReply(history);
-    onText(reply.text);
-    return reply;
-  }
-
-  // Cerebras is non-streaming here; wrap the full reply as a one-item stream.
-  async *generateStream(
-    history: ChatMessage[],
-  ): AsyncGenerator<string, GenerateStats, void> {
-    const reply = await this.fetchReply(history);
-    if (reply.text) yield reply.text;
-    return reply.stats;
-  }
 }
 
 export type SpeakStats = {
