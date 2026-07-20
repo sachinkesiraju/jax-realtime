@@ -614,20 +614,21 @@ export class SmolLmChatModel implements ChatModel {
     );
     const specialIds = new Set(Object.values(spec.special));
 
+    // The full-precision fp16 file gives measurably warmer, less echo-prone
+    // conversation than the per-row int8 dequantization, so we load it first
+    // for the demo. The int8 file stays as a fallback for slower connections.
     let data: Uint8Array<ArrayBuffer> | null;
     try {
       data = await fetchWithProgress(
-        "SmolLM2 360M weights (int8)",
-        SMOLLM_Q8_URL,
+        "SmolLM2 360M weights",
+        SMOLLM_WEIGHTS_URL,
         onProgress,
       );
     } catch (err) {
-      // int8 download unreachable — fall back to the full fp16 file so the app
-      // still loads.
-      console.warn("int8 SmolLM download failed, falling back to fp16", err);
+      console.warn("fp16 SmolLM download failed, falling back to int8", err);
       data = await fetchWithProgress(
-        "SmolLM2 360M weights",
-        SMOLLM_WEIGHTS_URL,
+        "SmolLM2 360M weights (int8)",
+        SMOLLM_Q8_URL,
         onProgress,
       );
     }
