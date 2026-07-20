@@ -107,10 +107,6 @@ export const TTS_VOICES = [
 ] as const;
 export type TTSVoice = (typeof TTS_VOICES)[number];
 
-const MEMORY_HINT =
-  "A [memory: …] tag contains relevant facts the user explicitly shared earlier. " +
-  "Use those facts to answer the current message and do not read the tag aloud.";
-
 export async function fetchWithProgress(
   name: string,
   url: string,
@@ -545,9 +541,11 @@ const SMOLLM_EOS = 0; // <|endoftext|>
 // SmolLM2 honors a real ChatML system role. A spoken-format prompt.
 const SMOLLM_SYSTEM =
   "You are a warm, helpful voice assistant. Answer directly in a natural, " +
-  "spoken style — a sentence or two, no lists, bullet points, or markdown. A " +
-  "[scene: …] tag tells you what the camera sees; never read a bracketed tag " +
-  "aloud.";
+  "spoken style — a sentence or two, no lists, bullet points, or markdown. Use " +
+  "contractions and a friendly, conversational tone. Address the user by name " +
+  "when you know it, and weave in any known facts naturally, like a friend " +
+  "would, without listing them. A [scene: …] tag tells you what the camera sees; " +
+  "never read a bracketed tag aloud.";
 // Optional clarify-on-garble instruction (TUNABLES.qualityGarbleClause).
 // Observed live failure: speech recognition sometimes hands the brain
 // gibberish ("whazzit fmm the uh...") and a 360M model answers it CONFIDENTLY
@@ -701,16 +699,26 @@ export class SmolLmChatModel implements ChatModel {
     // System string is assembled HERE (not at module scope) so the garble
     // clause reflects the tunable's value at generation time — the quality
     // bench flips it per-session without reloading the model.
-    const hasMemory =
-      TUNABLES.qualityTypedMemory &&
-      history.some(
-        (message) =>
-          message.role === "user" && message.content.includes("[memory:"),
-      );
+    const lastUser = [...history].reverse().find((m) => m.role === "user");
+    // If the user turn was annotated with known facts, lift them out of the
+    // bracketed tag and into a separate system note so the model can reference
+    // them naturally instead of echoing the tag text.
+    let lastUserMemoryText = "";
+    let lastUserContent = lastUser?.content ?? "";
+    if (lastUser && TUNABLES.qualityTypedMemory) {
+      const match = lastUser.content.match(/^\[memory:\s*([^\]]+)\]\s*(.*)$/s);
+      if (match) {
+        lastUserMemoryText = match[1].trim();
+        lastUserContent = match[2].trim();
+      }
+    }
+    const hasMemory = lastUserMemoryText !== "";
     const system = [
       SMOLLM_SYSTEM,
       TUNABLES.qualityGarbleClause ? SMOLLM_GARBLE_CLAUSE : "",
-      hasMemory ? MEMORY_HINT : "",
+      hasMemory
+        ? `You already know: ${lastUserMemoryText} Reference these facts naturally, like a friend, without repeating them verbatim.`
+        : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -722,17 +730,17 @@ export class SmolLmChatModel implements ChatModel {
     // camera-grounded, never garble candidates, and the confirmation run
     // showed the exemplar can leak a clarify onto them ("What am I sitting
     // on?" → "couldn't quite follow").
-    const lastUser = [...history].reverse().find((m) => m.role === "user");
     if (
       TUNABLES.qualityGarbleClause &&
-      !lastUser?.content.includes("[scene:") &&
-      !lastUser?.content.includes("[memory:")
+      !lastUserContent.includes("[scene:") &&
+      !hasMemory
     ) {
       for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
     }
     for (const message of windowHistory(history)) {
-      const content = message.content.trim();
+      let content = message.content.trim();
       if (content === "") continue;
+      if (message === lastUser) content = lastUserContent;
       turn(message.role === "assistant" ? "assistant" : "user", content);
     }
     tokens.push(SMOLLM_IM_START, ...enc("assistant\n"));
