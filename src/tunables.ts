@@ -155,12 +155,12 @@ export const TUNABLES = {
    * unchanged within noise. The EARS half of the gate is still open — flip
    * this on and listen for whether "So, … <pause> …reply" beats silence
    * before it defaults on. Flipped ON in cycle 8 ("voice responses don't
-   * feel realtime"): first sound lands ~0.5-0.8 s after end of speech with
-   * real-reply latency unchanged. The ears gate is now live-in-production —
-   * if the filler-then-pause cadence sounds worse than silence, flip this
-   * back off; the bench numbers will not miss it.
+   * feel realtime") but it shipped broken: the filler was heard by the mic
+   * and transcribed as a fake user response, and the "voice before the LLM
+   * reply" cadence sounded buggy. SHIPPED OFF — real first audio comes from
+   * the actual reply, not a cached lead-in.
    */
-  onsetFiller: true,
+  onsetFiller: false,
 
   // region: tools (campaign 2 — delegation)
   /**
