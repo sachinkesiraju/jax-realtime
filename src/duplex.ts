@@ -607,9 +607,9 @@ export class DuplexSession {
       this.startFreshListening();
       return;
     }
-    if (isDegenerateTranscript(text)) {
-      // Whisper repetition loop ("All in all. All in all. …") — a decoder
-      // artifact, not something the user said. Never answer it.
+    if (isGarbledTranscript(text)) {
+      // Whisper repetition loop / stutter ("All in all. All in all.…",
+      // "the the the") — a decoder artifact, not something the user said.
       this.cb.onEvent("asr · garbled, discarded");
       this.startFreshListening();
       return;
@@ -1113,11 +1113,6 @@ export class DuplexSession {
   }
 }
 
-/**
- * Index just after a sentence-ending punctuation that is followed by
- * whitespace, or -1. Requiring a trailing whitespace avoids flushing on
- * decimals like "3.14" mid-stream; the end-of-stream tail is flushed separately.
- */
 /** Count whitespace-separated word tokens in a transcript string. */
 function displayWordCount(text: string): number {
   const trimmed = text.trim();
@@ -1125,20 +1120,36 @@ function displayWordCount(text: string): number {
 }
 
 /**
- * Whisper's repetition-loop failure mode: on ambiguous audio the decoder can
- * emit one phrase over and over ("All in all. All in all. All in all…"). That
- * is a decode artifact, not speech — a real utterance of ≥6 words has far more
- * lexical variety. Signal-based (a repetition statistic), no phrase lists.
+ * Whisper's repetition-loop failure mode on ambiguous audio: it can emit one
+ * phrase over and over ("All in all. All in all.…"), the same word repeated
+ * ("the the the"), or a gibberish trigram loop. A real ≥6-word utterance has
+ * far more lexical variety. Signal-based, no phrase blocklists.
  */
-function isDegenerateTranscript(text: string): boolean {
-  const tokens = text
+function transcriptTokens(text: string): string[] {
+  return text
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .split(/\s+/)
     .filter(Boolean);
+}
+
+function isGarbledTranscript(text: string): boolean {
+  const tokens = transcriptTokens(text);
   if (tokens.length < 6) return false;
-  const unique = new Set(tokens).size;
-  return unique / tokens.length < 0.4;
+  if (new Set(tokens).size / tokens.length < 0.4) return true;
+  // Adjacent identical words (Whisper stutter) and looping trigrams.
+  for (let i = 1; i < tokens.length; i++) {
+    if (tokens[i] === tokens[i - 1]) return true;
+  }
+  const trigrams = new Set<string>();
+  for (let i = 0; i <= tokens.length - 3; i++) {
+    const trigram = tokens.slice(i, i + 3).join(" ");
+    if (trigrams.has(trigram)) return true;
+    trigrams.add(trigram);
+  }
+  return /\b(?:the|a|an)\s+(?:with|about|for|to)\s+(?:about|with|for|to)\b/i.test(
+    text,
+  );
 }
 
 function findSentenceEnd(buffer: string): number {
