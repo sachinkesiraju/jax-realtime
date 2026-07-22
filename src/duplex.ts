@@ -351,6 +351,9 @@ export class DuplexSession {
         // Interval/window come from TUNABLES (read live by the loop). Pause
         // while the assistant is speaking so ASR doesn't steal the GPU from TTS.
         pauseWhile: () => this.isAssistantAudible(),
+        // Fast-commit knobs default to TUNABLES (read live) when left undefined.
+        fastCommit: TUNABLES.asrFastCommit,
+        fastCommitThreshold: TUNABLES.asrFastCommitThreshold,
       },
     );
     this.transcriber.start();

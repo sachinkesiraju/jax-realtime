@@ -11,7 +11,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "probe:pcm": "node --experimental-strip-types --input-type=module -e \"const { runPcmBufferProbe } = await import('./src/mic.ts'); console.log(JSON.stringify(runPcmBufferProbe()))\""
+    "probe:pcm": "node --experimental-strip-types --input-type=module -e \"const { runPcmBufferProbe } = await import('./src/mic.ts'); console.log(JSON.stringify(runPcmBufferProbe()))\"",
+    "test:asr": "node --experimental-transform-types --import ./scripts/register-ts-hooks.mjs src/asr/streaming.test.ts"
   },
   "dependencies": {
     "@fontsource-variable/instrument-sans": "^5.2.8",
