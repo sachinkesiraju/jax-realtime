@@ -49,6 +49,24 @@ export const TUNABLES = {
    * -0.013..-0.007 correct) with zero clean false clarifications.
    */
   asrConfidenceThreshold: -0.3 as number | null,
+  /**
+   * Fast-commit path (default OFF -> keeps two-pass LocalAgreement-2). When on,
+   * a single streaming pass whose decoder confidence (`confidence.avgLogProb`)
+   * is >= `asrFastCommitThreshold` commits its ENTIRE current hypothesis
+   * immediately (tail becomes empty) instead of waiting for a second pass to
+   * agree on the common prefix. This shaves one pass (~asrPassIntervalMs plus a
+   * Whisper decode) of caption lag off high-confidence words. LocalAgreement-2
+   * is still the fallback for below-threshold passes, so low-confidence /
+   * unstable hypotheses are never prematurely committed.
+   */
+  asrFastCommit: false,
+  /**
+   * avgLogProb floor for `asrFastCommit`. Uses the same decoder-score scale as
+   * `asrConfidenceThreshold` (cycle-13 MAP: clean decodes -0.10..-0.01, garbled
+   * -0.69..-0.63), so -0.3 fast-commits confident decodes while leaving garbled
+   * ones on the safe two-pass path.
+   */
+  asrFastCommitThreshold: -0.3,
 
   // region: llm
   /**
