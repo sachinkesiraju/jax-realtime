@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "probe:pcm": "node --experimental-strip-types --input-type=module -e \"const { runPcmBufferProbe } = await import('./src/mic.ts'); console.log(JSON.stringify(runPcmBufferProbe()))\"",
-    "test:asr": "node --experimental-transform-types --import ./scripts/register-ts-hooks.mjs src/asr/streaming.test.ts"
+    "test:asr": "node --experimental-strip-types src/asr/commit.test.ts"
   },
   "dependencies": {
     "@fontsource-variable/instrument-sans": "^5.2.8",
