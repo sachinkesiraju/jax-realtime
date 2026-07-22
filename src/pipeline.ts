@@ -1302,6 +1302,70 @@ export class SpeechSynthesizer {
   }
 
   /**
+   * Build synthetic text whose prepared token count reaches ~`target`, then
+   * return the encoded tokens. Mirrors synthOne exactly (prepareTextPrompt +
+   * tokenizer.encode) so the resulting trace shape matches a real sentence of
+   * that token length. The word is filler — only the token COUNT (the flow-LM
+   * prefill's jit trace key) matters; it never reaches the speakers.
+   */
+  private warmupTokens(target: number): number[] {
+    let text = "one";
+    let tokens = this.tokenizer.encode(this.prepareTextPrompt(text)[0]);
+    // Grow one word at a time until we hit the target length; the length guard
+    // is a belt-and-braces stop against a pathological tokenizer.
+    while (tokens.length < target && text.length < 4096) {
+      text += " one";
+      tokens = this.tokenizer.encode(this.prepareTextPrompt(text)[0]);
+    }
+    return tokens;
+  }
+
+  /**
+   * Pre-trace the Pocket TTS flow-LM step-0 prefill for the given voice across
+   * a spread of representative sentence token lengths, before the user starts
+   * a conversation. The flow-LM prefill is the only TTS trace that keys on the
+   * sentence's token count, so the first sentence of an unseen length would
+   * otherwise pay a one-time trace+compile tax on-turn (~90–380 ms of the
+   * first-audio variance benchTtsPrefill measures). Mirrors benchTtsPrefill /
+   * synthOne's embed construction so the warmed shapes are the real ones, and
+   * disposes every result so it produces NO audio and leaks nothing. Gated on
+   * TUNABLES.ttsWarmup (default on); the LLM/ASR warm their prefills the same
+   * way in loadPipeline. Cost: a handful of one-time traces (~sub-second).
+   */
+  async warmup(voice: TTSVoice = TTS_VOICES[0]): Promise<void> {
+    if (!TUNABLES.ttsWarmup) return;
+    const voiceEmbed = await this.getVoiceEmbed(voice);
+    // A spread of common sentence token lengths; each distinct length pays its
+    // own one-time re-trace, so warming a few covers most real first sentences.
+    for (const target of [8, 16, 32, 48]) {
+      const tokens = this.warmupTokens(target);
+      const tokensAr = np.array(tokens, { dtype: np.uint32 });
+      let embeds = this.model.flowLM.conditionerEmbed.ref.slice(tokensAr);
+      embeds = np.concatenate([voiceEmbed.ref, embeds]);
+      // Fresh state, exactly like a real sentence's step 0: empty KV caches,
+      // offset 0, BOS latent as the sequence. runFlowLMStep consumes the
+      // refs/embeds and disposes the empty input caches.
+      const state = createFlowLMState(this.model.flowLM);
+      const {
+        latent,
+        isEos,
+        state: newState,
+      } = runFlowLMStep(
+        tree.ref(this.model.flowLM),
+        state,
+        random.key(0),
+        this.model.flowLM.bosEmb.ref.reshape([1, -1]),
+        embeds,
+        0, // step-0 prefill always starts at position 0
+      );
+      await blockUntilReady([latent.ref, isEos.ref]);
+      latent.dispose();
+      isEos.dispose();
+      tree.dispose(newState.kvCaches);
+    }
+  }
+
+  /**
    * DEV A/B bench hook: synthesize `sentence` once (off the audio graph) and
    * measure pure generation cost, so the harness can compare the fused
    * per-frame decode (TUNABLES.ttsFusedStep) against the shipped path on an

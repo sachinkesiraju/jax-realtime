@@ -370,6 +370,11 @@ async function handleLoad() {
     el.laneAsr.textContent = pipeline.asrDevice;
     setStatus("preparing backchannels", "busy");
     await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    // Pre-trace the flow-LM step-0 prefill for common sentence lengths so the
+    // first reply doesn't pay the on-turn JIT re-trace (gated on
+    // TUNABLES.ttsWarmup; no-op when off). No audio is produced.
+    setStatus("warming up TTS", "busy");
+    await pipeline.tts.warmup(el.voiceSelect.value as TTSVoice);
     el.loadBtn.hidden = true;
     el.orbBtn.disabled = false;
     orb.setState("idle");
@@ -389,9 +394,11 @@ async function handleLoad() {
 }
 
 el.voiceSelect.addEventListener("change", () => {
-  // Re-synthesize backchannel clips in the new voice (background, best-effort).
+  // Re-synthesize backchannel clips + re-warm the flow-LM prefill in the new
+  // voice (background, best-effort).
   void pipeline?.tts
     .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+    .then(() => pipeline?.tts.warmup(el.voiceSelect.value as TTSVoice))
     .catch(() => {});
 });
 

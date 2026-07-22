@@ -130,6 +130,22 @@ export const TUNABLES = {
   // re-trace variance it targeted is real (benchTtsPrefill shows it); the
   // open lever is fusing the step-0 prefill, not padding it.
 
+  // region: tts-warmup
+  /**
+   * Pre-trace the Pocket TTS flow-LM step-0 prefill at load, before the user
+   * starts a conversation, for a spread of representative sentence token
+   * lengths (8/16/32/48). The flow-LM prefill is the only part of TTS whose
+   * jit traces key on the sentence's token count, so the FIRST sentence of an
+   * unseen length otherwise pays a one-time trace+compile tax on-turn
+   * (benchTtsPrefill shows ~90–380 ms of first-audio variance vs ~30–60 ms
+   * warm). Warming a few common lengths up front moves that cost off the first
+   * reply. Produces no audio (runs runFlowLMStep and disposes the result); the
+   * added load cost is a handful of one-time traces (~sub-second). The LLM
+   * (SmolLmChatModel.warmup) and ASR already pre-trace their prefills the same
+   * way. Default on.
+   */
+  ttsWarmup: true,
+
   // region: tts-onset
   /**
    * Speak a short pre-rendered onset filler ("So," / "Right," / "Okay, so")
