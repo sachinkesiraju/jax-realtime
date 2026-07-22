@@ -52,7 +52,7 @@ app.innerHTML = `
     <section class="rail" aria-label="Pipeline stages">
       <div class="stage" id="stage-asr">
         <span class="stage-role"><span class="stage-dot" id="dot-asr"></span>Ear <span class="stage-lane" id="lane-asr">webgpu</span></span>
-        <span class="stage-model"><a href="https://huggingface.co/mlx-community/whisper-tiny.en-asr-fp16" target="_blank">Whisper tiny.en</a></span>
+        <span class="stage-model"><a href="https://huggingface.co/openai/whisper-base.en" target="_blank">Whisper base.en</a></span>
         <span class="stage-metric" id="metric-asr">&ndash;</span>
       </div>
       <span class="rail-arrow">+</span>

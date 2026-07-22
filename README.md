@@ -17,7 +17,7 @@ that fits in a browser.
 
 | Stage | Model | Runs on |
 | --- | --- | --- |
-| Ear (ASR) | Whisper base.en (fp16) | WebGPU via jax-js |
+| Ear (ASR) | Whisper base.en (int8, dequantized to fp16) | WebGPU via jax-js |
 | Brain (LLM) | SmolLM2-360M-Instruct (fp16) | WebGPU via jax-js |
 | Voice (TTS) | Kyutai Pocket TTS + Mimi codec (fp16) | WebGPU via jax-js |
 | Eye (vision) | D-FINE small (COCO-80) | WebGPU via `@jax-js/onnx` |
