@@ -116,6 +116,16 @@ export const TUNABLES = {
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
 
+  /**
+   * When true, keep flushing on subsequent clause boundaries (comma/colon/
+   * semicolon) after the first clause instead of only on sentence ends. This
+   * starts TTS on smaller chunks throughout the reply, trading a bit of
+   * prosody smoothness for lower mid-utterance latency. When false, only the
+   * first clause is flushed early and the rest waits for sentence-end
+   * punctuation or the 120-char cap (the original behavior).
+   */
+  streamFlushClauses: false,
+
   // region: tts-generation
   /**
    * Fuse the per-frame Pocket TTS decode into as few jitted dispatches as
