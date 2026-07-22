@@ -256,19 +256,6 @@ export class DuplexSession {
   private proactivePromise: Promise<void> | null = null;
   private proactiveSpeaking = false;
   private currentTtsText: string | null = null;
-  // Onset filler text for the current reply (e.g. "So,"). JUDGMENT CALL on the
-  // self-echo filter: the filler is audio-only — never shown in the transcript
-  // or pushed to history — but it IS real sound from the speakers, and echo
-  // cancellation is imperfect (see the adaptive barge-floor comments). If the
-  // mic picks up "so"/"right"/"okay" while the assistant is audible and those
-  // words aren't in currentTtsText, filterEcho's ≥70%-overlap test can pass
-  // them through as user speech, feeding the ASR barge path a phantom word.
-  // So the filler words are FOLDED INTO currentTtsText (via trackSpoken's
-  // prefix below) but kept out of state.spoken/fullText — echo filtering sees
-  // them, the UI and history never do. The over-filter risk is negligible:
-  // a genuine interruption composed ≥70% of "so/right/okay" is exactly the
-  // ambiguous double-talk the energy barge path (not ASR) is there to catch.
-  private onsetPrefix = "";
   private bargeAt = 0;
 
   // TTS analyser for the duplex orb core.
@@ -778,7 +765,6 @@ export class DuplexSession {
     };
     this.assistant = state;
     this.currentTtsText = "";
-    this.onsetPrefix = "";
     // Recalibrate the adaptive barge-in echo floor for this reply.
     this.bargeFloor = 0;
     this.bargeFloorTicks = 0;
@@ -787,7 +773,6 @@ export class DuplexSession {
     this.cb.onStageActivity("llm", true);
 
     let firstAudioAt = 0;
-    let onsetAudioAt = 0;
     const speakStart = performance.now();
 
     try {
@@ -815,17 +800,10 @@ export class DuplexSession {
           onAnalyser: (analyser) => {
             this.ttsAnalyser = analyser;
           },
-          // The onset filler is audio-only: it must reach the ASR self-echo
-          // filter (via currentTtsText) but never the transcript/history —
-          // see the onsetPrefix field comment for the full reasoning.
-          onOnset: (text) => {
-            this.onsetPrefix = text;
-            this.currentTtsText = text;
-          },
+          // No onset filler: the first audible audio is the real reply.
         },
       );
       if (stats.firstAudioMs > 0) firstAudioAt = speakStart + stats.firstAudioMs;
-      if (stats.onsetAudioMs > 0) onsetAudioAt = speakStart + stats.onsetAudioMs;
     } catch (error) {
       if (!controller.signal.aborted) this.cb.onError(error);
     } finally {
@@ -861,8 +839,6 @@ export class DuplexSession {
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
         // Absent (not 0) when no filler played, so the bench can distinguish
-        // "onsetFiller off / no cached PCM" from a degenerate timestamp.
-        onsetAudio: onsetAudioAt > 0 ? onsetAudioAt : undefined,
         endCause: this.turnMarks.endCause,
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
@@ -968,11 +944,7 @@ export class DuplexSession {
       this.turnMarks.firstSentence = performance.now();
     }
     state.spoken += (state.spoken ? " " : "") + sentence;
-    // Echo filter sees filler + reply (both are audible from the speakers);
-    // state.spoken stays filler-free so the UI/history never show the onset.
-    this.currentTtsText = this.onsetPrefix
-      ? `${this.onsetPrefix} ${state.spoken}`
-      : state.spoken;
+    this.currentTtsText = state.spoken;
     return sentence;
   }
 

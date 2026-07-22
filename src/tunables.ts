@@ -130,38 +130,6 @@ export const TUNABLES = {
   // re-trace variance it targeted is real (benchTtsPrefill shows it); the
   // open lever is fusing the step-0 prefill, not padding it.
 
-  // region: tts-onset
-  /**
-   * Speak a short pre-rendered onset filler ("So," / "Right," / "Okay, so")
-   * the instant a reply's TTS stream opens, to mask the ~1.3–1.8 s real turn
-   * latency that the single-GPU serialization law says we cannot lower. The
-   * fillers are synthesized to PCM once at load (zero runtime GPU cost, same
-   * machinery as the backchannels) and are audio-only — never shown in the
-   * transcript or stored in history, because they are a vocal gesture, not
-   * content.
-   *
-   * Cycle-3 law (docs/BENCHMARKS.md, Campaign A — SHIPPED then REVERTED): the
-   * first attempt played the filler through a SEPARATE short-lived
-   * AudioContext, so the real reply began over/into the filler's tail and the
-   * hand-off stop() clipped it mid-word — it sounded broken even though every
-   * timing metric looked good. The recorded law: filler and reply must be ONE
-   * gapless stream on ONE clock. This redo schedules the cached onset PCM as
-   * the first chunk of the SAME streaming player the reply uses, so overlap
-   * is structurally impossible (the player's nextStartTime clock serializes
-   * every chunk; worst case is dead air between filler and reply, never a
-   * collision). Default false: ships only if the bench AND a human listen
-   * pass. Bench half passed (cycle 6): first sound at ~510–805 ms after end
-   * of user speech vs ~1.2–1.8 s for the real reply, with real-reply latency
-   * unchanged within noise. The EARS half of the gate is still open — flip
-   * this on and listen for whether "So, … <pause> …reply" beats silence
-   * before it defaults on. Flipped ON in cycle 8 ("voice responses don't
-   * feel realtime") but it shipped broken: the filler was heard by the mic
-   * and transcribed as a fake user response, and the "voice before the LLM
-   * reply" cadence sounded buggy. SHIPPED OFF — real first audio comes from
-   * the actual reply, not a cached lead-in.
-   */
-  onsetFiller: false,
-
   // region: tools (campaign 2 — delegation)
   /**
    * Tool routing breadth. "conservative" is the shipped behavior (explicit
@@ -252,15 +220,8 @@ export type TurnRecord = {
   firstDelta: number;
   /** First sentence/clause handed to TTS. */
   firstSentence: number;
-  /** First TTS audio chunk scheduled. Always the first SYNTHESIZED reply
-   *  chunk — the onset filler (below) never counts, so this stat keeps its
-   *  meaning across onsetFiller on/off runs. */
+  /** First TTS audio chunk scheduled. */
   firstAudio: number;
-  /** Pre-rendered onset filler chunk scheduled (absent = no filler played).
-   *  Kept separate from firstAudio deliberately: cycle 3's single first-sound
-   *  metric rewarded ANY sound, including one that stepped on the real reply.
-   *  The bench computes onset = onsetAudio - endOfSpeech. */
-  onsetAudio?: number;
   transcript: string;
   reply: string;
   interrupted: boolean;

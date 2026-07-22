@@ -147,7 +147,6 @@ const el = {
   transcript: document.querySelector<HTMLDivElement>("#transcript")!,
   downloads: document.querySelector<HTMLDivElement>("#downloads")!,
   voiceSelect: document.querySelector<HTMLSelectElement>("#voice-select")!,
-  llmLabel: document.querySelector<HTMLSpanElement>("#llm-label")!,
   backendChip: document.querySelector<HTMLSpanElement>("#backend-chip")!,
   laneAsr: document.querySelector<HTMLSpanElement>("#lane-asr")!,
   eyeToggle: document.querySelector<HTMLInputElement>("#eye-toggle")!,
@@ -243,7 +242,7 @@ function setStatus(text: string, mode: "idle" | "live" | "busy" | "error" = "idl
 }
 
 function setHint(text: string) {
-  el.orbHint.innerHTML = text;
+  el.orbHint.textContent = text;
 }
 
 function formatMs(ms: number): string {
@@ -375,14 +374,13 @@ async function handleLoad() {
     orb.setState("idle");
     setStatus("ready", "idle");
     setHint(
-      "Press the orb once and just talk &mdash; interrupt it, pause, ask it to " +
+      "Press the orb once and just talk — interrupt it, pause, ask it to " +
         "time things. Press again to end.",
     );
     setTimeout(() => {
       el.downloads.hidden = true;
     }, 1500);
   } catch (error) {
-    console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");
     el.loadBtn.disabled = false;
   }
@@ -532,7 +530,6 @@ async function toggleVision(enabled: boolean): Promise<void> {
     if (enabled) await enableVision();
     else disableVision();
   } catch (error) {
-    console.error(error);
     tick(error instanceof Error ? error.message : String(error));
     el.eyeToggle.checked = false;
     disableVision();
@@ -616,7 +613,6 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
         el.bgPill.hidden = !active;
       },
       onError(error) {
-        console.error(error);
         tick(error instanceof Error ? error.message : String(error));
       },
     },
@@ -643,7 +639,7 @@ async function handleOrb() {
       }
       setStatus("ready", "idle");
       setHint(
-        "Press the orb once and just talk &mdash; interrupt it, pause, ask it " +
+        "Press the orb once and just talk — interrupt it, pause, ask it " +
           "to time things. Press again to end.",
       );
       return;
@@ -663,7 +659,6 @@ async function handleOrb() {
     setHint("Live. Talk naturally; talk over it to interrupt. Press the orb to end.");
     tick("duplex · live");
   } catch (error) {
-    console.error(error);
     setStatus(error instanceof Error ? error.message : String(error), "error");
     sessionActive = false;
     duplex = null;
