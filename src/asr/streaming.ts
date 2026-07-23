@@ -10,6 +10,7 @@ import type {
   SpeechRecognizer,
 } from "../pipeline";
 import { TUNABLES } from "../tunables";
+import { decideCommit } from "./commit";
 
 const SAMPLE_RATE = 16_000;
 
@@ -29,6 +30,11 @@ export type StreamingOptions = {
   /** When this returns true, skip passes (e.g. while the assistant speaks, to
    *  keep ASR off the GPU so TTS generation stays smooth). */
   pauseWhile?: () => boolean;
+  /** Commit the whole hypothesis on a single high-confidence pass instead of
+   *  requiring two-pass LocalAgreement-2. Defaults to TUNABLES.asrFastCommit. */
+  fastCommit?: boolean;
+  /** avgLogProb floor for fastCommit. Defaults to TUNABLES.asrFastCommitThreshold. */
+  fastCommitThreshold?: number;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -47,19 +53,6 @@ function normalizeWords(text: string): string[] {
 /** Word tokens preserving original casing/punctuation for display. */
 function displayWords(text: string): string[] {
   return text.trim().split(/\s+/).filter(Boolean);
-}
-
-function commonPrefixLen(a: string[], b: string[]): number {
-  const n = Math.min(a.length, b.length);
-  let i = 0;
-  while (
-    i < n &&
-    a[i].toLowerCase().replace(/[^\p{L}\p{N}']/gu, "") ===
-      b[i].toLowerCase().replace(/[^\p{L}\p{N}']/gu, "")
-  ) {
-    i++;
-  }
-  return i;
 }
 
 export class StreamingTranscriber {
@@ -222,11 +215,17 @@ export class StreamingTranscriber {
     const filtered = this.filterEcho(result.text);
     const words = displayWords(filtered);
 
-    // LocalAgreement-2: the longest common word-prefix of the previous and
-    // current hypotheses is committed; the newest hypothesis's tail is tentative.
-    const commonLen = commonPrefixLen(this.prevWords, words);
-    const committedWords = words.slice(0, commonLen);
-    const tentative = words.slice(commonLen).join(" ");
+    // Options win when set; otherwise fall back to the live TUNABLES value.
+    const { committedWords, tentative } = decideCommit(
+      this.prevWords,
+      words,
+      result.confidence?.avgLogProb ?? null,
+      {
+        fastCommit: this.opts.fastCommit ?? TUNABLES.asrFastCommit,
+        fastCommitThreshold:
+          this.opts.fastCommitThreshold ?? TUNABLES.asrFastCommitThreshold,
+      },
+    );
 
     const prevCommitted = this.committedWords.join(" ");
     const nextCommitted = committedWords.join(" ");

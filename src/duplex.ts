@@ -14,6 +14,7 @@ import {
 } from "./memory";
 import { VoiceCapture } from "./mic";
 import { analyserLevel } from "./orb";
+import { splitSpeechChunks } from "./sentence-split";
 import type {
   ChatMessage,
   ChatModel,
@@ -256,19 +257,6 @@ export class DuplexSession {
   private proactivePromise: Promise<void> | null = null;
   private proactiveSpeaking = false;
   private currentTtsText: string | null = null;
-  // Onset filler text for the current reply (e.g. "So,"). JUDGMENT CALL on the
-  // self-echo filter: the filler is audio-only — never shown in the transcript
-  // or pushed to history — but it IS real sound from the speakers, and echo
-  // cancellation is imperfect (see the adaptive barge-floor comments). If the
-  // mic picks up "so"/"right"/"okay" while the assistant is audible and those
-  // words aren't in currentTtsText, filterEcho's ≥70%-overlap test can pass
-  // them through as user speech, feeding the ASR barge path a phantom word.
-  // So the filler words are FOLDED INTO currentTtsText (via trackSpoken's
-  // prefix below) but kept out of state.spoken/fullText — echo filtering sees
-  // them, the UI and history never do. The over-filter risk is negligible:
-  // a genuine interruption composed ≥70% of "so/right/okay" is exactly the
-  // ambiguous double-talk the energy barge path (not ASR) is there to catch.
-  private onsetPrefix = "";
   private bargeAt = 0;
 
   // TTS analyser for the duplex orb core.
@@ -351,6 +339,9 @@ export class DuplexSession {
         // Interval/window come from TUNABLES (read live by the loop). Pause
         // while the assistant is speaking so ASR doesn't steal the GPU from TTS.
         pauseWhile: () => this.isAssistantAudible(),
+        // Fast-commit knobs default to TUNABLES (read live) when left undefined.
+        fastCommit: TUNABLES.asrFastCommit,
+        fastCommitThreshold: TUNABLES.asrFastCommitThreshold,
       },
     );
     this.transcriber.start();
@@ -778,7 +769,6 @@ export class DuplexSession {
     };
     this.assistant = state;
     this.currentTtsText = "";
-    this.onsetPrefix = "";
     // Recalibrate the adaptive barge-in echo floor for this reply.
     this.bargeFloor = 0;
     this.bargeFloorTicks = 0;
@@ -787,7 +777,6 @@ export class DuplexSession {
     this.cb.onStageActivity("llm", true);
 
     let firstAudioAt = 0;
-    let onsetAudioAt = 0;
     const speakStart = performance.now();
 
     try {
@@ -815,17 +804,10 @@ export class DuplexSession {
           onAnalyser: (analyser) => {
             this.ttsAnalyser = analyser;
           },
-          // The onset filler is audio-only: it must reach the ASR self-echo
-          // filter (via currentTtsText) but never the transcript/history —
-          // see the onsetPrefix field comment for the full reasoning.
-          onOnset: (text) => {
-            this.onsetPrefix = text;
-            this.currentTtsText = text;
-          },
+          // No onset filler: the first audible audio is the real reply.
         },
       );
       if (stats.firstAudioMs > 0) firstAudioAt = speakStart + stats.firstAudioMs;
-      if (stats.onsetAudioMs > 0) onsetAudioAt = speakStart + stats.onsetAudioMs;
     } catch (error) {
       if (!controller.signal.aborted) this.cb.onError(error);
     } finally {
@@ -861,8 +843,6 @@ export class DuplexSession {
         firstSentence: this.turnMarks.firstSentence ?? 0,
         firstAudio: firstAudioAt,
         // Absent (not 0) when no filler played, so the bench can distinguish
-        // "onsetFiller off / no cached PCM" from a degenerate timestamp.
-        onsetAudio: onsetAudioAt > 0 ? onsetAudioAt : undefined,
         endCause: this.turnMarks.endCause,
         transcript: this.turnMarks.transcript ?? "",
         reply: finalText,
@@ -902,64 +882,31 @@ export class DuplexSession {
     stream: AsyncGenerator<string, unknown, void>,
     state: AssistantState,
   ): AsyncGenerator<string, void, void> {
-    let buffer = "";
-    let firstEmitted = false;
-    let result = await stream.next();
-    while (!result.done) {
-      if (state.controller.signal.aborted) {
-        await stream.return?.(undefined);
-        return;
-      }
-      const delta = result.value;
-      if (!this.turnMarks.firstDelta) this.turnMarks.firstDelta = performance.now();
-      buffer += delta;
-      state.fullText += delta;
-      this.cb.onAssistantPartial(state.fullText);
-
-      // Fastest first audio: flush the first clause as soon as a comma/colon/
-      // semicolon appears (once there's enough to sound natural), so speech
-      // starts after "The weather in Tokyo," instead of the whole sentence.
-      // If no punctuation shows up, flush at a WORD BOUNDARY once ~2× the
-      // clause minimum has accumulated — otherwise the reply text is fully
-      // written on screen while the voice still waits for the first sentence
-      // to complete before it can even start synthesizing.
-      if (!firstEmitted) {
-        let clauseIdx = findClauseEnd(buffer);
-        if (clauseIdx === -1 && buffer.length >= TUNABLES.firstClauseMinChars * 2) {
-          const lastSpace = buffer.lastIndexOf(" ");
-          if (lastSpace >= TUNABLES.firstClauseMinChars) clauseIdx = lastSpace + 1;
+    // Feed the raw LLM deltas through the pure chunker, applying the per-delta
+    // UI/echo side-effects (partial bubble update, first-delta mark, abort
+    // handling) as each delta is consumed, and tracking each spoken chunk.
+    const deltas = async function* (this: DuplexSession): AsyncGenerator<string, void, void> {
+      let result = await stream.next();
+      while (!result.done) {
+        if (state.controller.signal.aborted) {
+          await stream.return?.(undefined);
+          return;
         }
-        if (clauseIdx !== -1) {
-          const clause = buffer.slice(0, clauseIdx).trim();
-          buffer = buffer.slice(clauseIdx);
-          if (clause) {
-            firstEmitted = true;
-            yield this.trackSpoken(state, clause);
-          }
-        }
+        const delta = result.value;
+        if (!this.turnMarks.firstDelta) this.turnMarks.firstDelta = performance.now();
+        state.fullText += delta;
+        this.cb.onAssistantPartial(state.fullText);
+        yield delta;
+        result = await stream.next();
       }
+    }.call(this);
 
-      let idx: number;
-      while ((idx = findSentenceEnd(buffer)) !== -1) {
-        const sentence = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx);
-        if (sentence) {
-          firstEmitted = true;
-          yield this.trackSpoken(state, sentence);
-        }
-      }
-      if (buffer.length >= 120) {
-        const sentence = buffer.trim();
-        buffer = "";
-        if (sentence) yield this.trackSpoken(state, sentence);
-      }
-
-      result = await stream.next();
-    }
-
-    if (!state.controller.signal.aborted) {
-      const tail = buffer.trim();
-      if (tail) yield this.trackSpoken(state, tail);
+    for await (const chunk of splitSpeechChunks(deltas, {
+      firstClauseMinChars: TUNABLES.firstClauseMinChars,
+      streamFlushClauses: TUNABLES.streamFlushClauses,
+      flushTail: () => !state.controller.signal.aborted,
+    })) {
+      yield this.trackSpoken(state, chunk);
     }
   }
 
@@ -968,11 +915,7 @@ export class DuplexSession {
       this.turnMarks.firstSentence = performance.now();
     }
     state.spoken += (state.spoken ? " " : "") + sentence;
-    // Echo filter sees filler + reply (both are audible from the speakers);
-    // state.spoken stays filler-free so the UI/history never show the onset.
-    this.currentTtsText = this.onsetPrefix
-      ? `${this.onsetPrefix} ${state.spoken}`
-      : state.spoken;
+    this.currentTtsText = state.spoken;
     return sentence;
   }
 
@@ -1240,32 +1183,3 @@ export function isGarbledTranscript(text: string): boolean {
   );
 }
 
-/** Sentence-ending punctuation followed by whitespace; skips decimals. */
-function findSentenceEnd(buffer: string): number {
-  for (let i = 0; i < buffer.length - 1; i++) {
-    const c = buffer[i];
-    if ((c === "." || c === "!" || c === "?" || c === "…") && /\s/.test(buffer[i + 1])) {
-      return i + 1;
-    }
-  }
-  return -1;
-}
-
-/**
- * Index just after the first clause break (comma/colon/semicolon or sentence
- * end) followed by whitespace, but only once ≥18 chars have accumulated so the
- * first spoken fragment isn't a choppy one-word stub. Used only for the very
- * first chunk, to minimize time-to-first-audio on longer opening sentences.
- */
-function findClauseEnd(buffer: string): number {
-  const MIN = TUNABLES.firstClauseMinChars;
-  for (let i = 0; i < buffer.length - 1; i++) {
-    const c = buffer[i];
-    const isBreak =
-      c === "," || c === ";" || c === ":" || c === "." || c === "!" || c === "?" || c === "…";
-    if (isBreak && i + 1 >= MIN && /\s/.test(buffer[i + 1])) {
-      return i + 1;
-    }
-  }
-  return -1;
-}

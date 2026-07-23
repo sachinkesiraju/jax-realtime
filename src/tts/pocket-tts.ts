@@ -424,7 +424,7 @@ export function runSEANetEncoder(
   let idx = 1;
   for (let i = 0; i < 3; i++) {
     // ResBlock
-    let states: any = [null, null];
+    let states: (np.Array | null)[] = [null, null];
     [x, states] = runSEANetResnetBlock(
       model[idx] as SEANetResnetBlock,
       states,

@@ -46,9 +46,6 @@ export async function playTTS(
     let mimiState = createMimiDecodeState(model.mimi);
     let eosStep: number | null = null;
 
-    console.log("Starting TTS generation...");
-    let lastTimestamp = performance.now();
-
     for (let step = 0; step < 1000; step++) {
       // Barge-in: cut playback and stop generating the moment we're aborted.
       if (signal?.aborted) {
@@ -92,13 +89,9 @@ export async function playTTS(
 
       const isEosData = await isEos.data();
       if (isEosData[0] && eosStep === null) {
-        console.log(`🛑 EOS at step ${step}!`);
         eosStep = step;
       }
       if (eosStep !== null && step >= eosStep + framesAfterEos) {
-        console.log(
-          `Generation ended at step ${step}, ${framesAfterEos} frames after EOS.`,
-        );
         latent.dispose();
         break;
       }
@@ -106,12 +99,6 @@ export async function playTTS(
       const prevLatent = lastLatent;
       lastLatent = latent;
       prevLatent.dispose();
-
-      const timestamp = performance.now();
-      console.log(
-        `Generated step ${step} in ${(timestamp - lastTimestamp).toFixed(1)} ms`,
-      );
-      lastTimestamp = timestamp;
 
       const mimiInput = latent.ref
         .mul(model.flowLM.embStd.ref)

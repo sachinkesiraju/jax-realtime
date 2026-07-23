@@ -49,6 +49,24 @@ export const TUNABLES = {
    * -0.013..-0.007 correct) with zero clean false clarifications.
    */
   asrConfidenceThreshold: -0.3 as number | null,
+  /**
+   * Fast-commit path (default OFF -> keeps two-pass LocalAgreement-2). When on,
+   * a single streaming pass whose decoder confidence (`confidence.avgLogProb`)
+   * is >= `asrFastCommitThreshold` commits its ENTIRE current hypothesis
+   * immediately (tail becomes empty) instead of waiting for a second pass to
+   * agree on the common prefix. This shaves one pass (~asrPassIntervalMs plus a
+   * Whisper decode) of caption lag off high-confidence words. LocalAgreement-2
+   * is still the fallback for below-threshold passes, so low-confidence /
+   * unstable hypotheses are never prematurely committed.
+   */
+  asrFastCommit: false,
+  /**
+   * avgLogProb floor for `asrFastCommit`. Uses the same decoder-score scale as
+   * `asrConfidenceThreshold` (cycle-13 MAP: clean decodes -0.10..-0.01, garbled
+   * -0.69..-0.63), so -0.3 fast-commits confident decodes while leaving garbled
+   * ones on the safe two-pass path.
+   */
+  asrFastCommitThreshold: -0.3,
 
   // region: llm
   /**
@@ -98,6 +116,16 @@ export const TUNABLES = {
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
 
+  /**
+   * When true, keep flushing on subsequent clause boundaries (comma/colon/
+   * semicolon) after the first clause instead of only on sentence ends. This
+   * starts TTS on smaller chunks throughout the reply, trading a bit of
+   * prosody smoothness for lower mid-utterance latency. When false, only the
+   * first clause is flushed early and the rest waits for sentence-end
+   * punctuation or the 120-char cap (the original behavior).
+   */
+  streamFlushClauses: false,
+
   // region: tts-generation
   /**
    * Fuse the per-frame Pocket TTS decode into as few jitted dispatches as
@@ -130,37 +158,21 @@ export const TUNABLES = {
   // re-trace variance it targeted is real (benchTtsPrefill shows it); the
   // open lever is fusing the step-0 prefill, not padding it.
 
-  // region: tts-onset
+  // region: tts-warmup
   /**
-   * Speak a short pre-rendered onset filler ("So," / "Right," / "Okay, so")
-   * the instant a reply's TTS stream opens, to mask the ~1.3–1.8 s real turn
-   * latency that the single-GPU serialization law says we cannot lower. The
-   * fillers are synthesized to PCM once at load (zero runtime GPU cost, same
-   * machinery as the backchannels) and are audio-only — never shown in the
-   * transcript or stored in history, because they are a vocal gesture, not
-   * content.
-   *
-   * Cycle-3 law (docs/BENCHMARKS.md, Campaign A — SHIPPED then REVERTED): the
-   * first attempt played the filler through a SEPARATE short-lived
-   * AudioContext, so the real reply began over/into the filler's tail and the
-   * hand-off stop() clipped it mid-word — it sounded broken even though every
-   * timing metric looked good. The recorded law: filler and reply must be ONE
-   * gapless stream on ONE clock. This redo schedules the cached onset PCM as
-   * the first chunk of the SAME streaming player the reply uses, so overlap
-   * is structurally impossible (the player's nextStartTime clock serializes
-   * every chunk; worst case is dead air between filler and reply, never a
-   * collision). Default false: ships only if the bench AND a human listen
-   * pass. Bench half passed (cycle 6): first sound at ~510–805 ms after end
-   * of user speech vs ~1.2–1.8 s for the real reply, with real-reply latency
-   * unchanged within noise. The EARS half of the gate is still open — flip
-   * this on and listen for whether "So, … <pause> …reply" beats silence
-   * before it defaults on. Flipped ON in cycle 8 ("voice responses don't
-   * feel realtime") but it shipped broken: the filler was heard by the mic
-   * and transcribed as a fake user response, and the "voice before the LLM
-   * reply" cadence sounded buggy. SHIPPED OFF — real first audio comes from
-   * the actual reply, not a cached lead-in.
+   * Pre-trace the Pocket TTS flow-LM step-0 prefill at load, before the user
+   * starts a conversation, for a spread of representative sentence token
+   * lengths (8/16/32/48). The flow-LM prefill is the only part of TTS whose
+   * jit traces key on the sentence's token count, so the FIRST sentence of an
+   * unseen length otherwise pays a one-time trace+compile tax on-turn
+   * (benchTtsPrefill shows ~90–380 ms of first-audio variance vs ~30–60 ms
+   * warm). Warming a few common lengths up front moves that cost off the first
+   * reply. Produces no audio (runs runFlowLMStep and disposes the result); the
+   * added load cost is a handful of one-time traces (~sub-second). The LLM
+   * (SmolLmChatModel.warmup) and ASR already pre-trace their prefills the same
+   * way. Default on.
    */
-  onsetFiller: false,
+  ttsWarmup: true,
 
   // region: tools (campaign 2 — delegation)
   /**
@@ -252,15 +264,8 @@ export type TurnRecord = {
   firstDelta: number;
   /** First sentence/clause handed to TTS. */
   firstSentence: number;
-  /** First TTS audio chunk scheduled. Always the first SYNTHESIZED reply
-   *  chunk — the onset filler (below) never counts, so this stat keeps its
-   *  meaning across onsetFiller on/off runs. */
+  /** First TTS audio chunk scheduled. */
   firstAudio: number;
-  /** Pre-rendered onset filler chunk scheduled (absent = no filler played).
-   *  Kept separate from firstAudio deliberately: cycle 3's single first-sound
-   *  metric rewarded ANY sound, including one that stepped on the real reply.
-   *  The bench computes onset = onsetAudio - endOfSpeech. */
-  onsetAudio?: number;
   transcript: string;
   reply: string;
   interrupted: boolean;
