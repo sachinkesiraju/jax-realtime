@@ -126,10 +126,19 @@ const BARGE_MIN_WORDS = 1; // one echo-filtered committed word + loud = the user
 // playback is audible) times a ratio, with an absolute minimum so a silent
 // echo floor doesn't make a whisper trigger. Fewer sustained ticks than before
 // so short interjections ("wait", "stop") interrupt.
-const BARGE_FLOOR_CALIB_TICKS = 3; // ~450 ms to estimate the echo floor
+const BARGE_FLOOR_CALIB_TICKS = 3; // ~450 ms of AUDIBLE playback to estimate the echo floor
 const BARGE_ENERGY_RATIO = 1.8; // user must clear the echo floor by this much
 const BARGE_ENERGY_MIN = 0.05; // absolute floor (level units, min·4 RMS)
 const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
+// TTS output-analyser level above which the assistant counts as audibly
+// playing RIGHT NOW (same rms·4 scale as mic level; real playback runs far
+// higher). The echo floor must be sampled from ticks where playback is
+// actually audible: the reply's first ticks fall in the silent LLM/TTS
+// latency gap (~1-2 s before first audio), and calibrating there produced an
+// ambient-level floor that the assistant's OWN playback echo later cleared —
+// the assistant barged itself mid-reply, and the discarded pre-roll then
+// endpointed into a hallucinated phantom turn ("Thank you. Thank you.").
+const TTS_AUDIBLE_LEVEL = 0.02;
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
 // Backchannel pause window. It sits BELOW the earliest endpoint threshold
 // (endpointPunctMs = 380 ms) on purpose: the endpoint checks run first in the
@@ -247,9 +256,6 @@ export class DuplexSession {
   private bargeFloor = 0;
   private bargeFloorTicks = 0;
   private backchannelUsed = false;
-  // A barge-in continuation skips the phantom-turn guard (its sustained energy
-  // already proved itself to the barge detector).
-  private bargeContinuation = false;
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -417,16 +423,35 @@ export class DuplexSession {
     //    real hardware the assistant's own playback leaks into the mic (echo
     //    cancellation is imperfect) and, worse, the mic's AGC ducks the user
     //    during double-talk, so the absolute level of a genuine interruption
-    //    varies wildly by device. Instead we calibrate the echo/ambient floor
-    //    over the reply's first few ticks (before the user could react) and
-    //    fire when the level clears that floor by a ratio. The ASR path can't
+    //    varies wildly by device. Instead we calibrate the echo floor over the
+    //    reply's first few AUDIBLE ticks (playback confirmed by the TTS output
+    //    analyser — the pre-audio latency gap holds no echo and calibrating on
+    //    it made the assistant barge itself on its own playback) and fire when
+    //    the level clears that floor by a ratio. The ASR path can't
     //    help here — it's paused during assistant speech to free the GPU.
     if (this.phase === "responding" && this.assistant) {
+      const ttsAudible = this.ttsLevel() > TTS_AUDIBLE_LEVEL;
       if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
-        // Calibration window: the loudest thing the mic hears now is our own
-        // echo, so take the max as the floor to beat.
-        this.bargeFloor = Math.max(this.bargeFloor, level);
-        this.bargeFloorTicks++;
+        if (ttsAudible) {
+          // Calibration window: playback is audible, so the loudest thing the
+          // mic hears now is our own echo — take the max as the floor to beat.
+          this.bargeFloor = Math.max(this.bargeFloor, level);
+          this.bargeFloorTicks++;
+          this.aboveBargeTicks = 0;
+        } else if (this.bargeFloorTicks === 0) {
+          // Latency gap before the reply's first audio: nothing is playing,
+          // so the mic hears only the user/room and there is no echo to
+          // calibrate against — sustained level above the absolute minimum IS
+          // the user starting to talk over the (pending) reply.
+          if (level > BARGE_ENERGY_MIN) this.aboveBargeTicks++;
+          else this.aboveBargeTicks = 0;
+          if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
+            this.handleBargeIn(now);
+            return;
+          }
+        }
+        // Mid-calibration inaudible tick (an inter-sentence gap): neither
+        // calibrate nor fire — the next audible tick resumes calibration.
       } else {
         const threshold = Math.max(
           BARGE_ENERGY_MIN,
@@ -561,9 +586,13 @@ export class DuplexSession {
     // Phantom-turn guard: without enough voiced evidence in the captured PCM
     // this "utterance" was ambient noise, and transcribing near-silence makes
     // Whisper hallucinate ("Thank you." etc.). Discard before transcription.
-    // Barge-in continuations skip the check — their sustained energy already
-    // proved itself to the barge detector.
-    if (!this.bargeContinuation) {
+    // Barge-in continuations get the SAME check (an earlier revision skipped
+    // it on "sustained energy already proved itself" — but the energy that
+    // fires the barge detector can be our own playback echo or a transient,
+    // and skipping the guard turned exactly those false barges into
+    // hallucinated turns like "Thank you. Thank you." in live sessions; a
+    // genuine interruption carries a voiced run that passes easily).
+    {
       const stats = voicedStats(this.capture.samples());
       // Reject anything that isn't a sustained voiced sound. Too quiet → always
       // ambient. Too short a contiguous voiced RUN → a transient: a keystroke,
@@ -579,7 +608,6 @@ export class DuplexSession {
         return;
       }
     }
-    this.bargeContinuation = false;
 
     // Switch to responding immediately so the tick loop stops re-entering.
     this.phase = "responding";
@@ -942,10 +970,10 @@ export class DuplexSession {
     this.backchannelUsed = false;
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
-    // The interrupting speech already proved itself (sustained energy above the
-    // barge threshold) — mark it so the phantom-turn guard doesn't second-guess
-    // a genuine barge-in utterance.
-    this.bargeContinuation = true;
+    // NOTE: the continuation does NOT skip the phantom-turn guard at endpoint
+    // time. The barge detector's energy evidence can be our own playback echo
+    // (imperfect AEC), and skipping the guard let false barges endpoint into
+    // Whisper-hallucinated turns; real interruptions pass the guard easily.
   }
 
   // --- Time awareness ----------------------------------------------------
@@ -1131,7 +1159,6 @@ export class DuplexSession {
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     this.backchannelUsed = false;
-    this.bargeContinuation = false;
   }
 
   /** Fresh listening window: drop buffered audio and reset ASR commit state. */
