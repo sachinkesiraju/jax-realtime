@@ -1174,3 +1174,48 @@ long-conversation ears-check remains the deciding test — if symptoms
 persist there, the next suspects are hardware-side (AEC/AGC adaptation over
 long sessions), which no fake-mic fixture can reproduce; an audible-loopback
 rig is the recorded prerequisite for attacking those.
+
+## Cycle 22 — the seam-layer reduction: learned turn signal (SHIPPED)
+
+Phase 0-3 of the simplification plan, executed. The signal layer that
+decides "is this speech?" — the source of most cycle-13-21 bugs — is now a
+LEARNED model instead of energy heuristics.
+
+**The port.** Silero VAD v5's 16 kHz branch, hand-ported to ~200 lines of
+pure TypeScript (`src/asr/vad.ts`): STFT-as-conv (fixed 258×256 basis, hop
+128), 4 conv layers, one LSTM cell, sigmoid head. ~200k params, 1.2 MB
+weights (`public/vad/silero-vad-v5.bin`, extracted from the ONNX graph),
+~2.3 ms per 32 ms frame of plain CPU JS — no GPU (the GPU law holds), no
+onnxruntime (the 24 MB dependency the parallel-VAD investigation rejected),
+no missing-LSTM-op problem (it's two matmuls and four gates). This resolves
+every recorded objection from that investigation.
+
+**Parity gate:** bit-close against the onnxruntime reference (worst |Δ|
+6.2e-7 over stateful sequences). Two expensive lessons encoded in the file:
+the ONNX's else-branch is the 8 kHz path (extracting it first cost a failed
+parity round), and the model REQUIRES the official wrapper's 64-sample
+rolling context prepended to each 512-sample chunk — without it, speech
+scores collapse to ~0.16 on clean speech and the model looks broken.
+
+**Offline shadow scoring** (the old VAD rejection's suite, plus the buckets
+it couldn't see): typing max P(speech) 0.009, ambient 0.001, quiet speech at
+0.11 raw peak — no AGC help — max 1.000. The learned signal separates every
+bucket that took the heuristics three constants and an adaptive floor.
+
+**In-browser gates, `turnSignal: "vad"` vs the energy baseline:**
+
+| gate | energy | vad |
+| --- | --- | --- |
+| typing 60 s | 0 turns, 20-21 phantom discards | **0 turns, 0 discards** (never latches) |
+| ambient 60 s | 0 turns | 0 turns |
+| quiet / quiet×0.4 | 3/3 exact | 3/3 exact |
+| midpause | 3/3 merged whole | 3/3 merged whole |
+| map_a 12-turn | P50 ~1415-1445 | P50 1418 / P95 1540, 12/12 exact |
+
+SHIPPED default "vad". Scope note: the learned signal owns the LISTENING
+phase (onset, silence, phantom evidence); barge-in keeps the echo-floor
+energy path because Silero scores the assistant's own playback echo as
+speech — the echo problem needs an echo-aware primitive, not a better
+speech detector. The energy heuristics stay selectable for one cycle
+(rollback + paired A/Bs), then the deletion list from the plan
+(voicedStats, GUARD_*/MIN_* constants, START_LEVEL onset) retires.

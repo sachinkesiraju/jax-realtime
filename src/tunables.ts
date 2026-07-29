@@ -31,8 +31,16 @@ export const TUNABLES = {
    * the tuned energy/echo-floor path either way: Silero would count the
    * assistant's own playback echo as speech, so the echo-aware energy
    * detector remains the right primitive there.
+   *
+   * SHIPPED "vad" (cycle 22) after the in-browser gates: typing 0 turns AND
+   * 0 phantom discards (the energy signal latched 20+ noise "utterances"
+   * that then needed discarding; the VAD never latches), ambient 0/0, quiet
+   * speech and quiet×0.4 3/3 exact transcripts, midpause 3/3 merged whole,
+   * map_a 12-turn P50 1418 / P95 1540 with 12/12 exact transcripts. The
+   * energy path stays selectable for one full cycle (rollback + paired
+   * A/Bs) before the heuristics are deleted.
    */
-  turnSignal: "energy" as "energy" | "vad",
+  turnSignal: "vad" as "energy" | "vad",
 
   // region: endpoint
   /**
