@@ -47,6 +47,18 @@ export const TUNABLES = {
    * plain barge-in path (abort + restart), the pre-cycle-16 behavior.
    */
   continuationMerge: true,
+  /**
+   * How long after the endpoint FIRES a speech resumption still counts as a
+   * continuation of the same thought (the roadmap spec'd "<700 ms"; cycle 16
+   * shipped it unbounded across the whole ~1.4 s pre-audio gap). Cycle 21
+   * bounds it: a resumption soon after a premature endpoint is the same
+   * thought; one arriving a second-plus later is new input (or incidental
+   * noise) and takes the barge path instead — an unbounded window let any
+   * gap noise abort the reply, mangle the merged transcript, and CHAIN
+   * (merge → new gap → merge again), which live read as "delayed responses"
+   * and "it doesn't listen to me". One merge per turn, tick-quantized.
+   */
+  continuationMergeWindowMs: 700,
 
   // region: asr
   /** Minimum time between the starts of two streaming Whisper passes. */

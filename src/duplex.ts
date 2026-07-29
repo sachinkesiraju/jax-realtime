@@ -260,6 +260,9 @@ export class DuplexSession {
   // reply is aborted; the next endpoint prepends it so the two halves of the
   // interrupted thought become ONE user turn ("append, don't restart").
   private continuationPrefix = "";
+  // Cycle 21: merges cannot chain — one per turn, and only inside the bounded
+  // resumption window (see continuationMergeWindowMs).
+  private mergedThisTurn = false;
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -450,15 +453,29 @@ export class DuplexSession {
           if (level > BARGE_ENERGY_MIN) this.aboveBargeTicks++;
           else this.aboveBargeTicks = 0;
           if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
-            // Speech resuming BEFORE the user has heard anything is not an
-            // interruption — it's the same thought continuing across a pause
-            // that the endpoint mistook for the end of the turn (the punct
-            // fast-path fires on Whisper-invented terminal punctuation, and
-            // cycles 3B/5/15 proved no pre-fire window can fix that). Merge:
-            // abort the unheard reply and append the continuation to the
-            // fired turn instead of answering half a thought.
-            if (TUNABLES.continuationMerge) this.handleContinuation(now);
-            else this.handleBargeIn(now);
+            // Speech resuming shortly after the endpoint fired — before the
+            // user has heard anything — is not an interruption: it's the same
+            // thought continuing across a pause the endpoint mistook for the
+            // end of the turn (the punct fast-path fires on Whisper-invented
+            // terminal punctuation, and cycles 3B/5/15 proved no pre-fire
+            // window can fix that). Merge: abort the unheard reply and append
+            // the continuation to the fired turn. BOUNDED (cycle 21): only
+            // within continuationMergeWindowMs of the endpoint firing, and at
+            // most once per turn — an unbounded window let any gap noise
+            // abort replies and chain merges (live: "delayed responses").
+            // The detector needs BARGE_ENERGY_TICKS to confirm, so the onset
+            // is ~2 ticks before `now`.
+            const resumedAt =
+              now - BARGE_ENERGY_TICKS * TUNABLES.tickMs - this.respondingSince;
+            if (
+              TUNABLES.continuationMerge &&
+              !this.mergedThisTurn &&
+              resumedAt <= TUNABLES.continuationMergeWindowMs
+            ) {
+              this.handleContinuation(now);
+            } else {
+              this.handleBargeIn(now);
+            }
             return;
           }
         }
@@ -965,6 +982,7 @@ export class DuplexSession {
    * endpoint answers the WHOLE thought (fired transcript + continuation).
    */
   private handleContinuation(now: number): void {
+    this.mergedThisTurn = true; // one merge per turn; reset on a fresh turn
     const state = this.assistant;
     if (state) state.merged = true;
     state?.controller.abort();
@@ -999,6 +1017,7 @@ export class DuplexSession {
 
   private handleBargeIn(now: number): void {
     this.bargeAt = now;
+    this.mergedThisTurn = false; // a genuine interruption starts a new exchange
     this.assistant?.controller.abort();
     this.cb.onEvent("barge-in · stopping");
     // The interrupting speech is already in the bounded response pre-roll.
@@ -1212,6 +1231,7 @@ export class DuplexSession {
     this.phase = "listening";
     this.respondingSince = 0;
     this.continuationPrefix = "";
+    this.mergedThisTurn = false;
     this.capture.clear();
     this.transcriber?.reset();
     this.resetUtterance();

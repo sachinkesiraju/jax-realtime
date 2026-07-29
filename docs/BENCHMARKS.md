@@ -1144,3 +1144,33 @@ the decode loop currently syncs GPU→CPU every 80 ms frame before dispatching
 the next, so overlapping dispatch with readback could cut the ~25 ms/frame
 wall time by the round-trip (~10-20% RTF). Neither moves first-audio more
 than a few tens of ms; neither is worth taking before the cloud-brain lever.
+
+## Cycle 21 — live report "doesn't listen / delayed responses": merge bounded
+
+Owner symptoms from real sessions: ASR feels worse as the conversation gets
+longer, and some questions answer late. The bench EXONERATED the pipeline on
+both counts before any fix: a 30-turn live-site session (longest ever run)
+showed zero drift — asr stage 0 on every turn, llmFirst flat ~505-640,
+turnLat medians 1353/1430/1412 across the three 10-turn segments, 30/30
+exact transcripts, zero finalize fallbacks. Attenuated quiet-speech clips
+(0.6× and 0.4× amplitude, simulating a long session's AGC-ducked mic) still
+transcribed exactly and were never discarded by the phantom guard.
+
+What was NOT clean in code review: **cycle 16's continuation-merge shipped
+unbounded** — the roadmap spec said "speech resuming <700 ms", but the
+implementation merged on any resumption across the whole ~1.4 s pre-audio
+gap, and merges could CHAIN (merge → new endpoint → new gap → merge again).
+In a live room, any ≥300 ms noise in the gap — a breath, an "um", a chair —
+aborted the pending reply, spliced noise-transcript onto the question, and
+could repeat: answers arrive seconds late to a mangled prompt. That is both
+symptoms ("delayed responses"; "doesn't listen to me" = the mangled merged
+transcript getting answered instead of the question).
+
+**SHIPPED: `continuationMergeWindowMs: 700` + one merge per turn** (chain
+cap; a later/second resumption takes the barge path, the pre-cycle-16
+behavior). Gates: midpause still merges 3/3 loops whole inside the bounded
+window; map_a 12-turn clean (P50 1445, transcripts exact). The live
+long-conversation ears-check remains the deciding test — if symptoms
+persist there, the next suspects are hardware-side (AEC/AGC adaptation over
+long sessions), which no fake-mic fixture can reproduce; an audible-loopback
+rig is the recorded prerequisite for attacking those.
