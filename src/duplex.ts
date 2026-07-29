@@ -140,13 +140,14 @@ const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 // endpointed into a hallucinated phantom turn ("Thank you. Thank you.").
 const TTS_AUDIBLE_LEVEL = 0.02;
 const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
-// Backchannel pause window. It sits BELOW the earliest endpoint threshold
-// (endpointPunctMs = 380 ms) on purpose: the endpoint checks run first in the
-// tick with early returns, so any window at/above 380 ms is shadowed — a
-// punct-terminal turn endpoints at 380 ms and a plain turn at 620 ms before a
-// [450,800) backchannel could ever fire. Placing it at [250,380) means a genuine
-// mid-utterance pause is acknowledged before either endpoint fires, adding zero
-// turn latency (the block never returns early / touches the endpoint logic).
+// Backchannel pause window. It sits BELOW the plain-silence endpoint
+// (endpointSilenceMs = 500 ms) on purpose: the endpoint checks run first in
+// the tick with early returns, so any window at/above the silence threshold
+// is shadowed. Punct-terminal turns endpoint at endpointPunctMs (250 ms,
+// cycle 17) but those are excluded from backchannels anyway (!endsTerminal),
+// so [250,380) still means a genuine mid-utterance pause is acknowledged
+// before the silence endpoint fires, adding zero turn latency (the block
+// never returns early / touches the endpoint logic).
 const BACKCHANNEL_PAUSE_MIN = 250;
 const BACKCHANNEL_PAUSE_MAX = 380;
 
