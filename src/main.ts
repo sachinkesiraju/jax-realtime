@@ -39,8 +39,8 @@ app.innerHTML = `
           A full&#8209;duplex voice assistant running entirely in your browser with
           <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a>.
           <br />
-          It listens while it talks, you can interrupt it mid&#8209;sentence,
-          and it backchannels while you speak.
+          It listens while it talks and you can interrupt it mid&#8209;sentence.
+
           <br />
           Inspired by the
           <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">Thinking Machines interaction model</a>
@@ -372,8 +372,8 @@ async function handleLoad() {
     // Respect a pre-load Eye opt-in after WebGPU initialization.
     if (el.eyeToggle.checked) void toggleVision(true);
     el.laneAsr.textContent = pipeline.asrDevice;
-    setStatus("preparing backchannels", "busy");
-    await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    setStatus("warming the voice", "busy");
+    await pipeline.tts.warmVoice(el.voiceSelect.value as TTSVoice);
     // Pre-trace the flow-LM step-0 prefill for common sentence lengths so the
     // first reply doesn't pay the on-turn JIT re-trace (gated on
     // TUNABLES.ttsWarmup; no-op when off). No audio is produced.
@@ -397,10 +397,10 @@ async function handleLoad() {
 }
 
 el.voiceSelect.addEventListener("change", () => {
-  // Re-synthesize backchannel clips + re-warm the flow-LM prefill in the new
-  // voice (background, best-effort).
+  // Re-warm the synth path + flow-LM prefill in the new voice (background,
+  // best-effort).
   void pipeline?.tts
-    .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+    .warmVoice(el.voiceSelect.value as TTSVoice)
     .then(() => pipeline?.tts.warmup(el.voiceSelect.value as TTSVoice))
     .catch(() => {});
 });

@@ -1109,3 +1109,38 @@ The -150 ms remains on the table, but the next attempt must ship default-OFF
 behind a live-listen protocol (N real conversations, fragment-rate counted)
 — not a fake-mic clip gate. Post-revert turn latency: P50 ~1.45-1.5 s
 (hist-8's win retained; endpoint back at ~450).
+
+## Cycle 20 — backchannels removed (owner call); TTS speed audit
+
+**Backchannels REMOVED.** The mid-utterance acknowledgments ("Mm-hmm." /
+"Right." / "Got it.") that played into user pauses read, in real sessions, as
+random filler that isn't part of the dialog — "Right." landing mid-thought
+makes no sense (owner report). Unlike the onset filler there is no metric
+they improve, so the playback path is deleted outright: the tick-policy
+block, the voiced-evidence pre-check, and `playBackchannel`. The cached-PCM
+synthesis machinery survives as `warmVoice` — synthesizing one short phrase
+off the audio graph is what JIT-warms the full synth path (flow-LM prefill,
+fused decode, Mimi) so the first real reply stays fast; that half was never
+the problem.
+
+**TTS speed audit (the "can TTS go faster?" question), from live-site turn
+stats and the recorded synth benches:**
+
+- First audio after the first sentence (the `tts` stage) runs ~85-230 ms and
+  is structurally minimal: the player schedules the FIRST 80 ms frame the
+  moment it decodes (no buffering), `lsdDecodeSteps` is already 1,
+  `framesAfterEos` 0, the per-frame decode is one fused dispatch
+  (`ttsFusedStep`), and `ttsWarmup` pre-traces the prefill shapes.
+- Generation runs ~3× faster than playback (realtime factor 0.31), so speech
+  never stalls mid-reply; there is no audible generation gap to remove.
+- What FEELS like slow speech onset is the upstream pipeline: sentence
+  (~350 ms of LLM text accumulation) + llmFirst (~550 ms) — TTS is ~7% of
+  turn latency.
+
+The two real TTS levers left, both kernel-level, recorded for a future
+cycle: (1) fuse the flow-LM step-0 prefill (the open lever from cycle 7,
+~30-60 ms/sentence warm), and (2) pipeline the per-frame `isEos` readback —
+the decode loop currently syncs GPU→CPU every 80 ms frame before dispatching
+the next, so overlapping dispatch with readback could cut the ~25 ms/frame
+wall time by the round-trip (~10-20% RTF). Neither moves first-audio more
+than a few tens of ms; neither is worth taking before the cloud-brain lever.

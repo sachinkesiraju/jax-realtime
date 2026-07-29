@@ -1,6 +1,6 @@
 // Full-duplex micro-turn engine. The mic is always capturing; a ~150 ms tick
 // loop applies a deterministic, priority-ordered policy — barge-in, user turn
-// end (adaptive endpointing), backchannel, time-awareness, idle — over a
+// end (adaptive endpointing), time-awareness, idle — over a
 // continuously-running streaming ASR lane. TTS/LLM run on WebGPU; ASR runs on
 // wasm (when available) so it can transcribe while the assistant speaks.
 
@@ -139,17 +139,12 @@ const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 // the assistant barged itself mid-reply, and the discarded pre-roll then
 // endpointed into a hallucinated phantom turn ("Thank you. Thank you.").
 const TTS_AUDIBLE_LEVEL = 0.02;
-const BACKCHANNEL_MIN_MS = 2_000; // utterance length before a backchannel
-// Backchannel pause window. It sits BELOW the plain-silence endpoint
-// (endpointSilenceMs = 500 ms) on purpose: the endpoint checks run first in
-// the tick with early returns, so any window at/above the silence threshold
-// is shadowed. Punct-terminal turns endpoint at endpointPunctMs (250 ms,
-// cycle 17) but those are excluded from backchannels anyway (!endsTerminal),
-// so [250,380) still means a genuine mid-utterance pause is acknowledged
-// before the silence endpoint fires, adding zero turn latency (the block
-// never returns early / touches the endpoint logic).
-const BACKCHANNEL_PAUSE_MIN = 250;
-const BACKCHANNEL_PAUSE_MAX = 380;
+// NOTE (cycle 20, owner call): the mid-utterance backchannels ("Mm-hmm." /
+// "Right." / "Got it.") that used to play into user pauses were REMOVED
+// entirely — in real sessions they read as random filler that isn't part of
+// the dialog ("right" landing mid-thought makes no sense), and unlike the
+// onset filler there is no bench-visible metric they improve. The cached-PCM
+// machinery lives on only as the TTS voice warmup (SpeechSynthesizer.warmVoice).
 
 const TERMINAL_PUNCT = /[.!?…]\s*$/;
 const TIMER_UNIT = /(\d+)\s*(seconds?|secs?|minutes?|mins?)/i;
@@ -260,7 +255,6 @@ export class DuplexSession {
   // Adaptive barge-in echo-floor calibration (reset each reply).
   private bargeFloor = 0;
   private bargeFloorTicks = 0;
-  private backchannelUsed = false;
   // Continuation-merge (cycle 16): when the user's speech resumes before the
   // reply's first audio, the fired turn's transcript is kept here and the
   // reply is aborted; the next endpoint prepends it so the two halves of the
@@ -563,36 +557,7 @@ export class DuplexSession {
       return;
     }
 
-    // 3. Backchannel (mid-utterance pause; does not end the turn). Only when the
-    //    committed text does NOT look turn-final — a terminal-punct tail means
-    //    the user is finishing, not pausing mid-thought, and that turn is about
-    //    to endpoint anyway.
-    if (
-      !this.backchannelUsed &&
-      !endsTerminal &&
-      speechMs >= BACKCHANNEL_MIN_MS &&
-      trailingSilence >= BACKCHANNEL_PAUSE_MIN &&
-      trailingSilence < BACKCHANNEL_PAUSE_MAX &&
-      !this.isAssistantAudible() &&
-      // Same voiced-evidence test the phantom-turn guard applies at endpoint,
-      // applied BEFORE humming at the user: the adversarial bench caught the
-      // engine backchanneling at keyboard noise (typing sustains the level
-      // meter past BACKCHANNEL_MIN_MS, but its longest voiced run stays far
-      // under a spoken word's). Runs at most once per utterance (the flag is
-      // set regardless) so the PCM scan cost isn't paid every tick.
-      this.utteranceSoundsVoiced()
-    ) {
-      this.pipeline.tts.playBackchannel();
-      this.cb.onEvent("backchannel");
-    }
-  }
-
-  /** Voiced-evidence check over the captured utterance so far (see the
-   *  phantom-turn guard); marks the backchannel as used either way. */
-  private utteranceSoundsVoiced(): boolean {
-    this.backchannelUsed = true;
-    const { maxRunMs, peak } = voicedStats(this.capture.samples());
-    return maxRunMs >= MIN_VOICED_RUN_MS && peak >= MIN_PEAK_ABS;
+    // (Backchannels removed in cycle 20 — see the note by TTS_AUDIBLE_LEVEL.)
   }
 
   // --- User turn end -----------------------------------------------------
@@ -795,7 +760,7 @@ export class DuplexSession {
     this.cb.onBackground(true);
     // Return to listening first (so speakProactive doesn't bail on the
     // "responding" phase), then speak the holding line while the fetch runs —
-    // the user can keep talking / interrupt / be backchanneled meanwhile.
+    // the user can keep talking / interrupt meanwhile.
     this.startFreshListening();
     // Instant tools (calc/convert/clock) have no holding line — their result
     // arrives immediately and is spoken from the pending queue instead.
@@ -1026,7 +991,6 @@ export class DuplexSession {
     this.respondingSince = 0;
     this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
     this.silenceStart = 0;
-    this.backchannelUsed = false;
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
   }
@@ -1051,7 +1015,6 @@ export class DuplexSession {
     this.phase = "listening";
     this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
     this.silenceStart = 0;
-    this.backchannelUsed = false;
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
     // NOTE: the continuation does NOT skip the phantom-turn guard at endpoint
@@ -1242,7 +1205,6 @@ export class DuplexSession {
     this.silenceStart = 0;
     this.aboveTicks = 0;
     this.aboveBargeTicks = 0;
-    this.backchannelUsed = false;
   }
 
   /** Fresh listening window: drop buffered audio and reset ASR commit state. */
