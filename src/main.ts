@@ -12,6 +12,7 @@ import {
   rememberUserFacts,
 } from "./memory";
 import { VoiceCapture } from "./mic";
+import { parseVadWeights, SileroVad } from "./asr/vad";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
 import { detectTool, type ToolKind, type UiCard } from "./tools/tools";
@@ -369,6 +370,19 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
+    // Learned turn signal (cycle 22): a 1.2 MB pure-TS Silero v5 fed from the
+    // mic worklet. Same-origin fetch (ships with the app bundle); failure
+    // falls back to the energy heuristics silently — the tunable's vadReady
+    // guard means the app never depends on it.
+    try {
+      const vadBin = await fetch("/vad/silero-vad-v5.bin").then((r) => {
+        if (!r.ok) throw new Error(`vad weights: HTTP ${r.status}`);
+        return r.arrayBuffer();
+      });
+      capture.attachVad(new SileroVad(parseVadWeights(vadBin)));
+    } catch (error) {
+      console.warn("VAD unavailable; energy turn signal only", error);
+    }
     // Respect a pre-load Eye opt-in after WebGPU initialization.
     if (el.eyeToggle.checked) void toggleVision(true);
     el.laneAsr.textContent = pipeline.asrDevice;

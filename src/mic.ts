@@ -2,7 +2,14 @@
 // run voice-activity detection and incremental Whisper passes on the live
 // buffer (hands-free mode, like the HF speech-to-speech Space).
 
+import type { SileroVad } from "./asr/vad";
+
 const SAMPLE_RATE = 16_000;
+// Silero frame size (32 ms) and the hysteresis thresholds from the official
+// wrapper defaults: speech latches on above 0.5 and releases below 0.35.
+const VAD_CHUNK = 512;
+const VAD_ON = 0.5;
+const VAD_OFF = 0.35;
 const MAX_CAPTURE_SAMPLES = SAMPLE_RATE * 32;
 
 /**
@@ -134,6 +141,15 @@ export class VoiceCapture {
   private pcm = new BoundedPcmBuffer(MAX_CAPTURE_SAMPLES);
   private recentLevel = 0;
   private capturing = true;
+  // Learned VAD (cycle 22): a pure-TS Silero v5 fed 512-sample chunks as they
+  // arrive from the worklet (~2 ms CPU per 32 ms frame). Optional — when not
+  // attached, the energy heuristics remain the only signal.
+  private vad: SileroVad | null = null;
+  private vadBuf = new Float32Array(VAD_CHUNK);
+  private vadFill = 0;
+  private lastVadProb = 0;
+  private vadSpeech = false;
+  private vadSpeechFrames = 0; // frames >VAD_ON since last clear/preRoll
 
   get open(): boolean {
     return this.context !== null;
@@ -172,6 +188,27 @@ export class VoiceCapture {
       const rms = Math.sqrt(sum / block.length);
       // Smoothed over roughly the last ~100 ms of blocks.
       this.recentLevel = this.recentLevel * 0.7 + rms * 0.3;
+      // Feed the learned VAD in 512-sample frames as blocks arrive.
+      if (this.vad) {
+        let off = 0;
+        while (off < block.length) {
+          const take = Math.min(VAD_CHUNK - this.vadFill, block.length - off);
+          this.vadBuf.set(block.subarray(off, off + take), this.vadFill);
+          this.vadFill += take;
+          off += take;
+          if (this.vadFill === VAD_CHUNK) {
+            this.vadFill = 0;
+            const p = this.vad.process(this.vadBuf);
+            this.lastVadProb = p;
+            if (p > VAD_ON) {
+              this.vadSpeech = true;
+              this.vadSpeechFrames++;
+            } else if (p < VAD_OFF) {
+              this.vadSpeech = false;
+            }
+          }
+        }
+      }
     };
     source.connect(node);
     // Keep the graph alive without echoing the mic to the speakers.
@@ -183,10 +220,37 @@ export class VoiceCapture {
     this.clear();
   }
 
+  /** Attach the learned VAD (idempotent; enables the vad turn signal). */
+  attachVad(vad: SileroVad): void {
+    this.vad = vad;
+  }
+
+  /** True once a VAD is attached and producing frames. */
+  vadReady(): boolean {
+    return this.vad !== null;
+  }
+
+  /** Hysteresis speech state: on >0.5, off <0.35 (Silero wrapper defaults). */
+  vadActive(): boolean {
+    return this.vadSpeech;
+  }
+
+  /** Latest per-frame P(speech). */
+  vadProb(): number {
+    return this.lastVadProb;
+  }
+
+  /** Frames above VAD_ON since the last clear()/startPreRoll() — the learned
+   *  replacement for the phantom-turn guard's voiced-evidence scan. */
+  vadSpeechFrameCount(): number {
+    return this.vadSpeechFrames;
+  }
+
   /** Discard buffered audio and restore the normal utterance-size cap. */
   clear(): void {
     this.pcm.clear();
     this.pcm.setMaxSamples(MAX_CAPTURE_SAMPLES);
+    this.vadSpeechFrames = 0;
   }
 
   /**
@@ -198,6 +262,7 @@ export class VoiceCapture {
     const maxSamples = sampleLimit((ms / 1000) * SAMPLE_RATE);
     this.pcm.clear();
     this.pcm.setMaxSamples(maxSamples);
+    this.vadSpeechFrames = 0;
   }
 
   /**

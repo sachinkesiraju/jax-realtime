@@ -516,12 +516,19 @@ export class DuplexSession {
     // starting a second TTS stream would overlap audio on the same GPU lane.
     if (this.proactiveSpeaking) return;
 
-    // Listening phase: track speech onset and silence. Anything below the
-    // speech threshold counts toward silence — using a lower "stop" gate here
-    // created a dead-band where a quiet-but-nonzero signal latched neither
-    // state and the turn never endpointed. Brief within-word dips are absorbed
-    // by the endpoint silence windows (450–800 ms), not this per-tick gate.
-    if (level > START_LEVEL) {
+    // Listening phase: track speech onset and silence. With the learned
+    // turn signal (cycle 22), "speech right now" is Silero's hysteresis
+    // state (on >0.5, off <0.35); with the energy signal it's the RMS level
+    // against START_LEVEL. Anything non-speech counts toward silence —
+    // using a lower "stop" gate here created a dead-band where a
+    // quiet-but-nonzero signal latched neither state and the turn never
+    // endpointed. Brief within-word dips are absorbed by the endpoint
+    // silence windows, not this per-tick gate.
+    const speechNow =
+      TUNABLES.turnSignal === "vad" && this.capture.vadReady()
+        ? this.capture.vadActive()
+        : level > START_LEVEL;
+    if (speechNow) {
       if (!this.speechStartAt) this.speechStartAt = now;
       this.silenceStart = 0;
     } else if (this.speechStartAt && !this.silenceStart) {
@@ -593,19 +600,25 @@ export class DuplexSession {
     // hallucinated turns like "Thank you. Thank you." in live sessions; a
     // genuine interruption carries a voiced run that passes easily).
     {
-      const stats = voicedStats(this.capture.samples());
-      // Reject anything that isn't a sustained voiced sound. Too quiet → always
-      // ambient. Too short a contiguous voiced RUN → a transient: a keystroke,
-      // a click, or a train of them from typing (each loud, but none sustained)
-      // — exactly the noise that was getting transcribed into invented convos.
-      // A real word, even a one-syllable "what?", carries a run well past the
-      // bar, so genuine speech (including snappy replies) still passes.
-      const tooQuiet = stats.peak < MIN_PEAK_ABS;
-      const notSustained = stats.maxRunMs < MIN_VOICED_RUN_MS;
+      // Reject anything that isn't speech evidence. Learned signal (cycle
+      // 22): the utterance must contain ≥4 frames (128 ms) of P(speech) >
+      // 0.5 — Silero separates keyboard transients / ambient swells from
+      // speech directly. Energy signal: the classic voicedStats evidence
+      // test — too quiet → always ambient; too short a contiguous voiced
+      // RUN → a transient (a keystroke, a click, or a train of them from
+      // typing — each loud, but none sustained). A real word, even a
+      // one-syllable "what?", passes both signals easily.
+      const notSpeech = (): boolean => {
+        if (TUNABLES.turnSignal === "vad" && this.capture.vadReady()) {
+          return this.capture.vadSpeechFrameCount() < 4;
+        }
+        const stats = voicedStats(this.capture.samples());
+        return stats.peak < MIN_PEAK_ABS || stats.maxRunMs < MIN_VOICED_RUN_MS;
+      };
       // A pending continuation-merge changes the discard semantics: the FIRED
       // half of the turn was real speech, so if the "resumption" turns out to
       // be noise we must still answer the fired half rather than drop both.
-      if ((tooQuiet || notSustained) && !this.continuationPrefix) {
+      if (!this.continuationPrefix && notSpeech()) {
         this.cb.onEvent("noise · discarded");
         this.startFreshListening();
         return;

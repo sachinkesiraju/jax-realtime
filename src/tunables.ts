@@ -16,6 +16,24 @@ export const TUNABLES = {
    */
   bargePreRollMs: 1200,
 
+  // region: signal (cycle 22 — the seam-layer reduction)
+  /**
+   * Which signal drives the LISTENING-phase turn decisions (speech onset,
+   * silence tracking, and the phantom-turn evidence check). "energy" is the
+   * heuristic stack (RMS level + voicedStats peak/run scan). "vad" is the
+   * hand-ported pure-TS Silero v5 (src/asr/vad.ts, parity-gated against the
+   * onnxruntime reference to 1e-6): P(speech) per 32 ms frame with the
+   * official 0.5/0.35 hysteresis, ~2 ms CPU per frame, no GPU. Offline
+   * shadow scoring on the full clip suite: typing max P 0.009, ambient
+   * 0.001, quiet speech (0.11 peak, NO AGC) max 1.000 — strictly separates
+   * every bucket the heuristics needed three constants and an adaptive
+   * floor to separate. Barge-in (responding phase) deliberately stays on
+   * the tuned energy/echo-floor path either way: Silero would count the
+   * assistant's own playback echo as speech, so the echo-aware energy
+   * detector remains the right primitive there.
+   */
+  turnSignal: "energy" as "energy" | "vad",
+
   // region: endpoint
   /**
    * Silence to end a turn whose committed text ends in . ! ?  Cycle 17
