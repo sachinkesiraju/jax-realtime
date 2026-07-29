@@ -216,6 +216,10 @@ type AssistantState = {
   controller: AbortController;
   fullText: string; // everything the LLM has produced so far
   spoken: string; // sentences actually handed to TTS
+  /** Continuation-merge: the reply was aborted BEFORE any audio played
+   *  because the user kept talking — suppress its bubble/history/turn-log
+   *  entirely (the user never heard it; it answered half a thought). */
+  merged: boolean;
 };
 
 type PendingTimer = {
@@ -256,6 +260,11 @@ export class DuplexSession {
   private bargeFloor = 0;
   private bargeFloorTicks = 0;
   private backchannelUsed = false;
+  // Continuation-merge (cycle 16): when the user's speech resumes before the
+  // reply's first audio, the fired turn's transcript is kept here and the
+  // reply is aborted; the next endpoint prepends it so the two halves of the
+  // interrupted thought become ONE user turn ("append, don't restart").
+  private continuationPrefix = "";
 
   // Assistant / response tracking.
   private assistant: AssistantState | null = null;
@@ -446,7 +455,15 @@ export class DuplexSession {
           if (level > BARGE_ENERGY_MIN) this.aboveBargeTicks++;
           else this.aboveBargeTicks = 0;
           if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
-            this.handleBargeIn(now);
+            // Speech resuming BEFORE the user has heard anything is not an
+            // interruption — it's the same thought continuing across a pause
+            // that the endpoint mistook for the end of the turn (the punct
+            // fast-path fires on Whisper-invented terminal punctuation, and
+            // cycles 3B/5/15 proved no pre-fire window can fix that). Merge:
+            // abort the unheard reply and append the continuation to the
+            // fired turn instead of answering half a thought.
+            if (TUNABLES.continuationMerge) this.handleContinuation(now);
+            else this.handleBargeIn(now);
             return;
           }
         }
@@ -602,7 +619,10 @@ export class DuplexSession {
       // bar, so genuine speech (including snappy replies) still passes.
       const tooQuiet = stats.peak < MIN_PEAK_ABS;
       const notSustained = stats.maxRunMs < MIN_VOICED_RUN_MS;
-      if (tooQuiet || notSustained) {
+      // A pending continuation-merge changes the discard semantics: the FIRED
+      // half of the turn was real speech, so if the "resumption" turns out to
+      // be noise we must still answer the fired half rather than drop both.
+      if ((tooQuiet || notSustained) && !this.continuationPrefix) {
         this.cb.onEvent("noise · discarded");
         this.startFreshListening();
         return;
@@ -641,6 +661,15 @@ export class DuplexSession {
     this.turnMarks.transcript = text;
     this.turnMarks.asrAvgLogProb = confidence?.avgLogProb ?? undefined;
     const asrLagMs = performance.now() - endOfSpeechAt;
+
+    // Continuation-merge: the previous endpoint fired mid-thought and its
+    // reply was aborted unheard; this turn is the rest of the same thought.
+    // Answer the whole thing as ONE user turn.
+    if (this.continuationPrefix) {
+      text = [this.continuationPrefix, text.trim()].filter(Boolean).join(" ");
+      this.continuationPrefix = "";
+      this.turnMarks.transcript = text;
+    }
 
     if (!this.running) return;
 
@@ -794,6 +823,7 @@ export class DuplexSession {
       controller,
       fullText: "",
       spoken: "",
+      merged: false,
     };
     this.assistant = state;
     this.currentTtsText = "";
@@ -846,6 +876,19 @@ export class DuplexSession {
     }
 
     const interrupted = controller.signal.aborted;
+
+    // Continuation-merge teardown: the reply was aborted before ANY audio
+    // played and its user turn was reclaimed — the user never heard it, so it
+    // never happened. Remove the bubble (empty text → the UI drops it), keep
+    // it out of history and the turn log; handleContinuation already re-opened
+    // listening, so no state transition here either.
+    if (state.merged) {
+      this.cb.onAssistantEnd("", true);
+      this.turnMarks = {};
+      if (this.assistant === state) this.assistant = null;
+      return;
+    }
+
     const finalText = interrupted
       ? `${state.spoken.trim()} [interrupted]`.trim()
       : state.fullText.trim();
@@ -945,6 +988,46 @@ export class DuplexSession {
     state.spoken += (state.spoken ? " " : "") + sentence;
     this.currentTtsText = state.spoken;
     return sentence;
+  }
+
+  // --- Continuation-merge --------------------------------------------------
+
+  /**
+   * The user's speech resumed while the reply was still silent (pre-first-
+   * audio): the endpoint fired mid-thought. Abort the unheard reply, take the
+   * fired turn back out of history, and re-open the utterance so the next
+   * endpoint answers the WHOLE thought (fired transcript + continuation).
+   */
+  private handleContinuation(now: number): void {
+    const state = this.assistant;
+    if (state) state.merged = true;
+    state?.controller.abort();
+    // Reclaim the fired half-turn: it was already pushed to history by
+    // endUserTurn; the merged turn re-pushes the full text at its endpoint.
+    const last = this.history[this.history.length - 1];
+    if (last?.role === "user") {
+      this.history.pop();
+      // Strip a scene-grounding prefix; it is re-derived at the merged
+      // endpoint from the then-current camera state.
+      const prefix = last.content.replace(/^\[scene:[^\]]*\]\s*/, "").trim();
+      this.continuationPrefix = [this.continuationPrefix, prefix]
+        .filter(Boolean)
+        .join(" ");
+    }
+    this.cb.onEvent("continuation · merging with previous turn");
+    // Same capture handoff as a barge-in: the response-phase pre-roll holds
+    // the continuation's onset; grow it as the new utterance window.
+    if (TUNABLES.bargePreRollMs > 0) {
+      this.capture.handoffPreRoll();
+      this.transcriber?.reset();
+    }
+    this.phase = "listening";
+    this.respondingSince = 0;
+    this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
+    this.silenceStart = 0;
+    this.backchannelUsed = false;
+    this.aboveTicks = 0;
+    this.aboveBargeTicks = 0;
   }
 
   // --- Barge-in ----------------------------------------------------------
@@ -1165,6 +1248,7 @@ export class DuplexSession {
   private startFreshListening(): void {
     this.phase = "listening";
     this.respondingSince = 0;
+    this.continuationPrefix = "";
     this.capture.clear();
     this.transcriber?.reset();
     this.resetUtterance();
