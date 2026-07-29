@@ -656,7 +656,14 @@ export class SmolLmChatModel implements ChatModel {
         const filler = this.tokenizer.encode(
           " tell me a little more about the ocean and the weather today",
         );
-        for (const target of [bucket * 2, bucket * 3]) {
+        // Warm every bucket shape a session can actually reach (bounded by
+        // the KV capacity minus reply headroom) — see llmWarmupBuckets.
+        const maxBuckets = Math.max(2, TUNABLES.llmWarmupBuckets);
+        const targets: number[] = [];
+        for (let n = 2; n <= maxBuckets; n++) {
+          if (bucket * n <= SMOLLM_KV_CAPACITY - 128) targets.push(bucket * n);
+        }
+        for (const target of targets) {
           const tokens = this.encodePrompt([{ role: "user", content: "Hi" }]);
           while (tokens.length < target) tokens.push(...filler);
           tokens.length = target - 1; // bucket pad brings it to `target`
