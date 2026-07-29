@@ -122,6 +122,16 @@ function extractPlace(text: string): string {
   const m = text.match(/\b(?:in|at|for|around|near)\s+([\p{L}][\p{L}\s.'-]*)/iu);
   if (!m) return "";
   const phrase = m[1].replace(/[.?!,;].*$/s, "").trim();
+  // The capture is greedy, so a VERB's preposition can swallow the real place
+  // phrase: "look AT the weather IN San Francisco instead" captures "the
+  // weather in San Francisco instead", whose leading junk defeats the
+  // geocoder's trailing-token backoff (and a degenerate backoff to "the"
+  // fuzzy-matched Teresina, Brazil in a live session). The place sits under
+  // the INNERMOST preposition, so recurse into the captured phrase and prefer
+  // its result; a recursion that strips to nothing (bare "in Paris for
+  // tomorrow" → "tomorrow" → "") falls back to this level's phrase.
+  const inner = extractPlace(phrase);
+  if (inner) return inner;
   // Strip leading deictic time words / prepositions (closed classes) so a bare
   // "for tomorrow" resolves to "" (→ tool doesn't fire) and "tomorrow in Paris"
   // → "Paris". The geocoder still owns the trailing tail (see geocodePlace).
@@ -169,12 +179,28 @@ function wmoDescribe(code: number): [string, string] {
 // rather than hand-cleaning the query. Try the whole phrase, then drop trailing
 // tokens until it matches, so "San Francisco instead" / "Paris right now" find
 // "San Francisco" / "Paris" without any junk-word list.
+// Words that must never be geocoded ALONE: articles + the closed grammatical
+// classes extractPlace already recognizes. The geocoder fuzzy-matches, so a
+// backoff that degenerates to a bare function word invents a city ("the" →
+// Teresina, Brazil — a live failure). Real place names ("The Hague") keep
+// their article because the multi-token candidate is tried first.
+const GEOCODE_STOP = new Set([
+  "the",
+  "a",
+  "an",
+  ...TIME_DEICTICS,
+  ...PLACE_PREPS,
+]);
+
 async function geocodePlace(
   query: string,
 ): Promise<{ name: string; admin1?: string; country_code?: string; latitude: number; longitude: number } | null> {
   const tokens = query.split(/\s+/).filter(Boolean);
   for (let end = tokens.length; end >= 1; end--) {
-    const name = tokens.slice(0, end).join(" ");
+    const candidate = tokens.slice(0, end);
+    // Skip candidates made entirely of function words — never a place.
+    if (candidate.every((t) => GEOCODE_STOP.has(t.toLowerCase()))) continue;
+    const name = candidate.join(" ");
     const geo = await fetch(
       `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1`,
     ).then((r) => r.json());
