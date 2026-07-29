@@ -242,6 +242,17 @@ export const TUNABLES = {
    */
   qualityTemperature: 0.7,
   qualityTypedMemory: true,
+  /**
+   * Append a "lead with one short sentence" instruction to the system prompt
+   * (hill-climb lever #3, cycle 15). Targets time-to-first-audio structurally:
+   * the sentence and tts stages both scale with the FIRST sentence's length
+   * (cycle-14 law: the first-audio path is synthesis-startup-bound and
+   * flush-timing knobs only relabel the wait), so making the opening sentence
+   * short in the TEXT shrinks both stages at once. Read at prompt-encode time
+   * (like qualityGarbleClause) so the bench can flip it per-session without a
+   * reload. Default off until the paired MAP + holdout gates pass.
+   */
+  qualityLeadShort: false,
 };
 
 export type Tunables = typeof TUNABLES;

@@ -547,6 +547,14 @@ const SMOLLM_SYSTEM =
 const SMOLLM_GARBLE_CLAUSE =
   "If the user's message is garbled or doesn't make sense, say you didn't " +
   "catch that and ask them to say it again.";
+// Optional lead-short instruction (TUNABLES.qualityLeadShort, cycle 15).
+// Time-to-first-audio scales with the FIRST sentence's length (it must be
+// fully generated, then fully synthesized, before any sound plays), so ask
+// for a short opener in the text itself. Positive phrasing, one sentence,
+// same pattern as the garble clause.
+const SMOLLM_LEAD_SHORT_CLAUSE =
+  "Open every reply with a short sentence of just a few words, then continue " +
+  "if there's more to say.";
 // MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
 // doesn't follow the instruction). Small models imitate demonstrations far
 // better than they follow rules, so the tunable also injects two few-shot
@@ -692,6 +700,7 @@ export class SmolLmChatModel implements ChatModel {
     const hasMemory = lastUserMemoryText !== "";
     const system = [
       SMOLLM_SYSTEM,
+      TUNABLES.qualityLeadShort ? SMOLLM_LEAD_SHORT_CLAUSE : "",
       TUNABLES.qualityGarbleClause ? SMOLLM_GARBLE_CLAUSE : "",
       hasMemory
         ? `You already know: ${lastUserMemoryText} Reference these facts naturally, like a friend, without repeating them verbatim.`
