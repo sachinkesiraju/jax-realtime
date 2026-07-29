@@ -123,6 +123,17 @@ export const TUNABLES = {
    * rolling window keeps recent context while bounding per-turn cost.
    */
   llmMaxHistoryTurns: 16,
+  /**
+   * How many prefill bucket shapes to pre-trace at load (×2..×N of
+   * llmPrefillBucket; ×1 is traced by warmup's tiny real generation).
+   * Cycle-16 12-turn sessions measured llmFirst at 520–630 ms vs cycle-6's
+   * ~250–350 claim: warmup stopped at ×3 (768 tokens) while a windowed
+   * conversation's prompt reaches ×4–×5, so those turns paid the 32-layer
+   * re-trace mid-session — exactly the cost cycle 6 moved to load time, back
+   * again through the unwarmed shapes. Read at LOAD time (bench applies
+   * tunables before clicking load).
+   */
+  llmWarmupBuckets: 3,
 
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */
