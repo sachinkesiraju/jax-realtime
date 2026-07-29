@@ -1067,3 +1067,45 @@ above the median instead of ~1-1.3 s, because the two structural tail sources
 floor at ~1.3-1.4 s: endpoint 301 (floor) + llmFirst ~550 + sentence ~380 +
 tts ~100 — from here, only the cloud-brain ChatModel (llmFirst+sentence →
 ~250 combined) or a faster local decode moves it materially.
+
+## Cycle 19 — deployed-site "mess" report: serving exonerated, eager endpoint reverted on ears
+
+Owner report after the first real-mic session on the Netlify deploy: "it's a
+mess, it doesn't work as well as localhost". Two investigations:
+
+**1. Serving is NOT the problem — measured, not assumed.** The bench hooks
+were un-gated from `import.meta.env.DEV` (they made production deploys
+unbenchable — the one build that matters most), and the identical production
+build was benched three ways on the same rig:
+
+| serving path | turnLat P50 / P95 | stage medians |
+| --- | --- | --- |
+| dev server (cyc-18 ref) | 1458 / 1649 | ep 450 · llm 535 · sent 353 · tts 85 |
+| `vite preview` (prod build, local) | 1335 / 1495 | ep 301 · llm 586 · sent 308 · tts 100 |
+| **Netlify prod URL** | **1375 / 1976** | ep 301 · llm 576 · sent 314 · tts 228 |
+
+Same medians, same exact transcripts, midpause still merges whole on the
+deployed site. Once the weights are in OPFS the origin is irrelevant — the
+only serving-side difference is the FIRST-visit ~700 MB download (~3 min on
+LAN, worse on Wi-Fi), which localhost sessions never feel because their OPFS
+has been warm for weeks.
+
+**2. The actual regression: cycle 17's eager endpoint failed its ears gate.**
+The deploy was the owner's first LIVE contact with post-cycle-17 defaults —
+"localhost" was last heard running pre-cycle-16 code, so the comparison was
+never dev-vs-prod; it was old-tuning-vs-new-tuning. Real speech pauses
+mid-sentence constantly and at every length; the 250 ms punct window fired
+into those pauses, and continuation-merge only rescues resumptions that land
+inside the pre-first-audio gap (~1.3 s) — later resumptions take the barge
+path (abort + restart), which in a fluid human exchange reads as fragment
+chaos. The scripted clips (fluent single questions, one fixed midpause)
+structurally cannot surface this. **REVERTED to 380/620; continuation-merge,
+hist-8, and the quality fusion stay** (merge is a pure safety net at any
+window; hist-8's win has no endpoint interaction).
+
+This is the cycle-3 law violated and re-learned at full price: *"a
+timing-proxy win must pass an ears-in-the-loop gate before it defaults on."*
+The -150 ms remains on the table, but the next attempt must ship default-OFF
+behind a live-listen protocol (N real conversations, fragment-rate counted)
+— not a fake-mic clip gate. Post-revert turn latency: P50 ~1.45-1.5 s
+(hist-8's win retained; endpoint back at ~450).

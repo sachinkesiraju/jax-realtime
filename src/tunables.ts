@@ -18,19 +18,21 @@ export const TUNABLES = {
 
   // region: endpoint
   /**
-   * Silence to end a turn whose committed text ends in . ! ?  380 → 250 in
-   * cycle 17: pre-merge, the window was UX-safety-bound (an eager fire on a
-   * mid-thought pause broke the conversation, so cycle 3B refused to lower
-   * it for a latency win). continuationMerge (cycle 16) changed the failure
-   * cost — an eager fire now merges with the resumed speech instead of
-   * answering half a thought — so the window could finally chase the floor:
-   * endpoint stage 450 → 301 ms, deterministic and exactly replicated on
-   * both clips, with 0 midpause cut-offs and clean transcripts throughout.
+   * Silence to end a turn whose committed text ends in . ! ?  Cycle 17
+   * shipped 380 → 250 under the continuation-merge safety net (endpoint
+   * stage 450 → 301 ms, clean on every fake-mic clip) — and cycle 19
+   * REVERTED it on ears: the first real-mic session (deployed site) was "a
+   * mess". Real speech pauses mid-sentence far more than the scripted clips,
+   * and the merge only rescues a resumption that lands BEFORE first audio
+   * (~1.3 s); a resumption after that is a barge → aborted reply → fragment
+   * chaos. The cycle-3 law ("a timing-proxy win must pass an ears gate
+   * before it ships") applied verbatim and was violated; recorded so the
+   * next -150 ms attempt starts with a live-listen protocol, not a clip.
    */
-  endpointPunctMs: 250,
-  /** Silence to end a turn otherwise. 620 → 500 in cycle 17, same merge
-   *  safety-net reasoning (validated only fused with the punct change). */
-  endpointSilenceMs: 500,
+  endpointPunctMs: 380,
+  /** Silence to end a turn otherwise. (Cycle 17's 500 reverted with the
+   *  punct window above — same ears verdict.) */
+  endpointSilenceMs: 620,
   /** Ignore sub-blip "utterances" shorter than this. */
   minSpeechMs: 350,
   /**
