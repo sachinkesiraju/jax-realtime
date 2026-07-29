@@ -23,6 +23,18 @@ export const TUNABLES = {
   endpointSilenceMs: 620,
   /** Ignore sub-blip "utterances" shorter than this. */
   minSpeechMs: 350,
+  /**
+   * Post-fire continuation-merge (cycle 16; open-roadmap item 1). When the
+   * user's speech resumes DURING the reply's silent latency gap (before first
+   * audio), the endpoint fired mid-thought: abort the unheard reply, reclaim
+   * the fired turn from history, and answer fired-transcript + continuation
+   * as ONE turn at the next endpoint. Cycles 3B/5/15 proved this is the only
+   * viable design for the cut-off class — no pre-fire window (shorter OR
+   * longer) can fix a mid-thought pause that Whisper terminates with invented
+   * punctuation. When off, pre-audio speech resumption falls back to the
+   * plain barge-in path (abort + restart), the pre-cycle-16 behavior.
+   */
+  continuationMerge: true,
 
   // region: asr
   /** Minimum time between the starts of two streaming Whisper passes. */
@@ -253,6 +265,21 @@ export const TUNABLES = {
    * reload. Default off until the paired MAP + holdout gates pass.
    */
   qualityLeadShort: false,
+  /**
+   * Append a stay-on-topic clause to the system prompt (cycle 16, targets the
+   * staysOnTopic axis — 5/12 at the cycle-15 baseline, the worst quality
+   * dial: generic/meta replies that ignore what the user actually said).
+   * Read at prompt-encode time like the other quality clauses.
+   */
+  qualityTopicClause: false,
+  /**
+   * How many garble-clarify exemplar exchanges to inject (0-2). Cycle 11
+   * added the second pair for asksClarify; cycle-15 baseline showed clarify
+   * over-priming (a false clarify on a clean short ask, and one on a factual
+   * item) — this dials the demonstration count so the trade is measurable:
+   * asksClarify vs noFalseClarify/correct/staysOnTopic.
+   */
+  qualityGarbleExemplars: 2,
 };
 
 export type Tunables = typeof TUNABLES;

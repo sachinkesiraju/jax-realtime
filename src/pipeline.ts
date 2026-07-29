@@ -555,6 +555,12 @@ const SMOLLM_GARBLE_CLAUSE =
 const SMOLLM_LEAD_SHORT_CLAUSE =
   "Open every reply with a short sentence of just a few words, then continue " +
   "if there's more to say.";
+// Optional stay-on-topic instruction (TUNABLES.qualityTopicClause, cycle 16).
+// Cycle-15 baseline: staysOnTopic 5/12 — replies drift generic/meta instead of
+// answering what the user actually said. Positive phrasing, one sentence.
+const SMOLLM_TOPIC_CLAUSE =
+  "Answer the user's most recent message directly, staying on their topic " +
+  "and using the specific details they mentioned.";
 // MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
 // doesn't follow the instruction). Small models imitate demonstrations far
 // better than they follow rules, so the tunable also injects two few-shot
@@ -701,6 +707,7 @@ export class SmolLmChatModel implements ChatModel {
     const system = [
       SMOLLM_SYSTEM,
       TUNABLES.qualityLeadShort ? SMOLLM_LEAD_SHORT_CLAUSE : "",
+      TUNABLES.qualityTopicClause ? SMOLLM_TOPIC_CLAUSE : "",
       TUNABLES.qualityGarbleClause ? SMOLLM_GARBLE_CLAUSE : "",
       hasMemory
         ? `You already know: ${lastUserMemoryText} Reference these facts naturally, like a friend, without repeating them verbatim.`
@@ -721,7 +728,13 @@ export class SmolLmChatModel implements ChatModel {
       !lastUserContent.includes("[scene:") &&
       !hasMemory
     ) {
-      for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
+      // Exemplar count is tunable (cycle 16): each pair teaches the clarify
+      // behavior but also primes clarifies on clean input — the dial makes
+      // that trade measurable per-condition.
+      const pairs = Math.max(0, Math.min(2, TUNABLES.qualityGarbleExemplars));
+      for (const m of SMOLLM_GARBLE_EXEMPLAR.slice(0, pairs * 2)) {
+        turn(m.role, m.content);
+      }
     }
     for (const message of windowHistory(history)) {
       let content = message.content.trim();
