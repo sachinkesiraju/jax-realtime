@@ -17,12 +17,34 @@ export const TUNABLES = {
   bargePreRollMs: 1200,
 
   // region: endpoint
-  /** Silence to end a turn whose committed text ends in . ! ? */
-  endpointPunctMs: 380,
-  /** Silence to end a turn otherwise. */
-  endpointSilenceMs: 620,
+  /**
+   * Silence to end a turn whose committed text ends in . ! ?  380 → 250 in
+   * cycle 17: pre-merge, the window was UX-safety-bound (an eager fire on a
+   * mid-thought pause broke the conversation, so cycle 3B refused to lower
+   * it for a latency win). continuationMerge (cycle 16) changed the failure
+   * cost — an eager fire now merges with the resumed speech instead of
+   * answering half a thought — so the window could finally chase the floor:
+   * endpoint stage 450 → 301 ms, deterministic and exactly replicated on
+   * both clips, with 0 midpause cut-offs and clean transcripts throughout.
+   */
+  endpointPunctMs: 250,
+  /** Silence to end a turn otherwise. 620 → 500 in cycle 17, same merge
+   *  safety-net reasoning (validated only fused with the punct change). */
+  endpointSilenceMs: 500,
   /** Ignore sub-blip "utterances" shorter than this. */
   minSpeechMs: 350,
+  /**
+   * Post-fire continuation-merge (cycle 16; open-roadmap item 1). When the
+   * user's speech resumes DURING the reply's silent latency gap (before first
+   * audio), the endpoint fired mid-thought: abort the unheard reply, reclaim
+   * the fired turn from history, and answer fired-transcript + continuation
+   * as ONE turn at the next endpoint. Cycles 3B/5/15 proved this is the only
+   * viable design for the cut-off class — no pre-fire window (shorter OR
+   * longer) can fix a mid-thought pause that Whisper terminates with invented
+   * punctuation. When off, pre-audio speech resumption falls back to the
+   * plain barge-in path (abort + restart), the pre-cycle-16 behavior.
+   */
+  continuationMerge: true,
 
   // region: asr
   /** Minimum time between the starts of two streaming Whisper passes. */
@@ -105,12 +127,33 @@ export const TUNABLES = {
   llmPrefillBucket: 256,
   /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
-   * (whole user/assistant pairs). 0 = unlimited. Shipped at 16 (8 exchanges):
-   * unbounded history let the brain's prefill grow every turn until a long session
-   * crawled (and risked a capacity throw that wedged the response path); a
-   * rolling window keeps recent context while bounding per-turn cost.
+   * (whole user/assistant pairs). 0 = unlimited. Was 16; **8 in cycle 18**
+   * after the llmFirst "drift" diagnosis: with no KV reuse the WHOLE prompt
+   * is re-prefilled every turn, and at 16 messages the padded prompt crossed
+   * from bucket ×2-×3 into ×4-×5 around turn 6 — a deterministic step
+   * function (llmFirst ~550 → ~950-1150 ms for the REST of the session, plus
+   * 1.9-2.1 s ×4/×5 first-encounter re-trace spikes) that 5-turn benches
+   * never sampled. At 8 the prompt never leaves the warm cheap buckets:
+   * llmFirst flat ~500-610 across all 12 turns on BOTH clips, turnLat P50
+   * 1775 → 1458 (map) / 1660 → 1334 (holdout), P95 1987 → 1649 / 2859 →
+   * 1414. Cost: 4 exchanges of verbatim context instead of 8 — typed memory
+   * (qualityTypedMemory) carries names/facts across the window, and the
+   * quality bench's items (≤3-message histories) are unaffected by
+   * construction. Long-range verbatim recall beyond 4 exchanges is the
+   * traded axis; recorded honestly.
    */
-  llmMaxHistoryTurns: 16,
+  llmMaxHistoryTurns: 8,
+  /**
+   * How many prefill bucket shapes to pre-trace at load (×2..×N of
+   * llmPrefillBucket; ×1 is traced by warmup's tiny real generation).
+   * Cycle-16 12-turn sessions measured llmFirst at 520–630 ms vs cycle-6's
+   * ~250–350 claim: warmup stopped at ×3 (768 tokens) while a windowed
+   * conversation's prompt reaches ×4–×5, so those turns paid the 32-layer
+   * re-trace mid-session — exactly the cost cycle 6 moved to load time, back
+   * again through the unwarmed shapes. Read at LOAD time (bench applies
+   * tunables before clicking load).
+   */
+  llmWarmupBuckets: 3,
 
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */
@@ -242,6 +285,38 @@ export const TUNABLES = {
    */
   qualityTemperature: 0.7,
   qualityTypedMemory: true,
+  /**
+   * Append a "lead with one short sentence" instruction to the system prompt
+   * (hill-climb lever #3, cycle 15). Targets time-to-first-audio structurally:
+   * the sentence and tts stages both scale with the FIRST sentence's length
+   * (cycle-14 law: the first-audio path is synthesis-startup-bound and
+   * flush-timing knobs only relabel the wait), so making the opening sentence
+   * short in the TEXT shrinks both stages at once. Read at prompt-encode time
+   * (like qualityGarbleClause) so the bench can flip it per-session without a
+   * reload. Default off until the paired MAP + holdout gates pass.
+   */
+  qualityLeadShort: false,
+  /**
+   * Append a stay-on-topic clause to the system prompt (cycle 16; targets the
+   * staysOnTopic axis — generic/meta replies that ignore what the user said).
+   * SHIPPED ON as half of the cycle-16 fusion (with qualityGarbleExemplars:
+   * 1): the fusion's replicated, holdout-validated win is CLARIFY behavior
+   * (asksClarify 4/10 → 7/10 pooled, noFalseClarify 46/46); its staysOnTopic
+   * gain was MAP-only (+2..+4) and flat on holdout — recorded honestly, the
+   * clause ships because the fusion is Pareto (no axis regressed beyond ±1).
+   * Read at prompt-encode time like the other quality clauses.
+   */
+  qualityTopicClause: true,
+  /**
+   * How many garble-clarify exemplar exchanges to inject (0-2). Cycle 11
+   * added the second pair; cycle-15/16 baselines showed clarify over-priming
+   * (false clarifies on clean short asks, factual items answered with a
+   * clarify). Cycle-16 MAP: one pair beat two on correct (+3) AND — fused
+   * with the topic clause — on asksClarify itself (holdout 1/4 → 3/4): one
+   * demonstration teaches the behavior, the second mostly teaches "clarify
+   * more", which leaks onto clean input. SHIPPED 1.
+   */
+  qualityGarbleExemplars: 1,
 };
 
 export type Tunables = typeof TUNABLES;

@@ -547,6 +547,20 @@ const SMOLLM_SYSTEM =
 const SMOLLM_GARBLE_CLAUSE =
   "If the user's message is garbled or doesn't make sense, say you didn't " +
   "catch that and ask them to say it again.";
+// Optional lead-short instruction (TUNABLES.qualityLeadShort, cycle 15).
+// Time-to-first-audio scales with the FIRST sentence's length (it must be
+// fully generated, then fully synthesized, before any sound plays), so ask
+// for a short opener in the text itself. Positive phrasing, one sentence,
+// same pattern as the garble clause.
+const SMOLLM_LEAD_SHORT_CLAUSE =
+  "Open every reply with a short sentence of just a few words, then continue " +
+  "if there's more to say.";
+// Optional stay-on-topic instruction (TUNABLES.qualityTopicClause, cycle 16).
+// Cycle-15 baseline: staysOnTopic 5/12 — replies drift generic/meta instead of
+// answering what the user actually said. Positive phrasing, one sentence.
+const SMOLLM_TOPIC_CLAUSE =
+  "Answer the user's most recent message directly, staying on their topic " +
+  "and using the specific details they mentioned.";
 // MAP iteration: the clause ALONE scored 0/6 asks-to-clarify (a 360M model
 // doesn't follow the instruction). Small models imitate demonstrations far
 // better than they follow rules, so the tunable also injects two few-shot
@@ -642,7 +656,14 @@ export class SmolLmChatModel implements ChatModel {
         const filler = this.tokenizer.encode(
           " tell me a little more about the ocean and the weather today",
         );
-        for (const target of [bucket * 2, bucket * 3]) {
+        // Warm every bucket shape a session can actually reach (bounded by
+        // the KV capacity minus reply headroom) — see llmWarmupBuckets.
+        const maxBuckets = Math.max(2, TUNABLES.llmWarmupBuckets);
+        const targets: number[] = [];
+        for (let n = 2; n <= maxBuckets; n++) {
+          if (bucket * n <= SMOLLM_KV_CAPACITY - 128) targets.push(bucket * n);
+        }
+        for (const target of targets) {
           const tokens = this.encodePrompt([{ role: "user", content: "Hi" }]);
           while (tokens.length < target) tokens.push(...filler);
           tokens.length = target - 1; // bucket pad brings it to `target`
@@ -692,6 +713,8 @@ export class SmolLmChatModel implements ChatModel {
     const hasMemory = lastUserMemoryText !== "";
     const system = [
       SMOLLM_SYSTEM,
+      TUNABLES.qualityLeadShort ? SMOLLM_LEAD_SHORT_CLAUSE : "",
+      TUNABLES.qualityTopicClause ? SMOLLM_TOPIC_CLAUSE : "",
       TUNABLES.qualityGarbleClause ? SMOLLM_GARBLE_CLAUSE : "",
       hasMemory
         ? `You already know: ${lastUserMemoryText} Reference these facts naturally, like a friend, without repeating them verbatim.`
@@ -712,7 +735,13 @@ export class SmolLmChatModel implements ChatModel {
       !lastUserContent.includes("[scene:") &&
       !hasMemory
     ) {
-      for (const m of SMOLLM_GARBLE_EXEMPLAR) turn(m.role, m.content);
+      // Exemplar count is tunable (cycle 16): each pair teaches the clarify
+      // behavior but also primes clarifies on clean input — the dial makes
+      // that trade measurable per-condition.
+      const pairs = Math.max(0, Math.min(2, TUNABLES.qualityGarbleExemplars));
+      for (const m of SMOLLM_GARBLE_EXEMPLAR.slice(0, pairs * 2)) {
+        turn(m.role, m.content);
+      }
     }
     for (const message of windowHistory(history)) {
       let content = message.content.trim();

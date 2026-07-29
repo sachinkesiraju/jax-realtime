@@ -820,3 +820,250 @@ Non-levers / ceilings: wasm CPU Whisper pass time (~seconds) is fine now that
 it's off the critical path; won't chase it. We will not hit 0.40 s with a
 cascade, but LLM-first-token + TTS-first-audio in the ~0.8–1.5 s range is a
 realistic floor to push toward.
+
+## Map-reduce campaign — cycle 14 (post-#22 lever validation; all rejected)
+
+Paired MAP on `map_a.wav` (5 turns/condition, warm medians, turn 1 excluded)
+against the #23 branch, testing the two levers #22 shipped default-OFF plus
+the two cheapest open roadmap knobs. Baseline ran twice first to calibrate
+noise: turnLat medians 1537 / 1531 (tight), but per-STAGE medians swing ±100 ms
+run-to-run (llmFirst 626 vs 522) — reply content is sampled at temperature 0.7,
+so where the first comma lands moves `sentence` and reply length moves
+everything downstream. Stage-level deltas under ~100 ms are noise here.
+
+| condition | turnLat | endpoint | llmFirst | sentence | tts | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline ×2 | 1537 / 1531 | 451 | 626 / 522 | 390 / 367 | 104 / 122 | — |
+| `asrFastCommit: true` | 1534 | 451 | 587 | 327 | 227 | reject (flat) |
+| `firstClauseMinChars: 12` | 1497 | 452 | 554 | 263 | 230 | reject (see law) |
+| `streamFlushClauses: true` | 1400 | 450 | 519 | 356 | 76 | **reversed on holdout** |
+| `asrPassIntervalMs: 100` | 1498 | 452 | 528 | 394 | 139 | reject (within noise) |
+
+Cost guards were clean everywhere (30/30 exact transcripts, all `punct`
+endpoints, no phantom turns), so the rejections are pure latency verdicts:
+
+- **`streamFlushClauses` (the only MAP winner, −134 ms) reversed on
+  `holdout_a.wav`: 1479 baseline vs 1573 flushed (+94 ms, tts 101 → 234).**
+  A textbook holdout catch. Mechanically it makes sense: clause flushing
+  hands TTS SHORTER chunks, and per-chunk synthesis startup (flow-LM prefill)
+  is a fixed tax, so more, smaller chunks can pay MORE total startup — whether
+  it wins depends on where the reply's commas fall, i.e. on sampled content,
+  which is exactly why it looked good on one clip and bad on another. Stays
+  default OFF; an ears-gated prosody A/B is the only test that could ship it.
+- **`firstClauseMinChars: 12` recorded as a law: shrinking the first clause
+  moves cost, it doesn't cut it.** sentence dropped 390 → 263 but tts rose
+  104 → 230 — the first-audio path is synthesis-startup-bound, not
+  queue-wait-bound, so flushing earlier just relabels the same wait.
+- **`asrFastCommit` and `asrPassIntervalMs` cannot move turn latency in the
+  current design**: endpoint was pinned at ~451 ms in every condition because
+  the punct fast-path window (380 ms) + tick quantization IS the endpoint —
+  commit freshness feeds a signal that is already saturated on clean speech.
+  Their value, if any, is caption freshness / noisy-speech endpointing, which
+  this bench doesn't measure. Re-confirms the cycle-1 settle-bound law from
+  the signal side.
+
+Where the remaining latency actually lives (baseline decomposition): llmFirst
+~520–630 ms + sentence ~370–390 ms + endpoint 451 ms ≈ the whole 1.5 s. The
+tunables surface is mined out — every cheap knob is now either shipped, law-
+rejected, or noise. The next real lever is structural, per the open roadmap:
+cut LLM-first-token itself (smaller/faster prefill path), or make the reply's
+first sentence structurally short ("lead with one short sentence" prompt
+surgery, hill-climb lever #3), which shrinks BOTH sentence and tts stages.
+
+## Cycle 15 — composite realtime-conversation metric (v2) + first campaign on it
+
+The metric was upgraded first, then the campaign ran on it. v2 scores every
+condition on THREE axes at once: (a) turn latency as P50/P90/**P95** over
+12-turn sessions (medians of 4 hid the tail; the tail is what feels broken),
+(b) **mid-thought cut-off rate** on the `midpause.wav` clip (the "I'm doing."
+failure class finally has a number), and (c) the deterministic quality
+buckets (`quality.mjs`, repaired for the #22 `generateStream` API — it had
+bitrotted silently, so quality had NO working gate since the merge).
+
+**Baseline diagnosis (the metric's first catch):**
+
+| axis | baseline | note |
+| --- | --- | --- |
+| turnLat P50 / P95 (11 warm) | 1700 / 2000 ms | P95 run-to-run swing later measured at 2000↔2949 — tails are HIGH noise |
+| midpause cut-offs | **4/4 loops (100%)** | punct fast-path fires on Whisper-invented "?" at every mid-thought pause |
+| staysOnTopic (flow) | **5/12** | worst quality axis |
+| correct (factual) | 3/6 | includes a false clarify on a clean short ask |
+
+Three candidates, each targeting a named bucket, paired MAP + holdout:
+
+- **`qualityLeadShort` (new tunable, "open with a short sentence" clause) —
+  REJECTED with a law.** MAP flow win (staysOnTopic 5/12 → 10/12) but P95
+  blew up 2000 → 2823 ms (+41%): the clause's "then continue if there's more
+  to say" licenses longer multi-sentence replies, so history grows faster and
+  later-turn prefills pay for it. Prompt clauses that shape the OPENING also
+  shape the TAIL — a first-audio prompt candidate must cap the whole reply,
+  not just the opener. The tunable stays in the tree, default off.
+- **`endpointPunctMs: 550` — REJECTED; strengthens the cycle-5 law.** The
+  lengthened punct window changed NOTHING on its own target: midpause
+  fragments 4/4 → 4/4, because the mid-thought pause outlasts any plausible
+  window and Whisper's invented terminal punct makes the fast-path fire the
+  moment it ends. Pre-fire patience is now dead from BOTH directions
+  (shorter: cycle-3B; longer: here). **Post-fire continuation-merge is the
+  only remaining design for the cut-off class**, and it is the top open item.
+- **`llmMaxNewTokens: 48` — REJECTED on a mixed holdout.** MAP looked like
+  the winner (correct 3/6 → 5/6, staysOnTopic 5/12 → 9/12, latency flat), but
+  holdout reversed `correct` (2/4 → 1/4) while staysOnTopic held only +1/6.
+  At ±1-item effects on 4–6-item axes the eval cannot separate signal from
+  sampling; the brevity-cap family needs a LARGER quality item set (≥20 per
+  axis) before it is retried. Recorded, not shipped.
+
+Cycle verdict: no ships, three laws, and the v2 metric earned its keep — it
+caught a 100%-reproducible turn-taking defect the old medians never saw,
+priced a prompt candidate's hidden tail cost, and blocked a false-positive
+quality win. Next cycle, in order: (1) post-fire continuation-merge (now the
+only design left for the diagnosed top defect), (2) grow the quality item set
+so ±1-item noise stops deciding verdicts, (3) an audible-loopback fixture so
+the echo/self-barge class (fixed in #23) gets a regression gate.
+
+## Cycle 16 — continuation-merge (SHIPPED) + staysOnTopic/correct campaign
+
+Cycle 15's items 1 and 2, executed: the structural fix for the cut-off
+defect, and the eval-resolution growth (flow 6 → 12 MAP + 3 → 6 holdout
+items, factual 4 → 8 + 2 → 5) so ±1-item sampling stops deciding verdicts.
+
+### Post-fire continuation-merge — SHIPPED ON (`continuationMerge`)
+
+Speech resuming during the reply's silent latency gap (before first audio)
+now aborts the unheard reply, reclaims the fired user turn from history, and
+answers fired-transcript + continuation as ONE turn at the next endpoint
+("append, don't restart" — the design cycles 3B/5/15 converged on). The
+merged reply's bubble/history/turn-log entries are suppressed entirely: the
+user never heard it, so it never happened. A pending merge also flips the
+phantom-guard discard semantics (the fired half was real speech, so a noise
+"resumption" answers the fired half rather than dropping both).
+
+| gate | merge OFF (control) | merge ON |
+| --- | --- | --- |
+| midpause cut-offs | 4/4 loops fragmented, 4 aborted half-replies | **0 — every loop answered as one whole turn** |
+| map_a 12-turn latency | P50 1700 / P95 2000 (cyc-15 base) | P50 1765 / P95 2113 (within the 2000↔2949 tail noise band) |
+| noise typing / ambient | 0 turns / 0 turns | **0 turns / 0 turns** (20 phantom discards on typing, unchanged) |
+
+The diagnosed cycle-15 top defect (100% mid-thought cut-off rate) is closed.
+Known gap: no fixture exercises speech-then-typing during the gap (a false
+continuation would splice a noise transcript onto a real turn); the guard
+still gates the merged endpoint, so the failure needs typing that passes
+voicedStats — recorded, not observed.
+
+### staysOnTopic / correct campaign (expanded set; fusion SHIPPED)
+
+| condition | staysOnTopic | correct | asksClarify | noFalseClarify |
+| --- | --- | --- | --- | --- |
+| baseline MAP | 17/24 | 6/14 | 3/6 | 29/30 |
+| topicClause MAP | **21/24** | 6/14 | 2/6 | 29/30 |
+| oneExemplar MAP | 20/24 | **9/14** | 2/6 | 30/30 |
+| **fusion MAP** | 19/24 | **11/14** | **4/6** | **30/30** |
+| baseline holdout | 8/12 | 7/10 | 1/4 | 16/16 |
+| **fusion holdout** | 8/12 | 6/10 | **3/4** | 16/16 |
+
+**Shipped: `qualityTopicClause: true` + `qualityGarbleExemplars: 1` (the
+fusion), on an honestly re-framed claim.** The campaign's TARGET axes did not
+survive the holdout gate: staysOnTopic's MAP gain (+2..+4) went flat and
+correct's (+5) read −1 — the same MAP-mirage pattern as cycles 14/15, now
+visible at doubled n. What DID replicate is the clarify axis: asksClarify
+improved in both splits (3→4 MAP, 1→3 holdout; 4/10 → 7/10 pooled) at a
+perfect 46/46 noFalseClarify — and the mechanism makes sense: ONE exemplar
+teaches the clarify move, the SECOND mostly teaches "clarify more", which
+leaks onto clean input (the cycle-15 false-clarify failures) and displaces
+direct answers (the correct-axis MAP win when it was removed). The fusion is
+Pareto across both splits (no axis worse than −1), so it ships on the
+validated clarify claim with the topic/correct gains recorded as MAP-only.
+
+Law recorded: **exemplar count is a dose, not a switch** — few-shot pairs in
+a 360M prompt trade target-behavior recall against off-target priming, and
+the second demonstration was net-negative. Open next: staysOnTopic remains
+the worst axis (~70% both splits) with prompt clauses now measured
+insufficient — the next candidate family is structural (e.g. repeating the
+user's last message as a pre-reply anchor, or a topic-echo decode
+constraint), not more system-prompt words.
+
+## Cycle 17 — turn latency: eager endpoint under the merge safety net (SHIPPED)
+
+Continuation-merge (cycle 16) didn't just fix cut-offs — it changed the
+FAILURE COST of an eager endpoint from "broken conversation" to "recoverable
+merge", unlocking the endpoint-window family that cycles 1/3B correctly
+refused to touch pre-merge ("pushing the silence floor down only trades UX
+safety for a non-existent gain" — true then, obsolete now).
+
+| condition | endpoint P50 | turnLat P50 / P95 | midpause cut-offs | transcripts |
+| --- | --- | --- | --- | --- |
+| base (map_a) | 450 | 2010 / 2966 | — | 12/12 exact |
+| eager 250/500 (map_a) | **301** | 1775 / 1987 | **0** (merged whole) | 12/12 exact |
+| base (holdout_a) | 451 | 1660 / 2859 | — | 12/12 exact |
+| eager 250/500 (holdout_a) | **301** | 1724 / 2637 | — | 12/12 exact |
+
+**SHIPPED: `endpointPunctMs` 380 → 250, `endpointSilenceMs` 620 → 500.** The
+endpoint stage moved 450 → 301 ms deterministically — exactly replicated in
+all four runs on both clips — with zero midpause cut-offs (the merge caught
+every eager fire and answered the whole thought) and exact transcripts
+throughout. That is −150 ms off EVERY turn's critical path. Composite turnLat
+medians can't cleanly show it in single runs because llmFirst noise (±100-250
+ms run-to-run) swamps a 150 ms effect — the deterministic stage metric is the
+honest evidence, and it is unambiguous. (endpointSilenceMs 500 was validated
+only fused with the punct change; it was not isolated.)
+
+**REJECTED: `llmWarmupBuckets: 5`** (pre-trace prefill buckets ×4-×5 at
+load). Its own target metric's tail blew up: llmFirst median improved 1162 →
+935 ms but one mid-session turn hit **8461 ms** (turnLat P95 9435) — the
+extra resident traces/kernels appear to push the device into
+memory-pressure recompiles, trading a predictable ~1 s first-encounter
+re-trace for an unpredictable multi-second stall. The dial stays at 3.
+
+Diagnosis note for the next latency cycle: llmFirst has drifted to 920-1160
+ms medians across ALL of today's later runs (cycles 15/16 measured 520-630 on
+the same code paths) and is now both the dominant bucket and the dominant
+noise source. Candidate explanations to rule out in order: sustained-load
+thermals on the mini, Chrome profile/OPFS state accumulated across ~30 bench
+sessions, and the cycle-16 fusion prompt. A fresh-profile A/B is the first
+probe; the cloud-brain ChatModel remains the structural lever if llmFirst
+really is the wall.
+
+## Cycle 18 — the llmFirst "drift" diagnosed: not drift, a history step function (SHIPPED)
+
+The cycle-17 anomaly resolved WITHOUT new runs — the per-turn llmFirst arrays
+already in the result JSONs show a deterministic step, identical at 04:21 and
+07:42, on every commit:
+
+```
+cyc15 (04:21): [283,532,633,522 | 1141,959,974,1082,925,918,1007]
+cyc16 (06:19): [511,510,514,512,541 | 1096,985,1032,921,941,941]
+cyc17 (07:42): [509,510,521 | 1082,1024,923,933,928,999,1001,968]
+```
+
+Not thermal, not profile decay, not the fusion prompt — around turn 6 the
+windowed prompt (llmMaxHistoryTurns 16 + system/exemplar tokens) crosses from
+prefill bucket ×2-×3 into ×4-×5, and with no KV reuse the whole 1024-1280
+token prompt is re-prefilled EVERY turn thereafter: double the FLOPs, so
+llmFirst permanently doubles, with 1.9-2.1 s ×4/×5 first-encounter re-traces
+as the visible "spikes". The historical ~550 ms belief came from 5-turn
+benches that never reached the step. (This also retro-explains cycle 17's
+llmWarmupBuckets attempt: it warmed the expensive shapes but could not remove
+their per-turn FLOPs — treating a compute problem as a trace problem.)
+
+**SHIPPED: `llmMaxHistoryTurns` 16 → 8.** The prompt never leaves the warm
+cheap buckets:
+
+| | llmFirst per turn | turnLat P50 / P95 |
+| --- | --- | --- |
+| hist 16 (map_a, cyc17-eager) | 509..521 then **923-1082 plateau** | 1775 / 1987 |
+| **hist 8 (map_a)** | **flat 509-608, all 12 turns** | **1458 / 1649** |
+| hist 16 (holdout_a) | plateau + 1934 spike | 1660 / 2859 |
+| **hist 8 (holdout_a)** | **flat 501-611, all 12 turns** | **1334 / 1414** |
+
+Exact transcripts on both clips; the quality bench is unaffected by
+construction (its items hold ≤3-message histories, under the window either
+way). The traded axis is verbatim recall beyond 4 exchanges — typed memory
+carries names/facts across the window; a live long-conversation session is
+the remaining ears-check before merge.
+
+Cycles 17+18 combined turn latency: **P50 2010 → 1458 (map) / 1660 → 1334
+(holdout); P95 2966 → 1649 / 2859 → 1414** — the tail now sits ~100-200 ms
+above the median instead of ~1-1.3 s, because the two structural tail sources
+(mid-session bucket crossings and their re-traces) no longer occur. Remaining
+floor at ~1.3-1.4 s: endpoint 301 (floor) + llmFirst ~550 + sentence ~380 +
+tts ~100 — from here, only the cloud-brain ChatModel (llmFirst+sentence →
+~250 combined) or a faster local decode moves it materially.
