@@ -820,3 +820,52 @@ Non-levers / ceilings: wasm CPU Whisper pass time (~seconds) is fine now that
 it's off the critical path; won't chase it. We will not hit 0.40 s with a
 cascade, but LLM-first-token + TTS-first-audio in the ~0.8–1.5 s range is a
 realistic floor to push toward.
+
+## Map-reduce campaign — cycle 14 (post-#22 lever validation; all rejected)
+
+Paired MAP on `map_a.wav` (5 turns/condition, warm medians, turn 1 excluded)
+against the #23 branch, testing the two levers #22 shipped default-OFF plus
+the two cheapest open roadmap knobs. Baseline ran twice first to calibrate
+noise: turnLat medians 1537 / 1531 (tight), but per-STAGE medians swing ±100 ms
+run-to-run (llmFirst 626 vs 522) — reply content is sampled at temperature 0.7,
+so where the first comma lands moves `sentence` and reply length moves
+everything downstream. Stage-level deltas under ~100 ms are noise here.
+
+| condition | turnLat | endpoint | llmFirst | sentence | tts | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline ×2 | 1537 / 1531 | 451 | 626 / 522 | 390 / 367 | 104 / 122 | — |
+| `asrFastCommit: true` | 1534 | 451 | 587 | 327 | 227 | reject (flat) |
+| `firstClauseMinChars: 12` | 1497 | 452 | 554 | 263 | 230 | reject (see law) |
+| `streamFlushClauses: true` | 1400 | 450 | 519 | 356 | 76 | **reversed on holdout** |
+| `asrPassIntervalMs: 100` | 1498 | 452 | 528 | 394 | 139 | reject (within noise) |
+
+Cost guards were clean everywhere (30/30 exact transcripts, all `punct`
+endpoints, no phantom turns), so the rejections are pure latency verdicts:
+
+- **`streamFlushClauses` (the only MAP winner, −134 ms) reversed on
+  `holdout_a.wav`: 1479 baseline vs 1573 flushed (+94 ms, tts 101 → 234).**
+  A textbook holdout catch. Mechanically it makes sense: clause flushing
+  hands TTS SHORTER chunks, and per-chunk synthesis startup (flow-LM prefill)
+  is a fixed tax, so more, smaller chunks can pay MORE total startup — whether
+  it wins depends on where the reply's commas fall, i.e. on sampled content,
+  which is exactly why it looked good on one clip and bad on another. Stays
+  default OFF; an ears-gated prosody A/B is the only test that could ship it.
+- **`firstClauseMinChars: 12` recorded as a law: shrinking the first clause
+  moves cost, it doesn't cut it.** sentence dropped 390 → 263 but tts rose
+  104 → 230 — the first-audio path is synthesis-startup-bound, not
+  queue-wait-bound, so flushing earlier just relabels the same wait.
+- **`asrFastCommit` and `asrPassIntervalMs` cannot move turn latency in the
+  current design**: endpoint was pinned at ~451 ms in every condition because
+  the punct fast-path window (380 ms) + tick quantization IS the endpoint —
+  commit freshness feeds a signal that is already saturated on clean speech.
+  Their value, if any, is caption freshness / noisy-speech endpointing, which
+  this bench doesn't measure. Re-confirms the cycle-1 settle-bound law from
+  the signal side.
+
+Where the remaining latency actually lives (baseline decomposition): llmFirst
+~520–630 ms + sentence ~370–390 ms + endpoint 451 ms ≈ the whole 1.5 s. The
+tunables surface is mined out — every cheap knob is now either shipped, law-
+rejected, or noise. The next real lever is structural, per the open roadmap:
+cut LLM-first-token itself (smaller/faster prefill path), or make the reply's
+first sentence structurally short ("lead with one short sentence" prompt
+surgery, hill-climb lever #3), which shrinks BOTH sentence and tts stages.
