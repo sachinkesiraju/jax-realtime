@@ -215,7 +215,12 @@ let vision: VisionSession | null = null;
 let visionRaf: number | null = null;
 let visionBusy = false;
 
-if (import.meta.env.DEV) {
+// Bench/debug hooks. Deliberately NOT gated behind import.meta.env.DEV
+// (they were, until cycle 19): the map-reduce harness drives the app through
+// these, and gating them made production deploys unbenchable — the Netlify
+// regression hunt had no instrumentation on exactly the build that mattered.
+// They are read-only debug surface; exposing them costs nothing.
+{
   const dev = window as unknown as Record<string, unknown>;
   dev.__capture = capture;
   dev.__getDuplex = () => duplex;
