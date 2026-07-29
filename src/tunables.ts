@@ -127,12 +127,22 @@ export const TUNABLES = {
   llmPrefillBucket: 256,
   /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
-   * (whole user/assistant pairs). 0 = unlimited. Shipped at 16 (8 exchanges):
-   * unbounded history let the brain's prefill grow every turn until a long session
-   * crawled (and risked a capacity throw that wedged the response path); a
-   * rolling window keeps recent context while bounding per-turn cost.
+   * (whole user/assistant pairs). 0 = unlimited. Was 16; **8 in cycle 18**
+   * after the llmFirst "drift" diagnosis: with no KV reuse the WHOLE prompt
+   * is re-prefilled every turn, and at 16 messages the padded prompt crossed
+   * from bucket ×2-×3 into ×4-×5 around turn 6 — a deterministic step
+   * function (llmFirst ~550 → ~950-1150 ms for the REST of the session, plus
+   * 1.9-2.1 s ×4/×5 first-encounter re-trace spikes) that 5-turn benches
+   * never sampled. At 8 the prompt never leaves the warm cheap buckets:
+   * llmFirst flat ~500-610 across all 12 turns on BOTH clips, turnLat P50
+   * 1775 → 1458 (map) / 1660 → 1334 (holdout), P95 1987 → 1649 / 2859 →
+   * 1414. Cost: 4 exchanges of verbatim context instead of 8 — typed memory
+   * (qualityTypedMemory) carries names/facts across the window, and the
+   * quality bench's items (≤3-message histories) are unaffected by
+   * construction. Long-range verbatim recall beyond 4 exchanges is the
+   * traded axis; recorded honestly.
    */
-  llmMaxHistoryTurns: 16,
+  llmMaxHistoryTurns: 8,
   /**
    * How many prefill bucket shapes to pre-trace at load (×2..×N of
    * llmPrefillBucket; ×1 is traced by warmup's tiny real generation).
