@@ -869,3 +869,53 @@ rejected, or noise. The next real lever is structural, per the open roadmap:
 cut LLM-first-token itself (smaller/faster prefill path), or make the reply's
 first sentence structurally short ("lead with one short sentence" prompt
 surgery, hill-climb lever #3), which shrinks BOTH sentence and tts stages.
+
+## Cycle 15 — composite realtime-conversation metric (v2) + first campaign on it
+
+The metric was upgraded first, then the campaign ran on it. v2 scores every
+condition on THREE axes at once: (a) turn latency as P50/P90/**P95** over
+12-turn sessions (medians of 4 hid the tail; the tail is what feels broken),
+(b) **mid-thought cut-off rate** on the `midpause.wav` clip (the "I'm doing."
+failure class finally has a number), and (c) the deterministic quality
+buckets (`quality.mjs`, repaired for the #22 `generateStream` API — it had
+bitrotted silently, so quality had NO working gate since the merge).
+
+**Baseline diagnosis (the metric's first catch):**
+
+| axis | baseline | note |
+| --- | --- | --- |
+| turnLat P50 / P95 (11 warm) | 1700 / 2000 ms | P95 run-to-run swing later measured at 2000↔2949 — tails are HIGH noise |
+| midpause cut-offs | **4/4 loops (100%)** | punct fast-path fires on Whisper-invented "?" at every mid-thought pause |
+| staysOnTopic (flow) | **5/12** | worst quality axis |
+| correct (factual) | 3/6 | includes a false clarify on a clean short ask |
+
+Three candidates, each targeting a named bucket, paired MAP + holdout:
+
+- **`qualityLeadShort` (new tunable, "open with a short sentence" clause) —
+  REJECTED with a law.** MAP flow win (staysOnTopic 5/12 → 10/12) but P95
+  blew up 2000 → 2823 ms (+41%): the clause's "then continue if there's more
+  to say" licenses longer multi-sentence replies, so history grows faster and
+  later-turn prefills pay for it. Prompt clauses that shape the OPENING also
+  shape the TAIL — a first-audio prompt candidate must cap the whole reply,
+  not just the opener. The tunable stays in the tree, default off.
+- **`endpointPunctMs: 550` — REJECTED; strengthens the cycle-5 law.** The
+  lengthened punct window changed NOTHING on its own target: midpause
+  fragments 4/4 → 4/4, because the mid-thought pause outlasts any plausible
+  window and Whisper's invented terminal punct makes the fast-path fire the
+  moment it ends. Pre-fire patience is now dead from BOTH directions
+  (shorter: cycle-3B; longer: here). **Post-fire continuation-merge is the
+  only remaining design for the cut-off class**, and it is the top open item.
+- **`llmMaxNewTokens: 48` — REJECTED on a mixed holdout.** MAP looked like
+  the winner (correct 3/6 → 5/6, staysOnTopic 5/12 → 9/12, latency flat), but
+  holdout reversed `correct` (2/4 → 1/4) while staysOnTopic held only +1/6.
+  At ±1-item effects on 4–6-item axes the eval cannot separate signal from
+  sampling; the brevity-cap family needs a LARGER quality item set (≥20 per
+  axis) before it is retried. Recorded, not shipped.
+
+Cycle verdict: no ships, three laws, and the v2 metric earned its keep — it
+caught a 100%-reproducible turn-taking defect the old medians never saw,
+priced a prompt candidate's hidden tail cost, and blocked a false-positive
+quality win. Next cycle, in order: (1) post-fire continuation-merge (now the
+only design left for the diagnosed top defect), (2) grow the quality item set
+so ±1-item noise stops deciding verdicts, (3) an audible-loopback fixture so
+the echo/self-barge class (fixed in #23) gets a regression gate.
