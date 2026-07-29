@@ -17,10 +17,20 @@ export const TUNABLES = {
   bargePreRollMs: 1200,
 
   // region: endpoint
-  /** Silence to end a turn whose committed text ends in . ! ? */
-  endpointPunctMs: 380,
-  /** Silence to end a turn otherwise. */
-  endpointSilenceMs: 620,
+  /**
+   * Silence to end a turn whose committed text ends in . ! ?  380 → 250 in
+   * cycle 17: pre-merge, the window was UX-safety-bound (an eager fire on a
+   * mid-thought pause broke the conversation, so cycle 3B refused to lower
+   * it for a latency win). continuationMerge (cycle 16) changed the failure
+   * cost — an eager fire now merges with the resumed speech instead of
+   * answering half a thought — so the window could finally chase the floor:
+   * endpoint stage 450 → 301 ms, deterministic and exactly replicated on
+   * both clips, with 0 midpause cut-offs and clean transcripts throughout.
+   */
+  endpointPunctMs: 250,
+  /** Silence to end a turn otherwise. 620 → 500 in cycle 17, same merge
+   *  safety-net reasoning (validated only fused with the punct change). */
+  endpointSilenceMs: 500,
   /** Ignore sub-blip "utterances" shorter than this. */
   minSpeechMs: 350,
   /**

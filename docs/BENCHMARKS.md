@@ -980,3 +980,44 @@ the worst axis (~70% both splits) with prompt clauses now measured
 insufficient — the next candidate family is structural (e.g. repeating the
 user's last message as a pre-reply anchor, or a topic-echo decode
 constraint), not more system-prompt words.
+
+## Cycle 17 — turn latency: eager endpoint under the merge safety net (SHIPPED)
+
+Continuation-merge (cycle 16) didn't just fix cut-offs — it changed the
+FAILURE COST of an eager endpoint from "broken conversation" to "recoverable
+merge", unlocking the endpoint-window family that cycles 1/3B correctly
+refused to touch pre-merge ("pushing the silence floor down only trades UX
+safety for a non-existent gain" — true then, obsolete now).
+
+| condition | endpoint P50 | turnLat P50 / P95 | midpause cut-offs | transcripts |
+| --- | --- | --- | --- | --- |
+| base (map_a) | 450 | 2010 / 2966 | — | 12/12 exact |
+| eager 250/500 (map_a) | **301** | 1775 / 1987 | **0** (merged whole) | 12/12 exact |
+| base (holdout_a) | 451 | 1660 / 2859 | — | 12/12 exact |
+| eager 250/500 (holdout_a) | **301** | 1724 / 2637 | — | 12/12 exact |
+
+**SHIPPED: `endpointPunctMs` 380 → 250, `endpointSilenceMs` 620 → 500.** The
+endpoint stage moved 450 → 301 ms deterministically — exactly replicated in
+all four runs on both clips — with zero midpause cut-offs (the merge caught
+every eager fire and answered the whole thought) and exact transcripts
+throughout. That is −150 ms off EVERY turn's critical path. Composite turnLat
+medians can't cleanly show it in single runs because llmFirst noise (±100-250
+ms run-to-run) swamps a 150 ms effect — the deterministic stage metric is the
+honest evidence, and it is unambiguous. (endpointSilenceMs 500 was validated
+only fused with the punct change; it was not isolated.)
+
+**REJECTED: `llmWarmupBuckets: 5`** (pre-trace prefill buckets ×4-×5 at
+load). Its own target metric's tail blew up: llmFirst median improved 1162 →
+935 ms but one mid-session turn hit **8461 ms** (turnLat P95 9435) — the
+extra resident traces/kernels appear to push the device into
+memory-pressure recompiles, trading a predictable ~1 s first-encounter
+re-trace for an unpredictable multi-second stall. The dial stays at 3.
+
+Diagnosis note for the next latency cycle: llmFirst has drifted to 920-1160
+ms medians across ALL of today's later runs (cycles 15/16 measured 520-630 on
+the same code paths) and is now both the dominant bucket and the dominant
+noise source. Candidate explanations to rule out in order: sustained-load
+thermals on the mini, Chrome profile/OPFS state accumulated across ~30 bench
+sessions, and the cycle-16 fusion prompt. A fresh-profile A/B is the first
+probe; the cloud-brain ChatModel remains the structural lever if llmFirst
+really is the wall.
