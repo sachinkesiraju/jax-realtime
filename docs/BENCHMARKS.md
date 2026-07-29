@@ -919,3 +919,64 @@ quality win. Next cycle, in order: (1) post-fire continuation-merge (now the
 only design left for the diagnosed top defect), (2) grow the quality item set
 so ±1-item noise stops deciding verdicts, (3) an audible-loopback fixture so
 the echo/self-barge class (fixed in #23) gets a regression gate.
+
+## Cycle 16 — continuation-merge (SHIPPED) + staysOnTopic/correct campaign
+
+Cycle 15's items 1 and 2, executed: the structural fix for the cut-off
+defect, and the eval-resolution growth (flow 6 → 12 MAP + 3 → 6 holdout
+items, factual 4 → 8 + 2 → 5) so ±1-item sampling stops deciding verdicts.
+
+### Post-fire continuation-merge — SHIPPED ON (`continuationMerge`)
+
+Speech resuming during the reply's silent latency gap (before first audio)
+now aborts the unheard reply, reclaims the fired user turn from history, and
+answers fired-transcript + continuation as ONE turn at the next endpoint
+("append, don't restart" — the design cycles 3B/5/15 converged on). The
+merged reply's bubble/history/turn-log entries are suppressed entirely: the
+user never heard it, so it never happened. A pending merge also flips the
+phantom-guard discard semantics (the fired half was real speech, so a noise
+"resumption" answers the fired half rather than dropping both).
+
+| gate | merge OFF (control) | merge ON |
+| --- | --- | --- |
+| midpause cut-offs | 4/4 loops fragmented, 4 aborted half-replies | **0 — every loop answered as one whole turn** |
+| map_a 12-turn latency | P50 1700 / P95 2000 (cyc-15 base) | P50 1765 / P95 2113 (within the 2000↔2949 tail noise band) |
+| noise typing / ambient | 0 turns / 0 turns | **0 turns / 0 turns** (20 phantom discards on typing, unchanged) |
+
+The diagnosed cycle-15 top defect (100% mid-thought cut-off rate) is closed.
+Known gap: no fixture exercises speech-then-typing during the gap (a false
+continuation would splice a noise transcript onto a real turn); the guard
+still gates the merged endpoint, so the failure needs typing that passes
+voicedStats — recorded, not observed.
+
+### staysOnTopic / correct campaign (expanded set; fusion SHIPPED)
+
+| condition | staysOnTopic | correct | asksClarify | noFalseClarify |
+| --- | --- | --- | --- | --- |
+| baseline MAP | 17/24 | 6/14 | 3/6 | 29/30 |
+| topicClause MAP | **21/24** | 6/14 | 2/6 | 29/30 |
+| oneExemplar MAP | 20/24 | **9/14** | 2/6 | 30/30 |
+| **fusion MAP** | 19/24 | **11/14** | **4/6** | **30/30** |
+| baseline holdout | 8/12 | 7/10 | 1/4 | 16/16 |
+| **fusion holdout** | 8/12 | 6/10 | **3/4** | 16/16 |
+
+**Shipped: `qualityTopicClause: true` + `qualityGarbleExemplars: 1` (the
+fusion), on an honestly re-framed claim.** The campaign's TARGET axes did not
+survive the holdout gate: staysOnTopic's MAP gain (+2..+4) went flat and
+correct's (+5) read −1 — the same MAP-mirage pattern as cycles 14/15, now
+visible at doubled n. What DID replicate is the clarify axis: asksClarify
+improved in both splits (3→4 MAP, 1→3 holdout; 4/10 → 7/10 pooled) at a
+perfect 46/46 noFalseClarify — and the mechanism makes sense: ONE exemplar
+teaches the clarify move, the SECOND mostly teaches "clarify more", which
+leaks onto clean input (the cycle-15 false-clarify failures) and displaces
+direct answers (the correct-axis MAP win when it was removed). The fusion is
+Pareto across both splits (no axis worse than −1), so it ships on the
+validated clarify claim with the topic/correct gains recorded as MAP-only.
+
+Law recorded: **exemplar count is a dose, not a switch** — few-shot pairs in
+a 360M prompt trade target-behavior recall against off-target priming, and
+the second demonstration was net-negative. Open next: staysOnTopic remains
+the worst axis (~70% both splits) with prompt clauses now measured
+insufficient — the next candidate family is structural (e.g. repeating the
+user's last message as a pre-reply anchor, or a topic-echo decode
+constraint), not more system-prompt words.

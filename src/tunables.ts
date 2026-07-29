@@ -266,20 +266,26 @@ export const TUNABLES = {
    */
   qualityLeadShort: false,
   /**
-   * Append a stay-on-topic clause to the system prompt (cycle 16, targets the
-   * staysOnTopic axis — 5/12 at the cycle-15 baseline, the worst quality
-   * dial: generic/meta replies that ignore what the user actually said).
+   * Append a stay-on-topic clause to the system prompt (cycle 16; targets the
+   * staysOnTopic axis — generic/meta replies that ignore what the user said).
+   * SHIPPED ON as half of the cycle-16 fusion (with qualityGarbleExemplars:
+   * 1): the fusion's replicated, holdout-validated win is CLARIFY behavior
+   * (asksClarify 4/10 → 7/10 pooled, noFalseClarify 46/46); its staysOnTopic
+   * gain was MAP-only (+2..+4) and flat on holdout — recorded honestly, the
+   * clause ships because the fusion is Pareto (no axis regressed beyond ±1).
    * Read at prompt-encode time like the other quality clauses.
    */
-  qualityTopicClause: false,
+  qualityTopicClause: true,
   /**
    * How many garble-clarify exemplar exchanges to inject (0-2). Cycle 11
-   * added the second pair for asksClarify; cycle-15 baseline showed clarify
-   * over-priming (a false clarify on a clean short ask, and one on a factual
-   * item) — this dials the demonstration count so the trade is measurable:
-   * asksClarify vs noFalseClarify/correct/staysOnTopic.
+   * added the second pair; cycle-15/16 baselines showed clarify over-priming
+   * (false clarifies on clean short asks, factual items answered with a
+   * clarify). Cycle-16 MAP: one pair beat two on correct (+3) AND — fused
+   * with the topic clause — on asksClarify itself (holdout 1/4 → 3/4): one
+   * demonstration teaches the behavior, the second mostly teaches "clarify
+   * more", which leaks onto clean input. SHIPPED 1.
    */
-  qualityGarbleExemplars: 2,
+  qualityGarbleExemplars: 1,
 };
 
 export type Tunables = typeof TUNABLES;
