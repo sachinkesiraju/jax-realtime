@@ -1021,3 +1021,49 @@ thermals on the mini, Chrome profile/OPFS state accumulated across ~30 bench
 sessions, and the cycle-16 fusion prompt. A fresh-profile A/B is the first
 probe; the cloud-brain ChatModel remains the structural lever if llmFirst
 really is the wall.
+
+## Cycle 18 — the llmFirst "drift" diagnosed: not drift, a history step function (SHIPPED)
+
+The cycle-17 anomaly resolved WITHOUT new runs — the per-turn llmFirst arrays
+already in the result JSONs show a deterministic step, identical at 04:21 and
+07:42, on every commit:
+
+```
+cyc15 (04:21): [283,532,633,522 | 1141,959,974,1082,925,918,1007]
+cyc16 (06:19): [511,510,514,512,541 | 1096,985,1032,921,941,941]
+cyc17 (07:42): [509,510,521 | 1082,1024,923,933,928,999,1001,968]
+```
+
+Not thermal, not profile decay, not the fusion prompt — around turn 6 the
+windowed prompt (llmMaxHistoryTurns 16 + system/exemplar tokens) crosses from
+prefill bucket ×2-×3 into ×4-×5, and with no KV reuse the whole 1024-1280
+token prompt is re-prefilled EVERY turn thereafter: double the FLOPs, so
+llmFirst permanently doubles, with 1.9-2.1 s ×4/×5 first-encounter re-traces
+as the visible "spikes". The historical ~550 ms belief came from 5-turn
+benches that never reached the step. (This also retro-explains cycle 17's
+llmWarmupBuckets attempt: it warmed the expensive shapes but could not remove
+their per-turn FLOPs — treating a compute problem as a trace problem.)
+
+**SHIPPED: `llmMaxHistoryTurns` 16 → 8.** The prompt never leaves the warm
+cheap buckets:
+
+| | llmFirst per turn | turnLat P50 / P95 |
+| --- | --- | --- |
+| hist 16 (map_a, cyc17-eager) | 509..521 then **923-1082 plateau** | 1775 / 1987 |
+| **hist 8 (map_a)** | **flat 509-608, all 12 turns** | **1458 / 1649** |
+| hist 16 (holdout_a) | plateau + 1934 spike | 1660 / 2859 |
+| **hist 8 (holdout_a)** | **flat 501-611, all 12 turns** | **1334 / 1414** |
+
+Exact transcripts on both clips; the quality bench is unaffected by
+construction (its items hold ≤3-message histories, under the window either
+way). The traded axis is verbatim recall beyond 4 exchanges — typed memory
+carries names/facts across the window; a live long-conversation session is
+the remaining ears-check before merge.
+
+Cycles 17+18 combined turn latency: **P50 2010 → 1458 (map) / 1660 → 1334
+(holdout); P95 2966 → 1649 / 2859 → 1414** — the tail now sits ~100-200 ms
+above the median instead of ~1-1.3 s, because the two structural tail sources
+(mid-session bucket crossings and their re-traces) no longer occur. Remaining
+floor at ~1.3-1.4 s: endpoint 301 (floor) + llmFirst ~550 + sentence ~380 +
+tts ~100 — from here, only the cloud-brain ChatModel (llmFirst+sentence →
+~250 combined) or a faster local decode moves it materially.
