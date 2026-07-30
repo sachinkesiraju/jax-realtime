@@ -255,11 +255,31 @@ function formatMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+// Stick-to-bottom auto-scroll (cycle 24). The shell uses min-height, so a
+// growing transcript grows the PAGE rather than overflowing the container —
+// the old `transcript.scrollTop = scrollHeight` calls were no-ops on a
+// container that never scrolls, which is why the chat "didn't auto scroll".
+// Follow new content by scrolling the WINDOW, but only when the user is
+// already near the bottom: someone reading scrollback must never be yanked
+// down. The threshold is checked AFTER the mutation, so it also covers the
+// height just added (bubbles/chips add ≲200 px per update).
+const FOLLOW_THRESHOLD_PX = 240;
+function followChat(): void {
+  // Keep the container-level scroll too, for layouts where the transcript
+  // itself overflows (e.g. if the CSS ever pins the shell height).
+  el.transcript.scrollTop = el.transcript.scrollHeight;
+  const doc = document.documentElement;
+  const fromBottom = doc.scrollHeight - (window.innerHeight + window.scrollY);
+  if (fromBottom > 0 && fromBottom <= FOLLOW_THRESHOLD_PX) {
+    window.scrollTo({ top: doc.scrollHeight });
+  }
+}
+
 function addBubble(role: "user" | "assistant"): HTMLDivElement {
   const bubble = document.createElement("div");
   bubble.className = `bubble bubble-${role}`;
   el.transcript.appendChild(bubble);
-  el.transcript.scrollTop = el.transcript.scrollHeight;
+  followChat();
   return bubble;
 }
 
@@ -282,7 +302,7 @@ function addToolChip(kind: ToolKind, query: string): HTMLDivElement {
   label.textContent = `${verb} · ${query}`;
   chip.append(dot, label);
   el.transcript.appendChild(chip);
-  el.transcript.scrollTop = el.transcript.scrollHeight;
+  followChat();
   return chip;
 }
 
@@ -594,7 +614,7 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
       onAssistantPartial(text) {
         if (assistantBubble) {
           assistantBubble.textContent = text;
-          el.transcript.scrollTop = el.transcript.scrollHeight;
+          followChat();
         }
       },
       onAssistantEnd(text, interrupted) {
@@ -634,6 +654,7 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
           toolChip = null;
         }
         renderCard(card);
+        followChat(); // the card panel adds height below the transcript
       },
       onBackground(active) {
         el.bgPill.hidden = !active;
