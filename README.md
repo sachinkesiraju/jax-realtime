@@ -18,11 +18,11 @@ talk.
 
 | Stage | Model | Runs on |
 | --- | --- | --- |
-| Ear (ASR) | Whisper base.en (int8, dequantized to fp16) | WebGPU via jax-js |
-| Turn-taking (VAD) | Silero VAD v5, ported to TypeScript | CPU (~2 ms / 32 ms frame) |
-| Brain (LLM) | SmolLM2-360M-Instruct (fp16) | WebGPU via jax-js |
-| Voice (TTS) | Kyutai Pocket TTS + Mimi codec (fp16) | WebGPU via jax-js |
-| Eye (vision) | D-FINE small (COCO-80) | WebGPU via `@jax-js/onnx` |
+| Ear (ASR) | [Whisper base.en](https://huggingface.co/openai/whisper-base.en) (int8, dequantized to fp16) | WebGPU via jax-js |
+| Turn-taking (VAD) | [Silero VAD v5](https://github.com/snakers4/silero-vad), ported to TypeScript | CPU (~2 ms / 32 ms frame) |
+| Brain (LLM) | [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) (fp16) | WebGPU via jax-js |
+| Voice (TTS) | [Kyutai Pocket TTS](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning) + [Mimi](https://github.com/kyutai-labs/moshi) codec (fp16) | WebGPU via jax-js |
+| Eye (vision) | [D-FINE small](https://huggingface.co/bukuroo/D-FINE-ONNX) (COCO-80) | WebGPU via `@jax-js/onnx` |
 
 Everything shares the single WebGPU device. The streaming ASR lane is paused
 while the assistant speaks so it doesn't contend with TTS for the GPU; barge-in
