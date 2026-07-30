@@ -1104,7 +1104,7 @@ barge path. Gates: midpause still merges 3/3 loops whole; map_a 12-turn clean
 
 ## Cycle 22 — learned turn signal (SHIPPED)
 
-Silero VAD v5's 16 kHz branch, hand-ported to ~200 lines of pure TypeScript
+Silero VAD v5's 16 kHz branch, ported to ~200 lines of pure TypeScript
 (`src/asr/vad.ts`): STFT-as-conv, 4 conv layers, one LSTM cell, sigmoid head.
 ~200k params, 1.2 MB weights (`public/vad/silero-vad-v5.bin`), ~2.3 ms per
 32 ms frame of plain CPU JS — no GPU (the GPU law holds), no onnxruntime (the
