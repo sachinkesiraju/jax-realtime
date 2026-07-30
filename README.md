@@ -103,6 +103,49 @@ map-reduce campaign log, including the negative results):
 Runtime behaviour is tunable at `src/tunables.ts` (read live, so A/B
 experiments don't need a rebuild).
 
+## Hard-won details
+
+Things a default implementation gets wrong, found in live sessions and fixed
+here (full stories in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
+
+- **The assistant used to interrupt itself.** The barge-in threshold
+  calibrated its echo floor during the reply's first ticks — which fall in the
+  silent LLM/TTS latency gap, so the floor was ambient-level and the
+  assistant's own playback echo tripped it. Calibration now only counts ticks
+  where the TTS output analyser confirms audio is actually playing.
+- **Whisper invents "Thank you." from silence.** Every Whisper size does this
+  (silent-outro captions in its training data), and it decodes with *high*
+  confidence, so no model swap or confidence gate catches it. The fix is
+  signal-side: unvoiced audio never reaches the decoder, on every endpoint
+  path — including barge-in continuations, which originally skipped the guard.
+- **A mid-sentence TTS cut sounds like a full stop.** Each chunk is
+  synthesized as a complete utterance, so flushing at a bare word boundary
+  produces sentence-final falling intonation plus a pause in the middle of
+  your sentence. Chunks now only split at real punctuation — a measured
+  latency cost, paid for prosody.
+- **Merges must be bounded.** Letting speech-resumption merge with the fired
+  turn across the whole pre-audio gap meant any breath or chair creak aborted
+  the pending reply and chained merge-on-merge; live this read as "delayed
+  responses". One merge per turn, inside a 700 ms window.
+- **First-token latency doubled at turn 6 — deterministically.** With no KV
+  reuse the whole prompt re-prefills every turn, and history growth pushed the
+  padded prompt across a jit-trace bucket boundary mid-session. Capping the
+  window at 8 messages keeps every turn in the warm buckets.
+- **Silero VAD without onnxruntime.** The 16 kHz branch is ~200k params, so
+  it's hand-ported to plain TypeScript (the LSTM cell is two matmuls and four
+  gates) and parity-checked against the reference to 1e-6. Two contract traps:
+  the ONNX's *else*-branch is the 8 kHz path, and the model needs the official
+  wrapper's 64-sample rolling context — without it, clean speech scores ~0.16.
+- **Geocoder backoff can invent cities.** "Look at the weather in San
+  Francisco" once resolved to Teresina, Brazil: the place extractor grabbed
+  the verb's preposition and the token backoff degenerated to geocoding
+  "the", which open-meteo fuzzy-matches. The extractor now recurses to the
+  innermost preposition and never geocodes bare function words.
+- **Latency benches can't hear.** Two timing wins (an eager endpoint, an eager
+  first TTS flush) passed every clip gate and failed immediately on a real
+  microphone. Anything that changes turn-taking or audio structure ships only
+  after a live listen; the clip suite guards regressions, not feel.
+
 ## Run it
 
 ```sh
