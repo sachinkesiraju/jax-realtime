@@ -117,10 +117,6 @@ experiments don't need a rebuild).
   produces sentence-final falling intonation plus a pause in the middle of
   your sentence. Chunks now only split at real punctuation: a measured
   latency cost, paid for prosody.
-- **Latency benches can't hear.** Two timing wins (an eager endpoint, an eager
-  first TTS flush) passed every clip gate and failed immediately on a real
-  microphone. Anything that changes turn-taking or audio structure ships only
-  after a live listen; the clip suite guards regressions, not feel.
 
 ## Run it
 
