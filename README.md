@@ -10,10 +10,11 @@ locally in the tab; nothing is sent to a server.
 
 It's inspired by the Thinking Machines
 [interaction model](https://thinkingmachines.ai/blog/interaction-models/) and
-[GPT-Live](https://openai.com/index/introducing-gpt-live/): the goal is a
-conversation that *feels* live — you can interrupt it mid-sentence, pause
-mid-thought without losing your turn, and it keeps searching in the background
-while you talk — reproduced as a small-model cascade that fits in a browser.
+[GPT-Live](https://openai.com/index/introducing-gpt-live/), rebuilt as a
+small-model cascade that fits in a browser tab. The goal is a conversation
+that *feels* live: you can interrupt it mid-sentence, pause mid-thought
+without losing your turn, and it keeps searching in the background while you
+talk.
 
 | Stage | Model | Runs on |
 | --- | --- | --- |
@@ -80,8 +81,8 @@ map-reduce campaign log, including the negative results):
 - **Stable prefill shapes** — every turn has a different prompt length, which
   otherwise forces jax-js to compile new traces mid-conversation. Prompts use
   256-token buckets, the common buckets are warmed during loading, and the KV
-  cache has one fixed capacity. A 14-turn run kept first-token latency at
-  288–689 ms with no multi-second history-growth spikes.
+  cache has one fixed capacity — so long conversations never hit a
+  multi-second recompile stall mid-turn.
 - **Faster confidence-aware ASR** — timestamp-gate candidate reductions are
   reused for confidence scoring instead of scanning the vocabulary again. ASR
   runs 5–7% faster while preserving all 21 paired clean/quiet/distorted
@@ -90,10 +91,6 @@ map-reduce campaign log, including the negative results):
   leaves the warm prefill buckets: first-token latency stays flat (~500–610 ms)
   across long sessions instead of doubling around turn 6, and the worst turn of
   a 12-turn session sits within ~150 ms of the median.
-- **Prosody-safe TTS chunking** — reply text is flushed to the synthesizer only
-  at clause punctuation, never at bare word boundaries (each chunk is
-  synthesized as a complete utterance, so a mid-sentence cut would sound like a
-  full stop).
 - **Deterministic memory fast paths** — exact recall and bounded trip, pet, and
   activity follow-ups can answer in a few milliseconds without model generation.
 - **Smaller download** — Whisper ships a per-row int8 build (73 MB instead of
@@ -125,8 +122,8 @@ here (full stories in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
   latency cost, paid for prosody.
 - **Merges must be bounded.** Letting speech-resumption merge with the fired
   turn across the whole pre-audio gap meant any breath or chair creak aborted
-  the pending reply and chained merge-on-merge; live this read as "delayed
-  responses". One merge per turn, inside a 700 ms window.
+  the pending reply — and merges could chain, so answers arrived seconds late
+  to a mangled question. Now: one merge per turn, inside a 700 ms window.
 - **First-token latency doubled at turn 6 — deterministically.** With no KV
   reuse the whole prompt re-prefills every turn, and history growth pushed the
   padded prompt across a jit-trace bucket boundary mid-session. Capping the
@@ -165,9 +162,9 @@ answers out loud and resumes listening. Press the orb again to end.
 > SmolLM2-360M weights from
 > [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights); the
 > Whisper base.en weights are still fetched as a per-row int8 build and
-> dequantized to fp16 during load. Whisper produced identical paired MAP and
-> holdout transcripts; the SmolLM2 brain is kept at full precision for the best
-> conversation quality.
+> dequantized to fp16 during load. The int8 Whisper transcribes the entire
+> bench suite identically to fp16; the SmolLM2 brain is kept at full precision
+> for the best conversation quality.
 
 The orb reacts in real time: it breathes when idle, swells with your voice while
 listening, shimmers while the model thinks, and pulses with the synthesized
