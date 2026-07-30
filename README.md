@@ -130,25 +130,15 @@ npm run dev
 ```
 
 Open http://localhost:5173 in a WebGPU-capable browser (Chrome/Edge on desktop,
-Safari 26+). Click **Load models** (~1.0 GB on first run: SmolLM 724 +
-Pocket TTS 201 + Whisper 73 + D-FINE 42, all cached in OPFS afterwards). The
-Eye is enabled by default and requests camera access; uncheck it before loading
-to skip D-FINE. Then press the orb once and just talk, hands-free: turn ends are
-detected by silence, your words stream into the transcript live, the assistant
-answers out loud and resumes listening. Press the orb again to end.
+Safari 26+). Click **Load models**: ~1.0 GB on first run, cached in OPFS
+afterwards. The Eye is on by default and requests camera access; uncheck it
+before loading to skip it. Then press the orb once and just talk, hands-free.
+Press it again to end.
 
-> **Smaller model downloads.** By default the app fetches the full fp16
-> SmolLM2-360M weights from
-> [Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights); the
-> Whisper base.en weights are still fetched as a per-row int8 build and
-> dequantized to fp16 during load. The int8 Whisper transcribes the entire
-> bench suite identically to fp16; the SmolLM2 brain is kept at full precision
-> for the best conversation quality.
-
-The orb reacts in real time: it breathes when idle, swells with your voice while
-listening, shimmers while the model thinks, and pulses with the synthesized
-speech while answering. Per-stage latencies and the active GPU are shown in the
-pipeline rail and footer.
+Weights come from
+[Hugging Face](https://huggingface.co/sachink98/jax-realtime-weights): SmolLM2
+at full fp16 for conversation quality, Whisper as a per-row int8 build
+dequantized at load (it transcribes the bench suite identically to fp16).
 
 ## How it works
 
