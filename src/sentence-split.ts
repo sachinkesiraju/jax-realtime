@@ -49,9 +49,11 @@ export interface SplitSpeechChunksOptions {
   /**
    * No-punctuation fallback for the FIRST flush: once this many chars have
    * accumulated with no clause punctuation, flush at the last word boundary.
-   * Defaults to 2× firstClauseMinChars (the original behavior). Cycle 23's
-   * "start speaking sooner" candidate lowers it toward firstClauseMinChars so
-   * punctuation-less openers stop waiting for double the minimum.
+   * `0` DISABLES the fallback (cycle 23 ears verdict — shipped default): a
+   * chunk cut at a bare word boundary is synthesized as a complete utterance,
+   * so Pocket TTS renders sentence-final falling intonation and an
+   * end-of-utterance pause in the MIDDLE of the sentence. Undefined keeps the
+   * historical 2× firstClauseMinChars behavior for paired A/Bs.
    */
   firstWordFlushChars?: number;
 }
@@ -71,7 +73,11 @@ export async function* splitSpeechChunks(
   deltas: AsyncIterable<string>,
   opts: SplitSpeechChunksOptions,
 ): AsyncGenerator<string, void, void> {
-  const hardCap = opts.hardCapChars ?? 120;
+  // 200 (was 120, cycle 23): the cap is the LAST mid-sentence split source
+  // left, and a mid-sentence cut sounds like a full stop (see
+  // firstWordFlushChars). Pocket TTS synthesizes ~200-char sentences fine;
+  // the cap exists only to bound a pathological punctuation-less ramble.
+  const hardCap = opts.hardCapChars ?? 200;
   let buffer = "";
   let firstEmitted = false;
 
@@ -81,12 +87,15 @@ export async function* splitSpeechChunks(
     // Fastest first audio: flush the first clause as soon as a comma/colon/
     // semicolon appears (once there's enough to sound natural), so speech
     // starts after "The weather in Tokyo," instead of the whole sentence.
-    // If no punctuation shows up, flush at a WORD BOUNDARY once ~2× the
-    // clause minimum has accumulated — otherwise the reply text is fully
-    // written on screen while the voice still waits for the first sentence
-    // to complete before it can even start synthesizing.
+    // The no-punctuation WORD-BOUNDARY fallback is disabled by default
+    // (firstWordFlushChars 0): each chunk is synthesized as a complete
+    // utterance, so a bare word-boundary cut gets sentence-final prosody and
+    // an end-of-utterance pause mid-sentence — the cycle-23 ears verdict.
     if (!firstEmitted) {
-      const wordFlushAt = opts.firstWordFlushChars ?? opts.firstClauseMinChars * 2;
+      const wordFlushAt =
+        opts.firstWordFlushChars === 0
+          ? Infinity // disabled: only punctuation (or the hard cap) splits
+          : (opts.firstWordFlushChars ?? opts.firstClauseMinChars * 2);
       let clauseIdx = findClauseEnd(buffer, opts.firstClauseMinChars);
       if (clauseIdx === -1 && buffer.length >= wordFlushAt) {
         const lastSpace = buffer.lastIndexOf(" ");

@@ -104,6 +104,23 @@ test("firstWordFlushChars lowers the no-punctuation first flush (cycle 23)", asy
   assert.equal(classic[0], "The weather in Tokyo is mild today with light");
 });
 
+test("firstWordFlushChars 0 disables mid-sentence word splits (cycle 23 ears fix)", async () => {
+  // Punctuation-less opener: the whole sentence must flush as ONE chunk at
+  // its sentence end — never cut at a bare word boundary (a word-boundary
+  // chunk is synthesized with sentence-final prosody = a fake mid-sentence
+  // pause, the owner's ears report).
+  const text = "The weather in Tokyo is mild today with light wind. More text follows here.";
+  const chunks = await collect(text, {
+    firstClauseMinChars: 18,
+    firstWordFlushChars: 0,
+    streamFlushClauses: false,
+  }, 8);
+  assert.deepEqual(chunks, [
+    "The weather in Tokyo is mild today with light wind.",
+    "More text follows here.",
+  ]);
+});
+
 test("flushTail predicate suppresses the trailing tail", async () => {
   const kept = await collect("hello world", {
     firstClauseMinChars: 1000,

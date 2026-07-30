@@ -200,16 +200,20 @@ export const TUNABLES = {
   firstClauseMinChars: 18,
   /**
    * No-punctuation fallback for the FIRST flush: flush at a word boundary
-   * once this many chars accumulate (cycle 23, "start speaking sooner").
-   * Was hardwired to 2× firstClauseMinChars (36); punctuation-less openers
-   * waited ~2× longer than punctuated ones for no reason — the flush point
-   * is a word boundary either way. 20 keeps the first fragment ≥3-4 words
-   * (prosody floor) while letting speech start one-to-two tokens after the
-   * brain's first delta. Cycle-14's law (smaller FIRST CLAUSE just moves
-   * sentence-cost into tts-cost) applied to shrinking the clause MINIMUM;
-   * this instead removes the asymmetric extra wait on the fallback path.
+   * once this many chars accumulate. 0 = DISABLED (shipped, cycle-23 ears
+   * verdict). The fallback — 36 chars historically, 20 in the first
+   * cycle-23 ship — cut chunks at bare word boundaries, and every chunk is
+   * synthesized as a COMPLETE utterance: Pocket TTS renders sentence-final
+   * falling intonation plus an end-of-utterance pause in the middle of the
+   * sentence ("the tts pauses mid sentence when there's no punctuation" —
+   * owner ears report). Latency numbers said the eager flush won (−96 ms
+   * sentence stage, tts flat); ears said it sounds broken. Prosody wins:
+   * the first flush now happens ONLY at clause punctuation; punctuation-less
+   * openers wait for their sentence end (or the hard cap). Quantization was
+   * ruled out as the cause: TTS loads pocket-tts-decode-fp16.safetensors —
+   * full fp16, the int8 artifact was never shipped (cycle-13 rejection).
    */
-  firstWordFlushChars: 20,
+  firstWordFlushChars: 0,
 
   /**
    * When true, keep flushing on subsequent clause boundaries (comma/colon/

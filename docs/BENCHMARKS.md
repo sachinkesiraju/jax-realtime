@@ -1253,3 +1253,28 @@ cycle-14's firstClauseMinChars candidate, because this removes the
 fallback's asymmetric extra wait instead of shrinking the fragment below
 the prosody floor. Transcripts exact, midpause/typing regressions green.
 Prosody of the shorter first fragment is ears-checked with everything else.
+
+### Cycle 23b — the ears verdict: word-boundary splits REMOVED entirely
+
+The eager flush failed its ears check within hours ("the tts pauses mid
+sentence when there's no punctuation") — and the diagnosis indicts not just
+the 20-char eager value but the ORIGINAL 36-char fallback too: every TTS
+chunk is synthesized as a complete utterance, so ANY cut at a bare word
+boundary gets sentence-final falling intonation plus an end-of-utterance
+pause in the middle of the sentence. The timing metrics literally cannot
+see this (the cycle-3/19 law, third confirmation). Quantization was ruled
+out first: the TTS loads `pocket-tts-decode-fp16.safetensors` — full fp16;
+the int8 flow-LM artifact was never shipped (cycle-13 duration-gate
+rejection stands).
+
+**SHIPPED: `firstWordFlushChars: 0`** (word-boundary first-flush fallback
+disabled; first flush ONLY at clause punctuation) and **hard cap 120 →
+200** (the cap was the last remaining mid-sentence splitter; Pocket TTS
+handles ~200-char sentences fine). Measured cost, paired on map_a:
+sentence P50 217 → 460, tts 84 → 254, turnLat P50 1324 → 1585 / P95 1546 →
+2319 — punctuation-less openers now wait for their full first sentence.
+That is the price of never faking a full stop mid-sentence, paid
+knowingly. Open ears-gated candidate for reclaiming some of it:
+comma-splice the word-boundary cut ("The weather in Tokyo is" →
+synthesized as "…is,") so the flow-LM renders continuing intonation — a
+prosody hack that only ears can adjudicate, default off until then.
