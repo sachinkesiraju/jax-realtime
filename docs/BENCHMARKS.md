@@ -1219,3 +1219,37 @@ speech — the echo problem needs an echo-aware primitive, not a better
 speech detector. The energy heuristics stay selectable for one cycle
 (rollback + paired A/Bs), then the deletion list from the plan
 (voicedStats, GUARD_*/MIN_* constants, START_LEVEL onset) retires.
+
+## Cycle 23 — uninterruptible tool narrations (BUG) + eager first flush
+
+**Bug confirmed and fixed: proactive lines could not be barged.** Owner
+report ("barge doesn't work when the agent narrates a tool response") was a
+real structural hole, not tuning: the tick's policy ran `if
+(proactiveSpeaking) return;` BEFORE any barge check, and `tts.speak` was
+never given an abort signal — tool narrations, timer lines, and clarify
+lines were literally uninterruptible by construction. Fix: proactive
+playback now gets its own AbortController + the same adaptive echo-floor
+barge detector as replies (fresh calibration per line); on trigger the
+audio cuts, the capture buffer trims to its recent tail (`trimTo` — no
+pre-roll runs during proactive speech, so the buffer held the whole
+narration's echo), and the interrupting speech becomes the next utterance.
+History records the line with an `[interrupted]` marker. Clip gates can't
+exercise this path (no fixture speaks a tool narration); the regression
+suite stayed green and the ears check is the owner's.
+
+**SHIPPED: `firstWordFlushChars: 20`** ("start speaking sooner"). The
+first-flush fallback for punctuation-less openers was hardwired to 2×
+firstClauseMinChars (36 chars) — twice the wait of the punctuated path for
+no reason, since the flush lands on a word boundary either way. Paired
+A/B (12-turn map_a):
+
+| | sentence P50 | tts P50 | turnLat P50 / P95 |
+| --- | --- | --- | --- |
+| classic (36) | 313 | 92 | 1360 / 1536 |
+| **eager (20)** | **217** | 84 | 1324 / 1546 |
+
+−96 ms off the sentence stage with tts FLAT — no cost-shift, unlike
+cycle-14's firstClauseMinChars candidate, because this removes the
+fallback's asymmetric extra wait instead of shrinking the fragment below
+the prosody floor. Transcripts exact, midpause/typing regressions green.
+Prosody of the shorter first fragment is ears-checked with everything else.

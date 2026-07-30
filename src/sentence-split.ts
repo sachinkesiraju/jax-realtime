@@ -46,6 +46,14 @@ export interface SplitSpeechChunksOptions {
   hardCapChars?: number;
   /** Predicate gating the final tail flush (e.g. skip when the turn aborted). */
   flushTail?: () => boolean;
+  /**
+   * No-punctuation fallback for the FIRST flush: once this many chars have
+   * accumulated with no clause punctuation, flush at the last word boundary.
+   * Defaults to 2× firstClauseMinChars (the original behavior). Cycle 23's
+   * "start speaking sooner" candidate lowers it toward firstClauseMinChars so
+   * punctuation-less openers stop waiting for double the minimum.
+   */
+  firstWordFlushChars?: number;
 }
 
 /**
@@ -78,8 +86,9 @@ export async function* splitSpeechChunks(
     // written on screen while the voice still waits for the first sentence
     // to complete before it can even start synthesizing.
     if (!firstEmitted) {
+      const wordFlushAt = opts.firstWordFlushChars ?? opts.firstClauseMinChars * 2;
       let clauseIdx = findClauseEnd(buffer, opts.firstClauseMinChars);
-      if (clauseIdx === -1 && buffer.length >= opts.firstClauseMinChars * 2) {
+      if (clauseIdx === -1 && buffer.length >= wordFlushAt) {
         const lastSpace = buffer.lastIndexOf(" ");
         if (lastSpace >= opts.firstClauseMinChars) clauseIdx = lastSpace + 1;
       }

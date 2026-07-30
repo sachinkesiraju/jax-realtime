@@ -269,6 +269,11 @@ export class DuplexSession {
   private respondPromise: Promise<void> | null = null;
   private proactivePromise: Promise<void> | null = null;
   private proactiveSpeaking = false;
+  // Abort for the proactive line currently playing (cycle 23): tool
+  // narrations / timer lines were UNINTERRUPTIBLE — the tick early-returned
+  // on proactiveSpeaking before any barge check ran, and tts.speak was never
+  // given a signal, so the user could not talk over a tool response at all.
+  private proactiveController: AbortController | null = null;
   private currentTtsText: string | null = null;
   private bargeAt = 0;
 
@@ -375,6 +380,7 @@ export class DuplexSession {
     }
     // Abort any in-flight assistant response and wait for teardown.
     this.assistant?.controller.abort();
+    this.proactiveController?.abort();
     if (this.respondPromise) {
       try {
         await this.respondPromise;
@@ -512,9 +518,42 @@ export class DuplexSession {
       return;
     }
 
-    // Don't endpoint a user turn while a proactive line is still playing;
-    // starting a second TTS stream would overlap audio on the same GPU lane.
-    if (this.proactiveSpeaking) return;
+    // Proactive line (tool narration, timer, clarify) playing: the user must
+    // be able to interrupt it exactly like a reply (cycle-23 bug fix — this
+    // used to be a bare early-return, making tool narrations uninterruptible).
+    // Same adaptive echo-floor detector as the reply path; on trigger the
+    // proactive audio is cut and the interrupting speech becomes the next
+    // utterance. No endpointing happens while it plays (a second TTS stream
+    // would overlap audio on the same GPU lane), so return either way.
+    if (this.proactiveSpeaking) {
+      const ttsAudible = this.ttsLevel() > TTS_AUDIBLE_LEVEL;
+      if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
+        if (ttsAudible) {
+          this.bargeFloor = Math.max(this.bargeFloor, level);
+          this.bargeFloorTicks++;
+          this.aboveBargeTicks = 0;
+        } else if (this.bargeFloorTicks === 0) {
+          if (level > BARGE_ENERGY_MIN) this.aboveBargeTicks++;
+          else this.aboveBargeTicks = 0;
+          if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
+            this.handleProactiveBarge(now);
+            return;
+          }
+        }
+      } else {
+        const threshold = Math.max(
+          BARGE_ENERGY_MIN,
+          this.bargeFloor * BARGE_ENERGY_RATIO,
+        );
+        if (level > threshold) this.aboveBargeTicks++;
+        else this.aboveBargeTicks = 0;
+        if (this.aboveBargeTicks >= BARGE_ENERGY_TICKS) {
+          this.handleProactiveBarge(now);
+          return;
+        }
+      }
+      return;
+    }
 
     // Listening phase: track speech onset and silence. With the learned
     // turn signal (cycle 22), "speech right now" is Silero's hysteresis
@@ -970,6 +1009,7 @@ export class DuplexSession {
 
     for await (const chunk of splitSpeechChunks(deltas, {
       firstClauseMinChars: TUNABLES.firstClauseMinChars,
+      firstWordFlushChars: TUNABLES.firstWordFlushChars,
       streamFlushClauses: TUNABLES.streamFlushClauses,
       flushTail: () => !state.controller.signal.aborted,
     })) {
@@ -1187,29 +1227,53 @@ export class DuplexSession {
   private async runSpeakProactive(text: string): Promise<void> {
     this.proactiveSpeaking = true;
     this.currentTtsText = text;
+    // Interruptible (cycle 23) + fresh echo-floor calibration for this line.
+    const controller = new AbortController();
+    this.proactiveController = controller;
+    this.bargeFloor = 0;
+    this.bargeFloorTicks = 0;
+    this.aboveBargeTicks = 0;
     this.cb.onAssistantStart();
     this.cb.onAssistantPartial(text);
     this.cb.onStageActivity("tts", true);
     try {
       await this.pipeline.tts.speak(this.getVoice(), text, {
+        signal: controller.signal,
         onAnalyser: (analyser) => {
           this.ttsAnalyser = analyser;
         },
       });
+      const interrupted = controller.signal.aborted;
       this.history.push({
         role: "assistant",
-        content: text,
+        content: interrupted ? `${text} [interrupted]` : text,
         t: this.elapsed(),
       });
-      this.cb.onAssistantEnd(text, false);
+      this.cb.onAssistantEnd(text, interrupted);
     } catch (error) {
-      this.cb.onError(error);
+      if (!controller.signal.aborted) this.cb.onError(error);
     } finally {
       this.cb.onStageActivity("tts", false);
       this.ttsAnalyser = null;
       this.currentTtsText = null;
       this.proactiveSpeaking = false;
+      if (this.proactiveController === controller) this.proactiveController = null;
     }
+  }
+
+  /** The user talked over a proactive line: cut it and open their utterance. */
+  private handleProactiveBarge(now: number): void {
+    this.bargeAt = now;
+    this.proactiveController?.abort();
+    this.cb.onEvent("barge-in · proactive line stopped");
+    // The buffer holds the whole narration period (no pre-roll ran) — keep
+    // only the recent tail with the interruption onset, drop the echo bulk.
+    this.capture.trimTo(TUNABLES.bargePreRollMs);
+    this.transcriber?.reset();
+    this.speechStartAt = now - BARGE_ENERGY_TICKS * TUNABLES.tickMs;
+    this.silenceStart = 0;
+    this.aboveTicks = 0;
+    this.aboveBargeTicks = 0;
   }
 
   // --- Helpers -----------------------------------------------------------

@@ -266,6 +266,21 @@ export class VoiceCapture {
   }
 
   /**
+   * Trim the buffer to its most recent `ms` tail and resume growing under the
+   * normal cap. Used when a PROACTIVE line (tool narration etc.) is barged:
+   * unlike a reply, proactive speech plays without a pre-roll window, so the
+   * buffer holds the whole narration period's echo — keep only the recent
+   * tail (which contains the interruption onset) and drop the rest. VAD
+   * speech-frame evidence resets with it (the discarded frames were mostly
+   * narration echo; the ongoing interruption re-accumulates in one frame).
+   */
+  trimTo(ms: number): void {
+    this.pcm.setMaxSamples(sampleLimit((ms / 1000) * SAMPLE_RATE));
+    this.pcm.setMaxSamples(MAX_CAPTURE_SAMPLES);
+    this.vadSpeechFrames = 0;
+  }
+
+  /**
    * Hand the retained pre-roll to a normal growing utterance buffer. Existing
    * PCM is preserved exactly; subsequent interruption audio appends under the
    * normal 32 s cap.

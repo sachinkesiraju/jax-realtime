@@ -198,6 +198,18 @@ export const TUNABLES = {
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
+  /**
+   * No-punctuation fallback for the FIRST flush: flush at a word boundary
+   * once this many chars accumulate (cycle 23, "start speaking sooner").
+   * Was hardwired to 2× firstClauseMinChars (36); punctuation-less openers
+   * waited ~2× longer than punctuated ones for no reason — the flush point
+   * is a word boundary either way. 20 keeps the first fragment ≥3-4 words
+   * (prosody floor) while letting speech start one-to-two tokens after the
+   * brain's first delta. Cycle-14's law (smaller FIRST CLAUSE just moves
+   * sentence-cost into tts-cost) applied to shrinking the clause MINIMUM;
+   * this instead removes the asymmetric extra wait on the fallback path.
+   */
+  firstWordFlushChars: 20,
 
   /**
    * When true, keep flushing on subsequent clause boundaries (comma/colon/
