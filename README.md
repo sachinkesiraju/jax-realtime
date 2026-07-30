@@ -117,24 +117,6 @@ experiments don't need a rebuild).
   produces sentence-final falling intonation plus a pause in the middle of
   your sentence. Chunks now only split at real punctuation: a measured
   latency cost, paid for prosody.
-- **Merges must be bounded.** Letting speech-resumption merge with the fired
-  turn across the whole pre-audio gap meant any breath or chair creak aborted
-  the pending reply, and merges could chain, so answers arrived seconds late
-  to a mangled question. Now: one merge per turn, inside a 700 ms window.
-- **First-token latency doubled at turn 6, deterministically.** With no KV
-  reuse the whole prompt re-prefills every turn, and history growth pushed the
-  padded prompt across a jit-trace bucket boundary mid-session. Capping the
-  window at 8 messages keeps every turn in the warm buckets.
-- **Silero VAD without onnxruntime.** The 16 kHz branch is ~200k params, so
-  it's ported to plain TypeScript (the LSTM cell is two matmuls and four
-  gates) and parity-checked against the reference to 1e-6. Two contract traps:
-  the ONNX's *else*-branch is the 8 kHz path, and the model needs the official
-  wrapper's 64-sample rolling context; without it, clean speech scores ~0.16.
-- **Geocoder backoff can invent cities.** "Look at the weather in San
-  Francisco" once resolved to Teresina, Brazil: the place extractor grabbed
-  the verb's preposition and the token backoff degenerated to geocoding
-  "the", which open-meteo fuzzy-matches. The extractor now recurses to the
-  innermost preposition and never geocodes bare function words.
 - **Latency benches can't hear.** Two timing wins (an eager endpoint, an eager
   first TTS flush) passed every clip gate and failed immediately on a real
   microphone. Anything that changes turn-taking or audio structure ships only
