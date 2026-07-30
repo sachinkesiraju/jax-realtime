@@ -83,7 +83,7 @@ test("hard cap flushes buffered text with no punctuation", async () => {
   assert.deepEqual(chunks, ["abcdefghijklmnop"]);
 });
 
-test("firstWordFlushChars lowers the no-punctuation first flush (cycle 23)", async () => {
+test("firstWordFlushChars lowers the no-punctuation first flush", async () => {
   // "The weather in Tokyo is" (23 chars, no punctuation): with the default 2×
   // fallback (36) nothing flushes until more text arrives; with
   // firstWordFlushChars 20 the first words flush at the last word boundary.
@@ -104,11 +104,10 @@ test("firstWordFlushChars lowers the no-punctuation first flush (cycle 23)", asy
   assert.equal(classic[0], "The weather in Tokyo is mild today with light");
 });
 
-test("firstWordFlushChars 0 disables mid-sentence word splits (cycle 23 ears fix)", async () => {
-  // Punctuation-less opener: the whole sentence must flush as ONE chunk at
-  // its sentence end — never cut at a bare word boundary (a word-boundary
-  // chunk is synthesized with sentence-final prosody = a fake mid-sentence
-  // pause, the owner's ears report).
+test("firstWordFlushChars 0 disables mid-sentence word splits", async () => {
+  // Punctuation-less opener: the whole sentence must flush as one chunk at
+  // its sentence end — a word-boundary cut would be synthesized with
+  // sentence-final prosody (a fake mid-sentence pause).
   const text = "The weather in Tokyo is mild today with light wind. More text follows here.";
   const chunks = await collect(text, {
     firstClauseMinChars: 18,

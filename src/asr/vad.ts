@@ -1,16 +1,13 @@
-// Silero VAD v5, hand-ported to pure TypeScript (cycle 22 — the signal-layer
-// reduction). The model is ~200k parameters / ~750k MACs per 32 ms frame, so
-// it runs in well under a millisecond of plain CPU JS — no GPU (the GPU law
-// stays intact), no onnxruntime (the 24 MB dependency the parallel-VAD
-// investigation rejected), and no missing-op problem (the LSTM cell is two
-// matmuls and four gates, written out below).
+// Silero VAD v5, hand-ported to pure TypeScript. ~200k parameters and ~750k
+// MACs per 32 ms frame, so it runs on plain CPU JS — no GPU and no
+// onnxruntime dependency. The LSTM cell (the op @jax-js/onnx lacks) is two
+// matmuls and four gates, written out below.
 //
-// Architecture (decoded from silero_vad.onnx's 16 kHz branch, and verified
-// bit-close against an onnxruntime reference in bench/vad-parity):
+// Architecture (decoded from silero_vad.onnx's 16 kHz branch; verified
+// bit-close against an onnxruntime reference, see docs/BENCHMARKS.md cycle 22):
 //   input [576] = 64-sample rolling context ‖ 512-sample chunk @16 kHz
-//     (the context is the caller-side contract of the official wrapper —
-//     WITHOUT it the STFT frames misalign and speech scores collapse to
-//     ~0.16 even on clean speech; found the hard way, see cycle 22)
+//     (the context is the official wrapper's contract — without it the STFT
+//     frames misalign and speech scores collapse to ~0.16 on clean speech)
 //   → reflect-pad right by 64 → [640]
 //   → STFT-as-conv: fixed basis [258,1,256], stride 128 → [258,4]
 //     (rows 0..129 = real, 129..258 = imag) → magnitude [129,4]

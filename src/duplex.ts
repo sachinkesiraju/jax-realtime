@@ -139,12 +139,10 @@ const BARGE_ENERGY_TICKS = 2; // ~300 ms above threshold → interrupt
 // the assistant barged itself mid-reply, and the discarded pre-roll then
 // endpointed into a hallucinated phantom turn ("Thank you. Thank you.").
 const TTS_AUDIBLE_LEVEL = 0.02;
-// NOTE (cycle 20, owner call): the mid-utterance backchannels ("Mm-hmm." /
-// "Right." / "Got it.") that used to play into user pauses were REMOVED
-// entirely — in real sessions they read as random filler that isn't part of
-// the dialog ("right" landing mid-thought makes no sense), and unlike the
-// onset filler there is no bench-visible metric they improve. The cached-PCM
-// machinery lives on only as the TTS voice warmup (SpeechSynthesizer.warmVoice).
+// The mid-utterance backchannels ("Mm-hmm." / "Right." / "Got it.") were
+// removed: in real sessions they read as random filler, not dialog. The
+// cached-PCM machinery lives on as the TTS voice warmup
+// (SpeechSynthesizer.warmVoice).
 
 const TERMINAL_PUNCT = /[.!?…]\s*$/;
 const TIMER_UNIT = /(\d+)\s*(seconds?|secs?|minutes?|mins?)/i;
@@ -255,12 +253,12 @@ export class DuplexSession {
   // Adaptive barge-in echo-floor calibration (reset each reply).
   private bargeFloor = 0;
   private bargeFloorTicks = 0;
-  // Continuation-merge (cycle 16): when the user's speech resumes before the
-  // reply's first audio, the fired turn's transcript is kept here and the
-  // reply is aborted; the next endpoint prepends it so the two halves of the
-  // interrupted thought become ONE user turn ("append, don't restart").
+  // Continuation-merge: when the user's speech resumes before the reply's
+  // first audio, the fired turn's transcript is kept here and the reply is
+  // aborted; the next endpoint prepends it so the two halves of the
+  // interrupted thought become one user turn ("append, don't restart").
   private continuationPrefix = "";
-  // Cycle 21: merges cannot chain — one per turn, and only inside the bounded
+  // Merges cannot chain — one per turn, and only inside the bounded
   // resumption window (see continuationMergeWindowMs).
   private mergedThisTurn = false;
 
@@ -269,10 +267,9 @@ export class DuplexSession {
   private respondPromise: Promise<void> | null = null;
   private proactivePromise: Promise<void> | null = null;
   private proactiveSpeaking = false;
-  // Abort for the proactive line currently playing (cycle 23): tool
-  // narrations / timer lines were UNINTERRUPTIBLE — the tick early-returned
-  // on proactiveSpeaking before any barge check ran, and tts.speak was never
-  // given a signal, so the user could not talk over a tool response at all.
+  // Abort for the proactive line currently playing. Without it, tool
+  // narrations and timer lines were uninterruptible: the tick early-returned
+  // on proactiveSpeaking before any barge check ran.
   private proactiveController: AbortController | null = null;
   private currentTtsText: string | null = null;
   private bargeAt = 0;
@@ -463,14 +460,13 @@ export class DuplexSession {
             // user has heard anything — is not an interruption: it's the same
             // thought continuing across a pause the endpoint mistook for the
             // end of the turn (the punct fast-path fires on Whisper-invented
-            // terminal punctuation, and cycles 3B/5/15 proved no pre-fire
-            // window can fix that). Merge: abort the unheard reply and append
-            // the continuation to the fired turn. BOUNDED (cycle 21): only
-            // within continuationMergeWindowMs of the endpoint firing, and at
-            // most once per turn — an unbounded window let any gap noise
-            // abort replies and chain merges (live: "delayed responses").
-            // The detector needs BARGE_ENERGY_TICKS to confirm, so the onset
-            // is ~2 ticks before `now`.
+            // terminal punctuation; no pre-fire window can fix that). Merge:
+            // abort the unheard reply and append the continuation to the
+            // fired turn. Bounded: only within continuationMergeWindowMs of
+            // the endpoint firing, and at most once per turn — an unbounded
+            // window let gap noise abort replies and chain merges. The
+            // detector needs BARGE_ENERGY_TICKS to confirm, so the onset is
+            // ~2 ticks before `now`.
             const resumedAt =
               now - BARGE_ENERGY_TICKS * TUNABLES.tickMs - this.respondingSince;
             if (
@@ -519,12 +515,11 @@ export class DuplexSession {
     }
 
     // Proactive line (tool narration, timer, clarify) playing: the user must
-    // be able to interrupt it exactly like a reply (cycle-23 bug fix — this
-    // used to be a bare early-return, making tool narrations uninterruptible).
-    // Same adaptive echo-floor detector as the reply path; on trigger the
-    // proactive audio is cut and the interrupting speech becomes the next
-    // utterance. No endpointing happens while it plays (a second TTS stream
-    // would overlap audio on the same GPU lane), so return either way.
+    // be able to interrupt it exactly like a reply. Same adaptive echo-floor
+    // detector as the reply path; on trigger the audio is cut and the
+    // interrupting speech becomes the next utterance. No endpointing happens
+    // while it plays (a second TTS stream would overlap audio on the same
+    // GPU lane), so return either way.
     if (this.proactiveSpeaking) {
       const ttsAudible = this.ttsLevel() > TTS_AUDIBLE_LEVEL;
       if (this.bargeFloorTicks < BARGE_FLOOR_CALIB_TICKS) {
@@ -555,14 +550,13 @@ export class DuplexSession {
       return;
     }
 
-    // Listening phase: track speech onset and silence. With the learned
-    // turn signal (cycle 22), "speech right now" is Silero's hysteresis
-    // state (on >0.5, off <0.35); with the energy signal it's the RMS level
-    // against START_LEVEL. Anything non-speech counts toward silence —
-    // using a lower "stop" gate here created a dead-band where a
-    // quiet-but-nonzero signal latched neither state and the turn never
-    // endpointed. Brief within-word dips are absorbed by the endpoint
-    // silence windows, not this per-tick gate.
+    // Listening phase: track speech onset and silence. With the learned turn
+    // signal, "speech right now" is Silero's hysteresis state (on >0.5, off
+    // <0.35); with the energy signal it's the RMS level against START_LEVEL.
+    // Anything non-speech counts toward silence — a lower "stop" gate here
+    // created a dead-band where a quiet-but-nonzero signal latched neither
+    // state and the turn never endpointed. Brief within-word dips are
+    // absorbed by the endpoint silence windows, not this per-tick gate.
     const speechNow =
       TUNABLES.turnSignal === "vad" && this.capture.vadReady()
         ? this.capture.vadActive()
@@ -620,7 +614,7 @@ export class DuplexSession {
       return;
     }
 
-    // (Backchannels removed in cycle 20 — see the note by TTS_AUDIBLE_LEVEL.)
+    // (Backchannels removed — see the note by TTS_AUDIBLE_LEVEL.)
   }
 
   // --- User turn end -----------------------------------------------------
@@ -639,14 +633,13 @@ export class DuplexSession {
     // hallucinated turns like "Thank you. Thank you." in live sessions; a
     // genuine interruption carries a voiced run that passes easily).
     {
-      // Reject anything that isn't speech evidence. Learned signal (cycle
-      // 22): the utterance must contain ≥4 frames (128 ms) of P(speech) >
-      // 0.5 — Silero separates keyboard transients / ambient swells from
-      // speech directly. Energy signal: the classic voicedStats evidence
-      // test — too quiet → always ambient; too short a contiguous voiced
-      // RUN → a transient (a keystroke, a click, or a train of them from
-      // typing — each loud, but none sustained). A real word, even a
-      // one-syllable "what?", passes both signals easily.
+      // Reject anything that isn't speech evidence. Learned signal: the
+      // utterance must contain ≥4 frames (128 ms) of P(speech) > 0.5 —
+      // Silero separates keyboard transients and ambient swells from speech
+      // directly. Energy signal: the voicedStats evidence test — too quiet
+      // is ambient; too short a contiguous voiced run is a transient (a
+      // keystroke, or a train of them from typing — each loud, none
+      // sustained). A real word, even a one-syllable "what?", passes both.
       const notSpeech = (): boolean => {
         if (TUNABLES.turnSignal === "vad" && this.capture.vadReady()) {
           return this.capture.vadSpeechFrameCount() < 4;
@@ -1035,7 +1028,7 @@ export class DuplexSession {
    * endpoint answers the WHOLE thought (fired transcript + continuation).
    */
   private handleContinuation(now: number): void {
-    this.mergedThisTurn = true; // one merge per turn; reset on a fresh turn
+    this.mergedThisTurn = true; // one merge per turn; resets on a fresh turn
     const state = this.assistant;
     if (state) state.merged = true;
     state?.controller.abort();
@@ -1227,7 +1220,7 @@ export class DuplexSession {
   private async runSpeakProactive(text: string): Promise<void> {
     this.proactiveSpeaking = true;
     this.currentTtsText = text;
-    // Interruptible (cycle 23) + fresh echo-floor calibration for this line.
+    // Interruptible, with fresh echo-floor calibration for this line.
     const controller = new AbortController();
     this.proactiveController = controller;
     this.bargeFloor = 0;

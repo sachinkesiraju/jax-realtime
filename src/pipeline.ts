@@ -1520,9 +1520,9 @@ export class SpeechSynthesizer {
    * Warm the full synth path for a voice once, off the audio graph (flow-LM
    * step-0 prefill, fused decode, Mimi) so the first real reply pays no JIT
    * cost. This used to also cache backchannel PCM ("Mm-hmm." / "Right." /
-   * "Got it."); backchannel playback was REMOVED in cycle 20 (owner call —
-   * they read as random filler in real sessions), but the warmup half of the
-   * machinery is still what keeps the first turn's TTS fast.
+   * "Got it."); backchannel playback was removed in cycle 20 — the lines
+   * read as random filler in real sessions — but the warmup half is what
+   * keeps the first turn's TTS fast.
    */
   async warmVoice(voice: TTSVoice): Promise<void> {
     if (this.warmedVoice === voice) return;

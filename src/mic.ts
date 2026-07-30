@@ -141,9 +141,9 @@ export class VoiceCapture {
   private pcm = new BoundedPcmBuffer(MAX_CAPTURE_SAMPLES);
   private recentLevel = 0;
   private capturing = true;
-  // Learned VAD (cycle 22): a pure-TS Silero v5 fed 512-sample chunks as they
-  // arrive from the worklet (~2 ms CPU per 32 ms frame). Optional — when not
-  // attached, the energy heuristics remain the only signal.
+  // Optional learned VAD: a pure-TS Silero v5 fed 512-sample chunks as they
+  // arrive from the worklet (~2 ms CPU per 32 ms frame). When not attached,
+  // the energy heuristics are the only signal.
   private vad: SileroVad | null = null;
   private vadBuf = new Float32Array(VAD_CHUNK);
   private vadFill = 0;
@@ -267,12 +267,11 @@ export class VoiceCapture {
 
   /**
    * Trim the buffer to its most recent `ms` tail and resume growing under the
-   * normal cap. Used when a PROACTIVE line (tool narration etc.) is barged:
-   * unlike a reply, proactive speech plays without a pre-roll window, so the
-   * buffer holds the whole narration period's echo — keep only the recent
-   * tail (which contains the interruption onset) and drop the rest. VAD
-   * speech-frame evidence resets with it (the discarded frames were mostly
-   * narration echo; the ongoing interruption re-accumulates in one frame).
+   * normal cap. Used when a proactive line (tool narration etc.) is barged:
+   * proactive speech plays without a pre-roll window, so the buffer holds the
+   * whole narration period's echo — keep the tail with the interruption onset,
+   * drop the rest. VAD speech-frame evidence (mostly narration echo) resets
+   * with it.
    */
   trimTo(ms: number): void {
     this.pcm.setMaxSamples(sampleLimit((ms / 1000) * SAMPLE_RATE));

@@ -216,11 +216,9 @@ let vision: VisionSession | null = null;
 let visionRaf: number | null = null;
 let visionBusy = false;
 
-// Bench/debug hooks. Deliberately NOT gated behind import.meta.env.DEV
-// (they were, until cycle 19): the map-reduce harness drives the app through
-// these, and gating them made production deploys unbenchable — the Netlify
-// regression hunt had no instrumentation on exactly the build that mattered.
-// They are read-only debug surface; exposing them costs nothing.
+// Bench/debug hooks, deliberately not gated behind import.meta.env.DEV: the
+// bench harness drives the app through these, and gating them made production
+// deploys unbenchable. They are read-only debug surface.
 {
   const dev = window as unknown as Record<string, unknown>;
   dev.__capture = capture;
@@ -255,14 +253,12 @@ function formatMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
-// Stick-to-bottom auto-scroll (cycle 24). The shell uses min-height, so a
-// growing transcript grows the PAGE rather than overflowing the container —
-// the old `transcript.scrollTop = scrollHeight` calls were no-ops on a
-// container that never scrolls, which is why the chat "didn't auto scroll".
-// Follow new content by scrolling the WINDOW, but only when the user is
-// already near the bottom: someone reading scrollback must never be yanked
-// down. The threshold is checked AFTER the mutation, so it also covers the
-// height just added (bubbles/chips add ≲200 px per update).
+// Stick-to-bottom auto-scroll. The shell uses min-height, so a growing
+// transcript grows the page rather than overflowing the container — a bare
+// `transcript.scrollTop = scrollHeight` is a no-op there. Follow new content
+// by scrolling the window, but only when the user is already near the bottom
+// so scrollback is never hijacked. The threshold is checked after the
+// mutation, so it also covers the height just added (≲200 px per update).
 const FOLLOW_THRESHOLD_PX = 240;
 function followChat(): void {
   // Keep the container-level scroll too, for layouts where the transcript
@@ -390,10 +386,9 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
-    // Learned turn signal (cycle 22): a 1.2 MB pure-TS Silero v5 fed from the
-    // mic worklet. Same-origin fetch (ships with the app bundle); failure
-    // falls back to the energy heuristics silently — the tunable's vadReady
-    // guard means the app never depends on it.
+    // Learned turn signal: a 1.2 MB pure-TS Silero v5 fed from the mic
+    // worklet. Same-origin fetch (ships with the app bundle); on failure the
+    // energy heuristics take over via the vadReady guard.
     try {
       const vadBin = await fetch("/vad/silero-vad-v5.bin").then((r) => {
         if (!r.ok) throw new Error(`vad weights: HTTP ${r.status}`);
