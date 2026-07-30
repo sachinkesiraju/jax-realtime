@@ -102,9 +102,6 @@ experiments don't need a rebuild).
 
 ## Hard-won details
 
-Things a default implementation gets wrong, found in live sessions and fixed
-here (full stories in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
-
 - **The assistant used to interrupt itself.** The barge-in threshold
   calibrated its echo floor during the reply's first ticks, which fall in the
   silent LLM/TTS latency gap, so the floor was ambient-level and the
