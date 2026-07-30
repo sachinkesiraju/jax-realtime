@@ -40,8 +40,7 @@ app.innerHTML = `
           A full&#8209;duplex voice assistant running entirely in your browser with
           <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a>.
           <br />
-          It listens while it talks, runs searches in the background
-          mid&#8209;conversation, and you can interrupt it mid&#8209;sentence.
+          It listens while it talks and you can interrupt it mid&#8209;sentence.
           <br />
           Inspired by the
           <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">Thinking Machines interaction model</a>
