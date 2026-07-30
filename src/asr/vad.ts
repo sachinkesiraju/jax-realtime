@@ -1,4 +1,4 @@
-// Silero VAD v5, hand-ported to pure TypeScript. ~200k parameters and ~750k
+// Silero VAD v5, ported to pure TypeScript. ~200k parameters and ~750k
 // MACs per 32 ms frame, so it runs on plain CPU JS — no GPU and no
 // onnxruntime dependency. The LSTM cell (the op @jax-js/onnx lacks) is two
 // matmuls and four gates, written out below.

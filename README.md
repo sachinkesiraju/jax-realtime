@@ -18,7 +18,7 @@ while you talk — reproduced as a small-model cascade that fits in a browser.
 | Stage | Model | Runs on |
 | --- | --- | --- |
 | Ear (ASR) | Whisper base.en (int8, dequantized to fp16) | WebGPU via jax-js |
-| Turn-taking (VAD) | Silero VAD v5, hand-ported to TypeScript | CPU (~2 ms / 32 ms frame) |
+| Turn-taking (VAD) | Silero VAD v5, ported to TypeScript | CPU (~2 ms / 32 ms frame) |
 | Brain (LLM) | SmolLM2-360M-Instruct (fp16) | WebGPU via jax-js |
 | Voice (TTS) | Kyutai Pocket TTS + Mimi codec (fp16) | WebGPU via jax-js |
 | Eye (vision) | D-FINE small (COCO-80) | WebGPU via `@jax-js/onnx` |
@@ -132,7 +132,7 @@ here (full stories in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
   padded prompt across a jit-trace bucket boundary mid-session. Capping the
   window at 8 messages keeps every turn in the warm buckets.
 - **Silero VAD without onnxruntime.** The 16 kHz branch is ~200k params, so
-  it's hand-ported to plain TypeScript (the LSTM cell is two matmuls and four
+  it's ported to plain TypeScript (the LSTM cell is two matmuls and four
   gates) and parity-checked against the reference to 1e-6. Two contract traps:
   the ONNX's *else*-branch is the 8 kHz path, and the model needs the official
   wrapper's 64-sample rolling context — without it, clean speech scores ~0.16.
