@@ -11,13 +11,14 @@ locally in the tab; nothing is sent to a server.
 It's inspired by the Thinking Machines
 [interaction model](https://thinkingmachines.ai/blog/interaction-models/) and
 [GPT-Live](https://openai.com/index/introducing-gpt-live/): the goal is a
-conversation that *feels* live — you can interrupt it mid-sentence, pause to
-think, and it backchannels while you talk — reproduced as a small-model cascade
-that fits in a browser.
+conversation that *feels* live — you can interrupt it mid-sentence, pause
+mid-thought without losing your turn, and it keeps searching in the background
+while you talk — reproduced as a small-model cascade that fits in a browser.
 
 | Stage | Model | Runs on |
 | --- | --- | --- |
 | Ear (ASR) | Whisper base.en (int8, dequantized to fp16) | WebGPU via jax-js |
+| Turn-taking (VAD) | Silero VAD v5, hand-ported to TypeScript | CPU (~2 ms / 32 ms frame) |
 | Brain (LLM) | SmolLM2-360M-Instruct (fp16) | WebGPU via jax-js |
 | Voice (TTS) | Kyutai Pocket TTS + Mimi codec (fp16) | WebGPU via jax-js |
 | Eye (vision) | D-FINE small (COCO-80) | WebGPU via `@jax-js/onnx` |
@@ -30,16 +31,20 @@ assistant stops.
 ## Interaction
 
 - **Full-duplex micro-turns** — a ~150 ms tick loop drives a deterministic,
-  priority-ordered policy: adaptive **barge-in** (talk over the assistant and
-  its audio cuts in ~300 ms; the threshold auto-calibrates to the echo floor of
-  each reply), mid-utterance **backchannels**, adaptive **endpointing**, and
-  time-awareness timers. A watchdog force-recovers the session if a reply ever
-  stalls, so it can't wedge.
-- **Phantom-turn guard** — near-silence and ambient swells are rejected from the
-  captured PCM (voiced-duration + peak, over an adaptive noise floor) before
-  they reach Whisper, and a repetition-degeneracy gate drops decoder loops — so
-  the assistant doesn't answer "thank you"s you never said. Snappy one-word
-  replies ("what?", "no") still get through.
+  priority-ordered policy: adaptive **barge-in** (talk over the assistant —
+  including its tool narrations — and the audio cuts in ~300 ms; the threshold
+  auto-calibrates to the echo floor of each reply), adaptive **endpointing**,
+  and time-awareness timers. A watchdog force-recovers the session if a reply
+  ever stalls, so it can't wedge.
+- **Continuation-merge** — if the endpoint fires on a mid-thought pause and you
+  resume speaking before the reply's first audio, the unheard reply is aborted
+  and both halves are answered as one turn ("append, don't restart").
+- **Learned turn signal** — a pure-TypeScript port of Silero VAD v5 scores
+  P(speech) every 32 ms on the CPU and drives speech onset, silence tracking,
+  and the phantom-turn guard: keyboard noise and ambient swells never even
+  latch an utterance, near-silence never reaches Whisper (so no hallucinated
+  "thank you"s), and quiet speech still passes. A repetition-degeneracy gate
+  drops decoder loops on top.
 - **Eye (vision)** — enabled by default for webcam context, with a pre-load
   toggle to skip its 42 MB model, camera access, and GPU residency. D-FINE
   runs low-priority object detection (it yields the GPU to audio), smooths the
@@ -56,7 +61,8 @@ assistant stops.
   in °F/mph), facts ("who is Ada Lovelace" → Wikipedia), plus instant offline
   **calculator** and **clock/date**. Web lookups speak a holding line and fetch
   in the background, then answer on the next silence and render a card; the
-  card clears when the conversation moves on.
+  card clears when the conversation moves on, and the spoken answer can be
+  interrupted like any reply.
 
 ## Performance (all on jax-js / WebGPU)
 
@@ -80,6 +86,14 @@ map-reduce campaign log, including the negative results):
   reused for confidence scoring instead of scanning the vocabulary again. ASR
   runs 5–7% faster while preserving all 21 paired clean/quiet/distorted
   transcripts; low-confidence failures request a repeat before invoking the LLM.
+- **Bounded history window** — the prompt is capped at 8 messages so it never
+  leaves the warm prefill buckets: first-token latency stays flat (~500–610 ms)
+  across long sessions instead of doubling around turn 6, and the worst turn of
+  a 12-turn session sits within ~150 ms of the median.
+- **Prosody-safe TTS chunking** — reply text is flushed to the synthesizer only
+  at clause punctuation, never at bare word boundaries (each chunk is
+  synthesized as a complete utterance, so a mid-sentence cut would sound like a
+  full stop).
 - **Deterministic memory fast paths** — exact recall and bounded trip, pet, and
   activity follow-ups can answer in a few milliseconds without model generation.
 - **Smaller download** — Whisper ships a per-row int8 build (73 MB instead of
@@ -124,10 +138,10 @@ The pipeline stages, from microphone to speaker:
 | Path | What's there |
 | --- | --- |
 | `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
-| `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. |
+| `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. `vad.ts` is the Silero VAD v5 port (STFT-as-conv, four conv layers, one LSTM cell — parity-checked against the onnxruntime reference). |
 | `src/llm/smollm.ts` | SmolLM2-360M (Llama architecture) forward pass with a KV cache — the brain. Each token is generated in a single fused GPU dispatch, and the prompt prefill is bucket-padded so jit traces are reused across turns. Chosen via a blind-judged model shootout against same-size and larger alternatives. |
 | `src/memory.ts` | Bounded extraction, relevance filtering, and deterministic recall for facts the user explicitly shared. |
-| `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. |
+| `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. `src/sentence-split.ts` chunks the LLM delta stream at clause boundaries for synthesis. |
 | `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
 | `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |
 
