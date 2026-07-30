@@ -147,10 +147,10 @@ The pipeline stages, from microphone to speaker:
 | Path | What's there |
 | --- | --- |
 | `src/mic.ts` | 16 kHz PCM capture via an AudioWorklet. |
-| `src/asr/` | Whisper encoder/decoder, log-mel features, greedy timestamp decoding. `streaming.ts` transcribes live using LocalAgreement-2: it locks in words once two passes agree, filters out the assistant's own voice, and exposes a best-guess transcript the moment your turn ends. `vad.ts` is the Silero VAD v5 port (STFT-as-conv, four conv layers, one LSTM cell, parity-checked against the onnxruntime reference). |
-| `src/llm/smollm.ts` | SmolLM2-360M (Llama architecture) forward pass with a KV cache: the brain. Each token is generated in a single fused GPU dispatch, and the prompt prefill is bucket-padded so jit traces are reused across turns. Chosen via a blind-judged model shootout against same-size and larger alternatives. |
-| `src/memory.ts` | Bounded extraction, relevance filtering, and deterministic recall for facts the user explicitly shared. |
-| `src/tts/` | Pocket TTS flow-matching LM + Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) streaming neural codec (reimplemented on jax-js, with the fused per-frame decode) and a streaming `AudioContext` player. `src/sentence-split.ts` chunks the LLM delta stream at clause boundaries for synthesis. |
+| `src/asr/` | Whisper encoder/decoder and features. `streaming.ts` transcribes live (LocalAgreement-2: words lock in once two passes agree) and filters out the assistant's own voice. `vad.ts` is the Silero VAD v5 port. |
+| `src/llm/smollm.ts` | SmolLM2-360M forward pass with a KV cache: one fused GPU dispatch per token, bucket-padded prefill so jit traces are reused across turns. |
+| `src/memory.ts` | Extraction and deterministic recall of facts the user shared. |
+| `src/tts/` | Pocket TTS flow-matching LM + the [Mimi](https://github.com/kyutai-labs/moshi) codec on jax-js, streamed to an `AudioContext` player. `src/sentence-split.ts` chunks reply text at clause boundaries for synthesis. |
 | `src/vision/` | D-FINE detector on `@jax-js/onnx`, webcam `VisionSession`, COCO labels, box-dedupe and person-count smoothing. |
 | `src/tools/tools.ts` | Keyless intent detection → weather / Wikipedia / calc / clock. |
 
