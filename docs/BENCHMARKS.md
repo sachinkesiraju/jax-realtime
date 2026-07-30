@@ -1067,3 +1067,90 @@ above the median instead of ~1-1.3 s, because the two structural tail sources
 floor at ~1.3-1.4 s: endpoint 301 (floor) + llmFirst ~550 + sentence ~380 +
 tts ~100 — from here, only the cloud-brain ChatModel (llmFirst+sentence →
 ~250 combined) or a faster local decode moves it materially.
+
+## Cycle 19 — endpoint revert + benchable production builds (SHIPPED)
+
+- **`endpointPunctMs`/`endpointSilenceMs` back to 380/620.** Cycle 17's eager
+  250/500 windows failed the live-mic check: real speech pauses mid-sentence
+  far more than the scripted clips, and the continuation-merge only rescues
+  resumptions that land before first audio (~1.3 s). The safe windows are the
+  shipped state; any future attempt at the -150 ms needs a live-listen
+  protocol, not a clip gate.
+- **Bench hooks exposed in production builds** (`window.__tunables`,
+  `__turnLog`, `__pipeline`, ...): they were DEV-gated, which made deploys
+  unbenchable. With them exposed, the identical build measured the same
+  through `vite preview` and the Netlify CDN (P50 1335/1375, stage medians
+  equal) — serving does not affect turn latency once weights are cached.
+
+## Cycle 20 — backchannels removed (SHIPPED)
+
+The mid-utterance backchannels ("Mm-hmm." / "Right." / "Got it.") played into
+user pauses and read as random filler in real sessions. Playback is deleted:
+the tick-policy block, the voiced-evidence pre-check, and `playBackchannel`.
+The cached-PCM synthesis machinery survives as `warmVoice` — synthesizing one
+short phrase off the audio graph is what JIT-warms the synth path (flow-LM
+prefill, fused decode, Mimi) so the first real reply stays fast.
+
+## Cycle 21 — continuation-merge bounded (SHIPPED)
+
+`continuationMergeWindowMs: 700` + at most one merge per turn. Cycle 16
+shipped the merge unbounded across the whole ~1.4 s pre-audio gap, and merges
+could chain (merge → new gap → merge again): any ≥300 ms gap noise aborted
+the pending reply and spliced noise-transcript onto the question — live this
+read as delayed answers to mangled prompts. A resumption inside 700 ms of the
+endpoint firing merges; anything later (or a second resumption) takes the
+barge path. Gates: midpause still merges 3/3 loops whole; map_a 12-turn clean
+(P50 1445, transcripts exact).
+
+## Cycle 22 — learned turn signal (SHIPPED)
+
+Silero VAD v5's 16 kHz branch, hand-ported to ~200 lines of pure TypeScript
+(`src/asr/vad.ts`): STFT-as-conv, 4 conv layers, one LSTM cell, sigmoid head.
+~200k params, 1.2 MB weights (`public/vad/silero-vad-v5.bin`), ~2.3 ms per
+32 ms frame of plain CPU JS — no GPU (the GPU law holds), no onnxruntime (the
+24 MB dependency the parallel-VAD investigation rejected), no missing-LSTM-op
+problem. Parity-gated against the onnxruntime reference: worst |Δ| 6.2e-7
+over stateful sequences. Two contract notes encoded in the source: the ONNX's
+else-branch is the 8 kHz path, and the model requires the official wrapper's
+64-sample rolling context — without it speech scores collapse to ~0.16.
+
+`turnSignal: "vad"` (shipped default) drives the listening phase — onset,
+silence, and the phantom-evidence check (≥4 frames of P>0.5 replaces the
+voicedStats scan). Gates vs the energy baseline:
+
+| gate | energy | vad |
+| --- | --- | --- |
+| typing 60 s | 0 turns, 20-21 phantom discards | **0 turns, 0 discards** (never latches) |
+| ambient 60 s | 0 turns | 0 turns |
+| quiet / quiet×0.4 | 3/3 exact | 3/3 exact |
+| midpause | 3/3 merged whole | 3/3 merged whole |
+| map_a 12-turn | P50 ~1415-1445 | P50 1418 / P95 1540, 12/12 exact |
+
+Barge-in keeps the echo-floor energy path: Silero scores the assistant's own
+playback echo as speech, so the echo-aware detector remains the right
+primitive there. The energy heuristics stay selectable for one cycle
+(rollback + paired A/Bs), then the deletion list retires (voicedStats,
+GUARD_*/MIN_* constants, START_LEVEL onset).
+
+## Cycle 23 — interruptible proactive lines + no mid-sentence TTS splits (SHIPPED)
+
+- **Proactive lines are now barge-able.** Tool narrations, timer lines, and
+  clarify lines were uninterruptible by construction: the tick early-returned
+  on `proactiveSpeaking` before any barge check ran, and `tts.speak` was
+  never given an abort signal. Proactive playback now gets its own
+  AbortController plus the same adaptive echo-floor detector as replies; on
+  trigger the audio cuts, the capture buffer trims to its recent tail
+  (`trimTo` — no pre-roll runs during proactive speech), and the interrupting
+  speech becomes the next utterance.
+- **`firstWordFlushChars: 0` + hard cap 120 → 200.** Every TTS chunk is
+  synthesized as a complete utterance, so any cut at a bare word boundary
+  gets sentence-final falling intonation plus an end-of-utterance pause in
+  the middle of the sentence. The first flush now happens only at clause
+  punctuation; punctuation-less openers wait for their sentence end.
+  Measured cost, paired on map_a: sentence P50 217 → 460, turnLat P50 1324 →
+  1585 — the price of never faking a full stop mid-sentence. Quantization
+  was ruled out first: the TTS loads `pocket-tts-decode-fp16.safetensors`
+  (full fp16); the int8 flow-LM artifact was never shipped (cycle-13
+  duration-gate rejection stands). Open ears-gated candidate for reclaiming
+  latency: comma-splice the word-boundary cut so the flow-LM renders
+  continuing intonation.

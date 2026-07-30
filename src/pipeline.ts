@@ -1095,12 +1095,13 @@ export type SpeakOptions = {
 };
 
 const TTS_SAMPLE_RATE = 24_000; // Mimi codec output rate.
-const BACKCHANNEL_PHRASES = ["Mm-hmm.", "Right.", "Got it."] as const;
+// Short phrase synthesized once per voice at load to JIT-warm the synth path
+// (see warmVoice). Never played aloud.
+const WARMUP_PHRASE = "Okay.";
 
 export class SpeechSynthesizer {
   private voiceEmbeds = new Map<TTSVoice, np.Array>();
-  private backchannels: Float32Array[] = [];
-  private backchannelVoice: TTSVoice | null = null;
+  private warmedVoice: TTSVoice | null = null;
 
   private constructor(
     private model: PocketTTS,
@@ -1516,39 +1517,22 @@ export class SpeechSynthesizer {
   }
 
   /**
-   * Pre-synthesize the backchannel phrases once (off the audio graph) and cache
-   * their PCM, so `playBackchannel()` never touches the GPU mid-conversation.
+   * Warm the full synth path for a voice once, off the audio graph (flow-LM
+   * step-0 prefill, fused decode, Mimi) so the first real reply pays no JIT
+   * cost. This used to also cache backchannel PCM ("Mm-hmm." / "Right." /
+   * "Got it."); backchannel playback was removed in cycle 20 — the lines
+   * read as random filler in real sessions — but the warmup half is what
+   * keeps the first turn's TTS fast.
    */
-  async prepareBackchannels(voice: TTSVoice): Promise<void> {
-    if (this.backchannels.length && this.backchannelVoice === voice) return;
-    const clips: Float32Array[] = [];
-    for (const phrase of BACKCHANNEL_PHRASES) {
-      const collector = createStreamingPlayer({ collectPcm: true });
-      try {
-        await this.synthOne(voice, phrase, collector, null);
-        clips.push(collector.pcm());
-      } finally {
-        await collector.close();
-      }
+  async warmVoice(voice: TTSVoice): Promise<void> {
+    if (this.warmedVoice === voice) return;
+    const collector = createStreamingPlayer({ collectPcm: true });
+    try {
+      await this.synthOne(voice, WARMUP_PHRASE, collector, null);
+    } finally {
+      await collector.close();
     }
-    this.backchannels = clips;
-    this.backchannelVoice = voice;
-  }
-
-  /** Play a random cached backchannel instantly through a short-lived context. */
-  playBackchannel(): void {
-    if (!this.backchannels.length) return;
-    const pcm =
-      this.backchannels[Math.floor(Math.random() * this.backchannels.length)];
-    if (!pcm.length) return;
-    const ctx = new AudioContext({ sampleRate: TTS_SAMPLE_RATE });
-    const buffer = ctx.createBuffer(1, pcm.length, TTS_SAMPLE_RATE);
-    buffer.getChannelData(0).set(pcm);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    source.onended = () => void ctx.close().catch(() => {});
-    source.start();
+    this.warmedVoice = voice;
   }
 }
 
@@ -1627,7 +1611,7 @@ export async function loadPipeline(
   ]);
   // Compile the ASR + LLM kernels now (esp. slow to JIT on wasm) so the first
   // real turn isn't hit with a multi-second cold start. (TTS is warmed via
-  // prepareBackchannels, which the UI calls right after load.)
+  // warmVoice, which the UI calls right after load.)
   onProgress({ name: "Warming up models", loadedBytes: 0, done: false });
   await asr.warmup();
   await llm.warmup();

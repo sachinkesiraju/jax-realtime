@@ -46,6 +46,15 @@ export interface SplitSpeechChunksOptions {
   hardCapChars?: number;
   /** Predicate gating the final tail flush (e.g. skip when the turn aborted). */
   flushTail?: () => boolean;
+  /**
+   * No-punctuation fallback for the first flush: once this many chars have
+   * accumulated with no clause punctuation, flush at the last word boundary.
+   * `0` disables the fallback (the shipped default): every chunk is
+   * synthesized as a complete utterance, so a bare word-boundary cut gets
+   * sentence-final prosody — a fake full stop mid-sentence. Undefined keeps
+   * the historical 2× firstClauseMinChars behavior for paired A/Bs.
+   */
+  firstWordFlushChars?: number;
 }
 
 /**
@@ -63,7 +72,10 @@ export async function* splitSpeechChunks(
   deltas: AsyncIterable<string>,
   opts: SplitSpeechChunksOptions,
 ): AsyncGenerator<string, void, void> {
-  const hardCap = opts.hardCapChars ?? 120;
+  // 200 (was 120): a mid-sentence cut sounds like a full stop (see
+  // firstWordFlushChars), and Pocket TTS handles ~200-char sentences fine.
+  // The cap only bounds a pathological punctuation-less ramble.
+  const hardCap = opts.hardCapChars ?? 200;
   let buffer = "";
   let firstEmitted = false;
 
@@ -73,13 +85,14 @@ export async function* splitSpeechChunks(
     // Fastest first audio: flush the first clause as soon as a comma/colon/
     // semicolon appears (once there's enough to sound natural), so speech
     // starts after "The weather in Tokyo," instead of the whole sentence.
-    // If no punctuation shows up, flush at a WORD BOUNDARY once ~2× the
-    // clause minimum has accumulated — otherwise the reply text is fully
-    // written on screen while the voice still waits for the first sentence
-    // to complete before it can even start synthesizing.
+    // The word-boundary fallback is off by default; see firstWordFlushChars.
     if (!firstEmitted) {
+      const wordFlushAt =
+        opts.firstWordFlushChars === 0
+          ? Infinity // disabled: only punctuation (or the hard cap) splits
+          : (opts.firstWordFlushChars ?? opts.firstClauseMinChars * 2);
       let clauseIdx = findClauseEnd(buffer, opts.firstClauseMinChars);
-      if (clauseIdx === -1 && buffer.length >= opts.firstClauseMinChars * 2) {
+      if (clauseIdx === -1 && buffer.length >= wordFlushAt) {
         const lastSpace = buffer.lastIndexOf(" ");
         if (lastSpace >= opts.firstClauseMinChars) clauseIdx = lastSpace + 1;
       }

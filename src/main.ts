@@ -12,6 +12,7 @@ import {
   rememberUserFacts,
 } from "./memory";
 import { VoiceCapture } from "./mic";
+import { parseVadWeights, SileroVad } from "./asr/vad";
 import { TUNABLES, TURN_LOG } from "./tunables";
 import { Orb } from "./orb";
 import { detectTool, type ToolKind, type UiCard } from "./tools/tools";
@@ -40,7 +41,7 @@ app.innerHTML = `
           <a href="https://github.com/ekzhang/jax-js" target="_blank">jax&#8209;js</a>.
           <br />
           It listens while it talks, you can interrupt it mid&#8209;sentence,
-          and it backchannels while you speak.
+          and it continues searching while you speak.
           <br />
           Inspired by the
           <a href="https://thinkingmachines.ai/blog/interaction-models/" target="_blank">Thinking Machines interaction model</a>
@@ -215,7 +216,10 @@ let vision: VisionSession | null = null;
 let visionRaf: number | null = null;
 let visionBusy = false;
 
-if (import.meta.env.DEV) {
+// Bench/debug hooks, deliberately not gated behind import.meta.env.DEV: the
+// bench harness drives the app through these, and gating them made production
+// deploys unbenchable. They are read-only debug surface.
+{
   const dev = window as unknown as Record<string, unknown>;
   dev.__capture = capture;
   dev.__getDuplex = () => duplex;
@@ -249,11 +253,29 @@ function formatMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+// Stick-to-bottom auto-scroll. The shell uses min-height, so a growing
+// transcript grows the page rather than overflowing the container — a bare
+// `transcript.scrollTop = scrollHeight` is a no-op there. Follow new content
+// by scrolling the window, but only when the user is already near the bottom
+// so scrollback is never hijacked. The threshold is checked after the
+// mutation, so it also covers the height just added (≲200 px per update).
+const FOLLOW_THRESHOLD_PX = 240;
+function followChat(): void {
+  // Keep the container-level scroll too, for layouts where the transcript
+  // itself overflows (e.g. if the CSS ever pins the shell height).
+  el.transcript.scrollTop = el.transcript.scrollHeight;
+  const doc = document.documentElement;
+  const fromBottom = doc.scrollHeight - (window.innerHeight + window.scrollY);
+  if (fromBottom > 0 && fromBottom <= FOLLOW_THRESHOLD_PX) {
+    window.scrollTo({ top: doc.scrollHeight });
+  }
+}
+
 function addBubble(role: "user" | "assistant"): HTMLDivElement {
   const bubble = document.createElement("div");
   bubble.className = `bubble bubble-${role}`;
   el.transcript.appendChild(bubble);
-  el.transcript.scrollTop = el.transcript.scrollHeight;
+  followChat();
   return bubble;
 }
 
@@ -276,7 +298,7 @@ function addToolChip(kind: ToolKind, query: string): HTMLDivElement {
   label.textContent = `${verb} · ${query}`;
   chip.append(dot, label);
   el.transcript.appendChild(chip);
-  el.transcript.scrollTop = el.transcript.scrollHeight;
+  followChat();
   return chip;
 }
 
@@ -364,11 +386,23 @@ async function handleLoad() {
   setStatus("downloading models", "busy");
   try {
     pipeline = await loadPipeline(onDownloadProgress);
+    // Learned turn signal: a 1.2 MB pure-TS Silero v5 fed from the mic
+    // worklet. Same-origin fetch (ships with the app bundle); on failure the
+    // energy heuristics take over via the vadReady guard.
+    try {
+      const vadBin = await fetch("/vad/silero-vad-v5.bin").then((r) => {
+        if (!r.ok) throw new Error(`vad weights: HTTP ${r.status}`);
+        return r.arrayBuffer();
+      });
+      capture.attachVad(new SileroVad(parseVadWeights(vadBin)));
+    } catch (error) {
+      console.warn("VAD unavailable; energy turn signal only", error);
+    }
     // Respect a pre-load Eye opt-in after WebGPU initialization.
     if (el.eyeToggle.checked) void toggleVision(true);
     el.laneAsr.textContent = pipeline.asrDevice;
-    setStatus("preparing backchannels", "busy");
-    await pipeline.tts.prepareBackchannels(el.voiceSelect.value as TTSVoice);
+    setStatus("warming the voice", "busy");
+    await pipeline.tts.warmVoice(el.voiceSelect.value as TTSVoice);
     // Pre-trace the flow-LM step-0 prefill for common sentence lengths so the
     // first reply doesn't pay the on-turn JIT re-trace (gated on
     // TUNABLES.ttsWarmup; no-op when off). No audio is produced.
@@ -392,10 +426,10 @@ async function handleLoad() {
 }
 
 el.voiceSelect.addEventListener("change", () => {
-  // Re-synthesize backchannel clips + re-warm the flow-LM prefill in the new
-  // voice (background, best-effort).
+  // Re-warm the synth path + flow-LM prefill in the new voice (background,
+  // best-effort).
   void pipeline?.tts
-    .prepareBackchannels(el.voiceSelect.value as TTSVoice)
+    .warmVoice(el.voiceSelect.value as TTSVoice)
     .then(() => pipeline?.tts.warmup(el.voiceSelect.value as TTSVoice))
     .catch(() => {});
 });
@@ -575,7 +609,7 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
       onAssistantPartial(text) {
         if (assistantBubble) {
           assistantBubble.textContent = text;
-          el.transcript.scrollTop = el.transcript.scrollHeight;
+          followChat();
         }
       },
       onAssistantEnd(text, interrupted) {
@@ -615,6 +649,7 @@ function buildSession(pipe: VoicePipeline): DuplexSession {
           toolChip = null;
         }
         renderCard(card);
+        followChat(); // the card panel adds height below the transcript
       },
       onBackground(active) {
         el.bgPill.hidden = !active;

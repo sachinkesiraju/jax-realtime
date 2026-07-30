@@ -16,35 +16,61 @@ export const TUNABLES = {
    */
   bargePreRollMs: 1200,
 
+  // region: signal
+  /**
+   * Which signal drives the listening-phase turn decisions (speech onset,
+   * silence tracking, the phantom-turn evidence check). "energy" is the
+   * heuristic stack (RMS level + voicedStats peak/run scan). "vad" is the
+   * pure-TS Silero v5 port (src/asr/vad.ts): P(speech) per 32 ms frame with
+   * the official 0.5/0.35 hysteresis, ~2 ms CPU per frame, no GPU. Shipped
+   * "vad" after the cycle-22 gates (typing/ambient 0 turns with 0 phantom
+   * latches, quiet clips 3/3 exact, midpause merged, latency flat — see
+   * docs/BENCHMARKS.md). Barge-in stays on the energy/echo-floor path either
+   * way: Silero counts the assistant's own playback echo as speech, so the
+   * echo-aware detector remains the right primitive there. The energy path
+   * stays selectable for one cycle before the heuristics are deleted.
+   */
+  turnSignal: "vad" as "energy" | "vad",
+
   // region: endpoint
   /**
-   * Silence to end a turn whose committed text ends in . ! ?  380 → 250 in
-   * cycle 17: pre-merge, the window was UX-safety-bound (an eager fire on a
-   * mid-thought pause broke the conversation, so cycle 3B refused to lower
-   * it for a latency win). continuationMerge (cycle 16) changed the failure
-   * cost — an eager fire now merges with the resumed speech instead of
-   * answering half a thought — so the window could finally chase the floor:
-   * endpoint stage 450 → 301 ms, deterministic and exactly replicated on
-   * both clips, with 0 midpause cut-offs and clean transcripts throughout.
+   * Silence to end a turn whose committed text ends in . ! ?  Cycle 17
+   * shipped 380 → 250 under the continuation-merge safety net (endpoint
+   * stage 450 → 301 ms, clean on every fake-mic clip); cycle 19 reverted it
+   * on ears. Real speech pauses mid-sentence far more than the scripted
+   * clips, and the merge only rescues a resumption that lands before first
+   * audio (~1.3 s) — later resumptions barge, abort the reply, and fragment
+   * the exchange. Any future attempt at the -150 ms needs a live-listen
+   * protocol, not a clip gate (see docs/BENCHMARKS.md cycles 17/19).
    */
-  endpointPunctMs: 250,
-  /** Silence to end a turn otherwise. 620 → 500 in cycle 17, same merge
-   *  safety-net reasoning (validated only fused with the punct change). */
-  endpointSilenceMs: 500,
+  endpointPunctMs: 380,
+  /** Silence to end a turn otherwise. (Cycle 17's 500 reverted with the
+   *  punct window above — same ears verdict.) */
+  endpointSilenceMs: 620,
   /** Ignore sub-blip "utterances" shorter than this. */
   minSpeechMs: 350,
   /**
-   * Post-fire continuation-merge (cycle 16; open-roadmap item 1). When the
-   * user's speech resumes DURING the reply's silent latency gap (before first
-   * audio), the endpoint fired mid-thought: abort the unheard reply, reclaim
-   * the fired turn from history, and answer fired-transcript + continuation
-   * as ONE turn at the next endpoint. Cycles 3B/5/15 proved this is the only
-   * viable design for the cut-off class — no pre-fire window (shorter OR
-   * longer) can fix a mid-thought pause that Whisper terminates with invented
-   * punctuation. When off, pre-audio speech resumption falls back to the
-   * plain barge-in path (abort + restart), the pre-cycle-16 behavior.
+   * Post-fire continuation-merge. When the user's speech resumes during the
+   * reply's silent latency gap (before first audio), the endpoint fired
+   * mid-thought: abort the unheard reply, reclaim the fired turn from
+   * history, and answer fired-transcript + continuation as one turn at the
+   * next endpoint. No pre-fire window (shorter or longer) can fix a
+   * mid-thought pause that Whisper terminates with invented punctuation
+   * (cycles 3B/5/15), so post-fire merging is the only viable design for
+   * the cut-off class. When off, pre-audio speech resumption falls back to
+   * the plain barge-in path (abort + restart).
    */
   continuationMerge: true,
+  /**
+   * How long after the endpoint fires a speech resumption still counts as a
+   * continuation of the same thought. A resumption soon after a premature
+   * endpoint is the same thought; one arriving a second-plus later is new
+   * input (or noise) and takes the barge path. Cycle 16 shipped this
+   * unbounded across the whole ~1.4 s pre-audio gap, which let gap noise
+   * abort replies, mangle merged transcripts, and chain merge-on-merge;
+   * cycle 21 bounded it to the spec'd 700 ms, one merge per turn.
+   */
+  continuationMergeWindowMs: 700,
 
   // region: asr
   /** Minimum time between the starts of two streaming Whisper passes. */
@@ -127,20 +153,16 @@ export const TUNABLES = {
   llmPrefillBucket: 256,
   /**
    * Cap on the number of chat messages kept when formatting the LLM prompt
-   * (whole user/assistant pairs). 0 = unlimited. Was 16; **8 in cycle 18**
-   * after the llmFirst "drift" diagnosis: with no KV reuse the WHOLE prompt
-   * is re-prefilled every turn, and at 16 messages the padded prompt crossed
-   * from bucket ×2-×3 into ×4-×5 around turn 6 — a deterministic step
-   * function (llmFirst ~550 → ~950-1150 ms for the REST of the session, plus
-   * 1.9-2.1 s ×4/×5 first-encounter re-trace spikes) that 5-turn benches
-   * never sampled. At 8 the prompt never leaves the warm cheap buckets:
-   * llmFirst flat ~500-610 across all 12 turns on BOTH clips, turnLat P50
-   * 1775 → 1458 (map) / 1660 → 1334 (holdout), P95 1987 → 1649 / 2859 →
-   * 1414. Cost: 4 exchanges of verbatim context instead of 8 — typed memory
-   * (qualityTypedMemory) carries names/facts across the window, and the
-   * quality bench's items (≤3-message histories) are unaffected by
-   * construction. Long-range verbatim recall beyond 4 exchanges is the
-   * traded axis; recorded honestly.
+   * (whole user/assistant pairs). 0 = unlimited. 16 → 8 in cycle 18: with no
+   * KV reuse the whole prompt is re-prefilled every turn, and at 16 messages
+   * the padded prompt crossed from bucket ×2-×3 into ×4-×5 around turn 6 — a
+   * deterministic step (llmFirst ~550 → ~950-1150 ms for the rest of the
+   * session, plus 1.9-2.1 s first-encounter re-trace spikes) that 5-turn
+   * benches never sampled. At 8 the prompt stays in the warm buckets:
+   * llmFirst flat ~500-610 across 12 turns on both clips, turnLat P50
+   * 1775 → 1458 (map) / 1660 → 1334 (holdout). Cost: 4 exchanges of verbatim
+   * context instead of 8 — typed memory carries names/facts across the
+   * window; long-range verbatim recall is the traded axis.
    */
   llmMaxHistoryTurns: 8,
   /**
@@ -158,6 +180,18 @@ export const TUNABLES = {
   // region: tts-split
   /** Min chars before the first clause is flushed to TTS early. */
   firstClauseMinChars: 18,
+  /**
+   * No-punctuation fallback for the first flush: flush at a word boundary
+   * once this many chars accumulate. 0 = disabled (shipped). Every chunk is
+   * synthesized as a complete utterance, so a bare word-boundary cut gets
+   * sentence-final falling intonation plus an end-of-utterance pause in the
+   * middle of the sentence. The eager flush won on latency (−96 ms sentence
+   * stage, tts flat) and lost on ears — prosody wins. First flush happens
+   * only at clause punctuation; punctuation-less openers wait for their
+   * sentence end or the hard cap. (Quantization was ruled out: the TTS
+   * loads full-fp16 weights; see docs/BENCHMARKS.md cycle 23.)
+   */
+  firstWordFlushChars: 0,
 
   /**
    * When true, keep flushing on subsequent clause boundaries (comma/colon/
@@ -297,24 +331,22 @@ export const TUNABLES = {
    */
   qualityLeadShort: false,
   /**
-   * Append a stay-on-topic clause to the system prompt (cycle 16; targets the
-   * staysOnTopic axis — generic/meta replies that ignore what the user said).
-   * SHIPPED ON as half of the cycle-16 fusion (with qualityGarbleExemplars:
-   * 1): the fusion's replicated, holdout-validated win is CLARIFY behavior
-   * (asksClarify 4/10 → 7/10 pooled, noFalseClarify 46/46); its staysOnTopic
-   * gain was MAP-only (+2..+4) and flat on holdout — recorded honestly, the
-   * clause ships because the fusion is Pareto (no axis regressed beyond ±1).
+   * Append a stay-on-topic clause to the system prompt (targets the
+   * staysOnTopic axis — generic/meta replies that ignore what the user
+   * said). Shipped as half of the cycle-16 fusion with qualityGarbleExemplars
+   * 1: the fusion's holdout-validated win is clarify behavior (asksClarify
+   * 4/10 → 7/10 pooled, noFalseClarify 46/46); its staysOnTopic gain was
+   * MAP-only. Ships because the fusion regressed nothing beyond ±1.
    * Read at prompt-encode time like the other quality clauses.
    */
   qualityTopicClause: true,
   /**
    * How many garble-clarify exemplar exchanges to inject (0-2). Cycle 11
-   * added the second pair; cycle-15/16 baselines showed clarify over-priming
-   * (false clarifies on clean short asks, factual items answered with a
-   * clarify). Cycle-16 MAP: one pair beat two on correct (+3) AND — fused
-   * with the topic clause — on asksClarify itself (holdout 1/4 → 3/4): one
-   * demonstration teaches the behavior, the second mostly teaches "clarify
-   * more", which leaks onto clean input. SHIPPED 1.
+   * added a second pair; cycles 15/16 showed it over-primes clarifies (false
+   * clarifies on clean short asks). One pair beat two on correct (+3) and,
+   * fused with the topic clause, on asksClarify itself (holdout 1/4 → 3/4):
+   * one demonstration teaches the behavior, the second mostly teaches
+   * "clarify more", which leaks onto clean input. Shipped 1.
    */
   qualityGarbleExemplars: 1,
 };
