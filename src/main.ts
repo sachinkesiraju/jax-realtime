@@ -128,7 +128,7 @@ app.innerHTML = `
     </section>
 
     <footer class="colophon">
-      <span>A project by <a href="https://sachinkesiraju.com" target="_blank">Sachin Kesiraju</a></span>
+      <span>A project by <a href="https://sachinkesiraju.com" target="_blank">Sachin Kesiraju</a> · <a href="https://github.com/sachinkesiraju/jax-realtime" target="_blank">GitHub</a></span>
     </footer>
   </main>
 `;
