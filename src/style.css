@@ -55,7 +55,7 @@ body {
 .title-row {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 1.25rem;
   flex-wrap: wrap;
 }
 
@@ -65,6 +65,7 @@ body {
   justify-content: center;
   width: 2.4rem;
   height: 2.4rem;
+  margin-top: 0.1em;
   border-radius: 999px;
   color: var(--ink-soft);
   background: oklch(95% 0.01 105);
