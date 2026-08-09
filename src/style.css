@@ -63,21 +63,19 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: clamp(2rem, 5.4vw, 3rem);
-  height: clamp(2rem, 5.4vw, 3rem);
-  color: var(--ink);
-  border-radius: 999px;
-  transition: color 0.15s ease, background 0.15s ease;
+  width: 1.5rem;
+  height: 1.5rem;
+  color: var(--ink-soft);
+  transition: color 0.15s ease;
 }
 
 .github-link:hover {
-  color: var(--signal-deep);
-  background: oklch(92% 0.02 105);
+  color: var(--ink);
 }
 
 .github-link svg {
-  width: 80%;
-  height: 80%;
+  width: 100%;
+  height: 100%;
 }
 
 .tagline {
