@@ -52,6 +52,37 @@ body {
   line-height: 1;
 }
 
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.github-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: 999px;
+  color: var(--ink-soft);
+  background: oklch(95% 0.01 105);
+  border: 1px solid oklch(85% 0.02 105);
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.github-link:hover {
+  color: var(--ink);
+  background: oklch(97% 0.03 105);
+  border-color: var(--signal-deep);
+}
+
+.github-link svg {
+  width: 1.3rem;
+  height: 1.3rem;
+}
+
 .tagline {
   margin: 0.6rem 0 0;
   /* Wide enough that each <br />-separated line stays on one line on desktop
