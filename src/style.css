@@ -55,7 +55,7 @@ body {
 .title-row {
   display: flex;
   align-items: center;
-  gap: 1.25rem;
+  gap: clamp(1rem, 2.5vw, 1.6rem);
   flex-wrap: wrap;
 }
 
@@ -63,25 +63,21 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 2.4rem;
-  height: 2.4rem;
-  margin-top: 0.1em;
+  width: clamp(2rem, 5.4vw, 3rem);
+  height: clamp(2rem, 5.4vw, 3rem);
+  color: var(--ink);
   border-radius: 999px;
-  color: var(--ink-soft);
-  background: oklch(95% 0.01 105);
-  border: 1px solid oklch(85% 0.02 105);
-  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  transition: color 0.15s ease, background 0.15s ease;
 }
 
 .github-link:hover {
-  color: var(--ink);
-  background: oklch(97% 0.03 105);
-  border-color: var(--signal-deep);
+  color: var(--signal-deep);
+  background: oklch(92% 0.02 105);
 }
 
 .github-link svg {
-  width: 1.3rem;
-  height: 1.3rem;
+  width: 80%;
+  height: 80%;
 }
 
 .tagline {
