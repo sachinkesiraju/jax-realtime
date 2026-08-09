@@ -63,6 +63,8 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  position: relative;
+  top: 0.22rem;
   width: 1.5rem;
   height: 1.5rem;
   color: var(--ink-soft);
