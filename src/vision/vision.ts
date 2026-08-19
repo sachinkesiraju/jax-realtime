@@ -134,16 +134,19 @@ export class VisionSession {
   }
 
   /**
-   * Cheap colour enrichment: average the pixels inside each detection box (for a
-   * person, its torso region ≈ clothing) and name the dominant colour. No model
-   * — just canvas pixels — so it rides along in the low-priority Eye loop and
-   * lets the agent answer "what colour is my chair" / "what am I wearing".
+   * Cheap colour enrichment: sample the pixels inside each detection box (for a
+   * person, a tight central torso region ≈ clothing) and name the dominant
+   * colour. No model — just canvas pixels — so it rides along in the low-priority
+   * Eye loop and lets the agent answer "what colour is my chair" /
+   * "what am I wearing".
    */
   private sampleColors(detections: Detection[]): void {
     const vw = this.video.videoWidth;
     const vh = this.video.videoHeight;
     if (!vw || !vh || detections.length === 0) return;
-    const cw = 200;
+    // Higher-res sampling than before: navy/dark clothing gets washed out when
+    // the torso region is only a handful of pixels.
+    const cw = 400;
     const ch = Math.max(1, Math.round((vh * cw) / vw));
     const canvas = (this.colorCanvas ??= document.createElement("canvas"));
     canvas.width = cw;
@@ -160,15 +163,15 @@ export class VisionSession {
     for (const d of detections) {
       let [x, y, w, h] = d.box;
       if (d.label === "person") {
-        // Clothing band: LOWER-middle of the box. A seated webcam framing gives
-        // a head-and-shoulders box where 40-70% height is still face/neck —
+        // Clothing band: tight central torso. A seated webcam framing gives a
+        // head-and-shoulders box where 40-70% height is still face/neck —
         // sampling there described skin ("orange person", "dark red shirt" on a
-        // navy polo). 58-90% height hits the chest/shirt in that framing, and
-        // still lands on clothing (pants) for a full-body box.
-        x += w * 0.3;
-        w *= 0.4;
-        y += h * 0.58;
-        h *= 0.32;
+        // navy polo). 62-86% height hits the chest/shirt in that framing while
+        // a narrow 30% width avoids arms/background.
+        x += w * 0.35;
+        w *= 0.3;
+        y += h * 0.62;
+        h *= 0.24;
       } else {
         x += w * 0.25;
         y += h * 0.25;
@@ -181,17 +184,39 @@ export class VisionSession {
       const rh = Math.max(1, Math.min(Math.round(h * sy), ch - ry));
       try {
         const data = ctx.getImageData(rx, ry, rw, rh).data;
+        // Filter out very dark (shadows), very bright (highlights), and
+        // low-chroma (background grays/skin mid-tones) pixels so the average
+        // centres on the actual clothing colour instead of being pulled to gray.
+        const DARK = 25;
+        const BRIGHT = 245;
+        const CHROMA = 15;
         let r = 0;
         let g = 0;
         let b = 0;
         let n = 0;
+        let fallR = 0;
+        let fallG = 0;
+        let fallB = 0;
+        let fallN = 0;
         for (let i = 0; i < data.length; i += 4) {
-          r += data[i];
-          g += data[i + 1];
-          b += data[i + 2];
-          n++;
+          const pr = data[i];
+          const pg = data[i + 1];
+          const pb = data[i + 2];
+          const mx = Math.max(pr, pg, pb);
+          const mn = Math.min(pr, pg, pb);
+          fallR += pr;
+          fallG += pg;
+          fallB += pb;
+          fallN++;
+          if (mx > DARK && mn < BRIGHT && mx - mn >= CHROMA) {
+            r += pr;
+            g += pg;
+            b += pb;
+            n++;
+          }
         }
         if (n) d.color = colorName(r / n, g / n, b / n);
+        else if (fallN) d.color = colorName(fallR / fallN, fallG / fallN, fallB / fallN);
       } catch {
         // Ignore a bad region; the object just won't have a colour this frame.
       }
@@ -550,9 +575,13 @@ function colorName(r: number, g: number, b: number): string {
     h *= 60;
     if (h < 0) h += 360;
   }
-  if (l < 0.13) return "black";
-  if (l > 0.9 && sat < 0.15) return "white";
-  if (sat < 0.12) return l < 0.4 ? "dark gray" : l > 0.7 ? "light gray" : "gray";
+  // True blacks/whites/grays are recognised from raw channel extremes and a
+  // very small range. A slight but consistent tint (e.g. dark navy under poor
+  // light) still has a dominant hue, so we keep going instead of calling it
+  // "gray" just because saturation is low.
+  if (max < 20) return "black";
+  if (min > 245) return "white";
+  if (delta < 0.04) return l < 0.4 ? "dark gray" : l > 0.7 ? "light gray" : "gray";
   // Low-lightness orange reads as brown.
   if (h < 45 && l < 0.4 && sat > 0.2) return "brown";
   const shade = l < 0.32 ? "dark " : l > 0.78 ? "light " : "";
