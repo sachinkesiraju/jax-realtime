@@ -258,14 +258,21 @@ function formatMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
-// Stick-to-bottom auto-scroll inside the transcript container. Only scroll
-// when the user is already near the bottom so scrollback is never hijacked.
+// Stick-to-bottom auto-scroll. The shell uses min-height, so a growing
+// transcript grows the page rather than overflowing the container — a bare
+// `transcript.scrollTop = scrollHeight` is a no-op there. Follow new content
+// by scrolling the window, but only when the user is already near the bottom
+// so scrollback is never hijacked. The threshold is checked after the
+// mutation, so it also covers the height just added (≲200 px per update).
 const FOLLOW_THRESHOLD_PX = 240;
 function followChat(): void {
-  const t = el.transcript;
-  const fromBottom = t.scrollHeight - (t.clientHeight + t.scrollTop);
+  // Keep the container-level scroll too, for layouts where the transcript
+  // itself overflows (e.g. if the CSS ever pins the shell height).
+  el.transcript.scrollTop = el.transcript.scrollHeight;
+  const doc = document.documentElement;
+  const fromBottom = doc.scrollHeight - (window.innerHeight + window.scrollY);
   if (fromBottom > 0 && fromBottom <= FOLLOW_THRESHOLD_PX) {
-    t.scrollTop = t.scrollHeight;
+    window.scrollTo({ top: doc.scrollHeight });
   }
 }
 
