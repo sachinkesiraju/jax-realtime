@@ -768,7 +768,7 @@ export class DuplexSession {
 
     let content = text;
     if (this.vision?.active && this.vision.referencesVision(text)) {
-      const facts = this.vision.sceneFacts();
+      const facts = this.vision.sceneFacts(true);
       content = facts ? `[scene: ${facts}] ${text}` : text;
       this.cb.onEvent("eye · grounding from the camera");
     }

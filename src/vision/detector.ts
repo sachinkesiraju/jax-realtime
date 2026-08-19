@@ -27,8 +27,9 @@ export type Detection = {
   score: number;
   /** [x, y, w, h] in source-pixel coordinates. */
   box: [number, number, number, number];
-  /** Dominant colour name, filled in by the vision layer (cheap pixel average
-   *  over the box) — the detector itself doesn't compute it. */
+  /** Average RGB colour as an `rgb(r, g, b)` string, filled in by the vision
+   *  layer (cheap pixel average over the box) — the detector itself doesn't
+   *  compute it. */
   color?: string;
 };
 

@@ -4,7 +4,6 @@
 // DuplexSession reads these getters to drive proactive interjections and to
 // ground "what do you see?" turns.
 
-import { TUNABLES } from "../tunables";
 import type { Detection, ObjectDetector } from "./detector";
 
 // Vision is the lowest-priority stage — scene context is used far less than
@@ -35,12 +34,7 @@ const STABILITY_FRAMES = 3;
 // Min score for a person box to COUNT toward the announced number (the overlay
 // still draws everything above the detector's own display threshold).
 const PERSON_COUNT_MIN_SCORE = 0.6;
-// "Tell me about / describe X" phrasing. When X names something the eye can
-// currently see, the eye — not a web lookup — is the authority on it, so the
-// turn is answered from measurements. Before this, "tell me about the person"
-// matched the lookup tool's trigger and web-searched "the person".
-const DESCRIBE_RE =
-  /\b(tell me (?:more )?about|describe|what about|who(?:'s| is| are))\b/i;
+
 
 export type SceneState = {
   personCount: number;
@@ -135,18 +129,16 @@ export class VisionSession {
   }
 
   /**
-   * Cheap colour enrichment: sample the pixels inside each detection box (for a
-   * person, a tight central torso region ≈ clothing) and name the dominant
-   * colour. No model — just canvas pixels — so it rides along in the low-priority
-   * Eye loop and lets the agent answer "what colour is my chair" /
-   * "what am I wearing".
+   * Sample the pixels inside each detection box (for a person, the central
+   * torso ≈ clothing) and store the average RGB. The LLM can then interpret the
+   * colour in context rather than us hard-coding colour names.
    */
   private sampleColors(detections: Detection[]): void {
     const vw = this.video.videoWidth;
     const vh = this.video.videoHeight;
     if (!vw || !vh || detections.length === 0) return;
-    // Higher-res sampling than before: navy/dark clothing gets washed out when
-    // the torso region is only a handful of pixels.
+    // A higher-res sampling canvas keeps the average from being washed out by
+    // a handful of background pixels in a small region.
     const cw = 400;
     const ch = Math.max(1, Math.round((vh * cw) / vw));
     const canvas = (this.colorCanvas ??= document.createElement("canvas"));
@@ -166,9 +158,8 @@ export class VisionSession {
       if (d.label === "person") {
         // Clothing band: tight central torso. A seated webcam framing gives a
         // head-and-shoulders box where 40-70% height is still face/neck —
-        // sampling there described skin ("orange person", "dark red shirt" on a
-        // navy polo). 62-86% height hits the chest/shirt in that framing while
-        // a narrow 30% width avoids arms/background.
+        // sampling there described skin. 62-86% height hits the chest/shirt
+        // in that framing while a narrow 30% width avoids arms/background.
         x += w * 0.35;
         w *= 0.3;
         y += h * 0.62;
@@ -185,37 +176,20 @@ export class VisionSession {
       const rh = Math.max(1, Math.min(Math.round(h * sy), ch - ry));
       try {
         const data = ctx.getImageData(rx, ry, rw, rh).data;
-        // Filter out very dark (shadows), very bright (highlights), and
-        // low-chroma (background grays/skin mid-tones) pixels so the average
-        // centres on the actual clothing colour instead of being pulled to gray.
-        const { visionColor: vc } = TUNABLES;
         let r = 0;
         let g = 0;
         let b = 0;
-        let n = 0;
-        let fallR = 0;
-        let fallG = 0;
-        let fallB = 0;
-        let fallN = 0;
+        const count = data.length / 4;
         for (let i = 0; i < data.length; i += 4) {
-          const pr = data[i];
-          const pg = data[i + 1];
-          const pb = data[i + 2];
-          const mx = Math.max(pr, pg, pb);
-          const mn = Math.min(pr, pg, pb);
-          fallR += pr;
-          fallG += pg;
-          fallB += pb;
-          fallN++;
-          if (mx > vc.sampleDark && mn < vc.sampleBright && mx - mn >= vc.sampleMinChroma) {
-            r += pr;
-            g += pg;
-            b += pb;
-            n++;
-          }
+          r += data[i];
+          g += data[i + 1];
+          b += data[i + 2];
         }
-        if (n) d.color = colorName(r / n, g / n, b / n);
-        else if (fallN) d.color = colorName(fallR / fallN, fallG / fallN, fallB / fallN);
+        if (count) {
+          d.color = `rgb(${Math.round(r / count)}, ${Math.round(g / count)}, ${Math.round(
+            b / count,
+          )})`;
+        }
       } catch {
         // Ignore a bad region; the object just won't have a colour this frame.
       }
@@ -250,8 +224,10 @@ export class VisionSession {
    * a plain natural list with measured colours and counts, e.g. "a blue chair,
    * a person, and a cell phone". This is pure measurement — no interpretation —
    * and it's what both the direct answers and the LLM grounding are built from.
+   * When `withColor` is true, each object is annotated with its sampled RGB so
+   * the model can interpret the colour itself instead of us hard-coding names.
    */
-  sceneFacts(): string {
+  sceneFacts(withColor = false): string {
     const byLabel = new Map<string, Detection[]>();
     for (const d of this.stableDetections()) {
       (byLabel.get(d.label) ?? byLabel.set(d.label, []).get(d.label)!).push(d);
@@ -262,13 +238,10 @@ export class VisionSession {
       .slice(0, SCENE_MAX_OBJECTS)
       .map(([label, dets]) => {
         const n = dets.length;
-        // Colours are deliberately NOT volunteered here: the cheap box-average
-        // sampler is unreliable under webcam lighting (it has called a navy
-        // polo "dark red" and a person "orange"), so stating a colour unasked
-        // reads as hallucination. A direct "what colour is X" still answers
-        // from the measurement in answer(), where it's explicitly requested.
-        if (n === 1) return `${/^[aeiou]/.test(label) ? "an" : "a"} ${label}`;
-        return `${numWord(n)} ${pluralize(label)}`;
+        const rgb =
+          withColor && dets[0].color ? ` (${dets[0].color})` : "";
+        if (n === 1) return `${/^[aeiou]/.test(label) ? "an" : "a"} ${label}${rgb}`;
+        return `${numWord(n)} ${pluralize(label)}${rgb}`;
       });
     return joinList(parts);
   }
@@ -339,9 +312,9 @@ export class VisionSession {
 
   /**
    * A precise factual question we answer directly from measurements (the small
-   * model deflects on these, and exactness matters): count, colour, or a
-   * straight "what do you see". Broader/interpretive visual turns are handled by
-   * `referencesVision` + the LLM instead.
+   * model deflects on these, and exactness matters): count or a straight
+   * "what do you see". Colour / clothing questions are intentionally left for
+   * `referencesVision` + the LLM so the model interprets the raw RGB itself.
    */
   matchesQuestion(text: string): boolean {
     const s = text.toLowerCase();
@@ -351,13 +324,7 @@ export class VisionSession {
       /\bwhat('?s| is| are)?\b.*\b(in (view|frame|the (background|room|picture|shot|scene))|behind me|around me|in front of me)\b/.test(
         s,
       ) ||
-      /\bhow many (people|persons|faces|chairs|things|objects)\b/.test(s) ||
-      /\bwhat colou?r\b/.test(s) ||
-      /\b(am i|are we)\b.*\bwearing\b/.test(s) ||
-      /\bwhat am i wearing\b/.test(s) ||
-      // "Tell me about the person / describe the couch" — describing something
-      // in frame is the eye's job, not Wikipedia's.
-      (DESCRIBE_RE.test(s) && this.targetObject(s) !== null)
+      /\bhow many (people|persons|faces|chairs|things|objects)\b/.test(s)
     );
   }
 
@@ -369,7 +336,7 @@ export class VisionSession {
    */
   referencesVision(text: string): boolean {
     if (
-      /\b(see|seeing|look|looking|camera|webcam|frame|view|room|background|surroundings|around me|behind me|in front of me|wearing|holding|doing|on my phone)\b/i.test(
+      /\b(see|seeing|look|looking|camera|webcam|frame|view|room|background|surroundings|around me|behind me|in front of me|wearing|holding|doing|on my phone|colou?r|shirt|top|outfit|clothes)\b/i.test(
         text,
       )
     ) {
@@ -384,32 +351,6 @@ export class VisionSession {
   answer(text: string): string {
     const s = text.toLowerCase();
 
-    // What are you wearing → the person's measured torso colour.
-    if (/\bwearing\b|\bshirt\b|\btop\b|\boutfit\b|\bclothes\b/.test(s)) {
-      const person = largestPerson(this.stableDetections());
-      if (!person) return "I can't see you clearly enough to tell what you're wearing.";
-      return person.color
-        ? `Looks like you're wearing something ${person.color}.`
-        : "I can see you, but can't quite pick out the colour.";
-    }
-
-    // Colour of a specific object → its measured colour.
-    if (/\bcolou?r\b/.test(s)) {
-      const target = this.targetObject(s);
-      if (target) {
-        return target.color
-          ? `Your ${target.label} looks ${target.color}.`
-          : `I can see a ${target.label}, but can't pin down its colour.`;
-      }
-    }
-
-    // Describe something in frame ("tell me about the person", "describe the
-    // couch") — measurements only: count, rough distance, sampled colour.
-    if (DESCRIBE_RE.test(s)) {
-      const target = this.targetObject(s);
-      if (target) return this.describeTarget(target);
-    }
-
     // Count of people.
     if (/\bhow many\b/.test(s) && /\b(people|person|face|faces)\b/.test(s)) {
       const n = this.personCount;
@@ -422,35 +363,6 @@ export class VisionSession {
     const facts = this.sceneFacts();
     if (!facts) return "I can't make out anything specific in the frame right now.";
     return `I can see ${facts}.`;
-  }
-
-  /**
-   * Measurement-grounded description of one in-frame object: person count, a
-   * rough distance from the box's frame fraction, and the sampled colour —
-   * hedged, never invented. Left/right is deliberately omitted: the preview is
-   * mirrored (style.css scaleX(-1)) while boxes are in raw video coordinates,
-   * so a spoken "on the left" would contradict what the user sees on screen.
-   * The closing line states the detector's ceiling honestly instead of letting
-   * the reply trail off as if more detail were withheld.
-   */
-  private describeTarget(d: Detection): string {
-    const vw = this.video.videoWidth;
-    const vh = this.video.videoHeight;
-    const frac = vw && vh ? (d.box[2] * d.box[3]) / (vw * vh) : 0;
-    const distance =
-      frac > 0.3 ? "close to the camera" : frac > 0.08 ? "a bit further back" : "off in the background";
-    const ceiling = "That's about all the detail my eye picks out.";
-    if (d.label === "person") {
-      const n = this.personCount;
-      const dress = d.color ? `, wearing something ${d.color}` : "";
-      if (n > 1) {
-        return `I can see ${numWord(n)} people; the nearest is ${distance}${dress}. ${ceiling}`;
-      }
-      return `I can see one person ${distance}${dress}. ${ceiling}`;
-    }
-    const colour = d.color ? ` — it looks ${d.color}` : "";
-    const article = /^[aeiou]/.test(d.label) ? "an" : "a";
-    return `I can see ${article} ${d.label} ${distance}${colour}. ${ceiling}`;
   }
 
   // --- Detection loop -----------------------------------------------------
@@ -556,53 +468,6 @@ function pluralize(label: string): string {
   if (label === "person") return "people";
   if (/(s|sh|ch|x|z)$/.test(label)) return label + "es";
   return label + "s";
-}
-
-/** Map an average RGB to a rough colour name via HSL bucketing. */
-function colorName(r: number, g: number, b: number): string {
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const l = (max + min) / 2 / 255;
-  const delta = (max - min) / 255;
-  const sat = delta === 0 ? 0 : delta / (1 - Math.abs(2 * l - 1));
-  let h = 0;
-  if (delta !== 0) {
-    const dn = delta;
-    if (max === r) h = ((g - b) / 255 / dn) % 6;
-    else if (max === g) h = (b - r) / 255 / dn + 2;
-    else h = (r - g) / 255 / dn + 4;
-    h *= 60;
-    if (h < 0) h += 360;
-  }
-  // True blacks/whites/grays are recognised from raw channel extremes and a
-  // very small range. A slight but consistent tint (e.g. dark navy under poor
-  // light) still has a dominant hue, so we keep going instead of calling it
-  // "gray" just because saturation is low.
-  const { visionColor: vc } = TUNABLES;
-  if (max < vc.nameBlackMax) return "black";
-  if (min > vc.nameWhiteMin) return "white";
-  if (delta < vc.nameGrayDelta)
-    return l < 0.4 ? "dark gray" : l > 0.7 ? "light gray" : "gray";
-  // Low-lightness orange reads as brown.
-  if (h < vc.brownHueMax && l < vc.brownLightnessMax && sat > vc.brownSatMin) return "brown";
-  const shade = l < vc.darkLightness ? "dark " : l > vc.lightLightness ? "light " : "";
-  const hue =
-    h < 15 || h >= 345
-      ? "red"
-      : h < 45
-        ? "orange"
-        : h < 65
-          ? "yellow"
-          : h < 170
-            ? "green"
-            : h < 200
-              ? "teal"
-              : h < 255
-                ? "blue"
-                : h < 290
-                  ? "purple"
-                  : "pink";
-  return shade + hue;
 }
 
 function joinList(parts: string[]): string {
