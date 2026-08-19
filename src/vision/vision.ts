@@ -4,6 +4,7 @@
 // DuplexSession reads these getters to drive proactive interjections and to
 // ground "what do you see?" turns.
 
+import { TUNABLES } from "../tunables";
 import type { Detection, ObjectDetector } from "./detector";
 
 // Vision is the lowest-priority stage — scene context is used far less than
@@ -187,9 +188,7 @@ export class VisionSession {
         // Filter out very dark (shadows), very bright (highlights), and
         // low-chroma (background grays/skin mid-tones) pixels so the average
         // centres on the actual clothing colour instead of being pulled to gray.
-        const DARK = 25;
-        const BRIGHT = 245;
-        const CHROMA = 15;
+        const { visionColor: vc } = TUNABLES;
         let r = 0;
         let g = 0;
         let b = 0;
@@ -208,7 +207,7 @@ export class VisionSession {
           fallG += pg;
           fallB += pb;
           fallN++;
-          if (mx > DARK && mn < BRIGHT && mx - mn >= CHROMA) {
+          if (mx > vc.sampleDark && mn < vc.sampleBright && mx - mn >= vc.sampleMinChroma) {
             r += pr;
             g += pg;
             b += pb;
@@ -579,12 +578,14 @@ function colorName(r: number, g: number, b: number): string {
   // very small range. A slight but consistent tint (e.g. dark navy under poor
   // light) still has a dominant hue, so we keep going instead of calling it
   // "gray" just because saturation is low.
-  if (max < 20) return "black";
-  if (min > 245) return "white";
-  if (delta < 0.04) return l < 0.4 ? "dark gray" : l > 0.7 ? "light gray" : "gray";
+  const { visionColor: vc } = TUNABLES;
+  if (max < vc.nameBlackMax) return "black";
+  if (min > vc.nameWhiteMin) return "white";
+  if (delta < vc.nameGrayDelta)
+    return l < 0.4 ? "dark gray" : l > 0.7 ? "light gray" : "gray";
   // Low-lightness orange reads as brown.
-  if (h < 45 && l < 0.4 && sat > 0.2) return "brown";
-  const shade = l < 0.32 ? "dark " : l > 0.78 ? "light " : "";
+  if (h < vc.brownHueMax && l < vc.brownLightnessMax && sat > vc.brownSatMin) return "brown";
+  const shade = l < vc.darkLightness ? "dark " : l > vc.lightLightness ? "light " : "";
   const hue =
     h < 15 || h >= 345
       ? "red"

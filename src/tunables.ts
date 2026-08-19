@@ -349,6 +349,36 @@ export const TUNABLES = {
    * "clarify more", which leaks onto clean input. Shipped 1.
    */
   qualityGarbleExemplars: 1,
+
+  // region: vision
+  /**
+   * Eye colour-sampling thresholds. Kept as tunables so webcam/lighting
+   * differences can be adjusted without editing vision.ts.
+   */
+  visionColor: {
+    /** Pixels below this value are too dark (shadows) to vote. */
+    sampleDark: 25,
+    /** Pixels above this value are too bright (highlights) to vote. */
+    sampleBright: 245,
+    /** Minimum max-min channel distance for a pixel to count as chromatic. */
+    sampleMinChroma: 15,
+    /** Max channel value below which a sample is called black. */
+    nameBlackMax: 20,
+    /** Min channel value above which a sample is called white. */
+    nameWhiteMin: 245,
+    /** Normalized channel range below which a sample is called gray. */
+    nameGrayDelta: 0.04,
+    /** Hue ceiling for the brown special case. */
+    brownHueMax: 45,
+    /** Lightness ceiling for the brown special case. */
+    brownLightnessMax: 0.4,
+    /** Saturation floor for the brown special case. */
+    brownSatMin: 0.2,
+    /** Lightness below which a hue is prefixed with "dark". */
+    darkLightness: 0.32,
+    /** Lightness above which a hue is prefixed with "light". */
+    lightLightness: 0.78,
+  },
 };
 
 export type Tunables = typeof TUNABLES;
