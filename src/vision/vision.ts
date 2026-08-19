@@ -196,7 +196,7 @@ export class VisionSession {
     }
   }
 
-  /** Find the stable detection a colour/appearance/describe question refers to. */
+  /** Find the stable detection a lookup subject or visual mention refers to. */
   private targetObject(text: string): Detection | null {
     // Word-boundary matching (not substring) so a "tie" detection can't fire
     // inside "patience"; "people" normalizes to the COCO label "person". COCO
@@ -336,7 +336,7 @@ export class VisionSession {
    */
   referencesVision(text: string): boolean {
     if (
-      /\b(see|seeing|look|looking|camera|webcam|frame|view|room|background|surroundings|around me|behind me|in front of me|wearing|holding|doing|on my phone|colou?r|shirt|top|outfit|clothes)\b/i.test(
+      /\b(see|seeing|look|looking|camera|webcam|frame|view|room|background|surroundings|around me|behind me|in front of me|wearing|holding|doing|on my phone|colou?r|shirt|outfit|clothes)\b/i.test(
         text,
       )
     ) {

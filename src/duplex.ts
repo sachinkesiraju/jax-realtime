@@ -749,11 +749,11 @@ export class DuplexSession {
     }
 
     // Vision: the detector only *measures* (objects + colours). Precise factual
-    // questions (count, colour, "what do you see") are answered directly from
-    // those measurements — the small local model deflects on them. Broader /
-    // interpretive visual questions ("what am I doing", "does my room look
-    // tidy") are handed to the LLM with the measured scene as grounding, so the
-    // model reasons rather than us templating a reply.
+    // questions (count, "what do you see") are answered directly from those
+    // measurements — the small local model deflects on them. Broader /
+    // interpretive visual questions, including colour / clothing asks, are
+    // handed to the LLM with the measured scene as grounding so the model
+    // reasons (and names colours) instead of us templating a reply.
     if (this.vision?.active && this.vision.matchesQuestion(text)) {
       const reply = this.vision.answer(text);
       this.cb.onEvent("eye · answering from the camera");
@@ -797,8 +797,6 @@ export class DuplexSession {
     // Eye-as-oracle for lookups: when the lookup subject names something the
     // camera can currently see ("what is the person doing"), the turn is about
     // the scene, not the web — drop the tool so the scene-grounded LLM answers.
-    // (Direct "tell me about the person" turns never reach here; matchesQuestion
-    // answers them from measurements above.)
     if (
       tool?.kind === "lookup" &&
       this.vision?.active &&
